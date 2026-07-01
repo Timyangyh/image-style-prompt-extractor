@@ -32,13 +32,32 @@
 
 ## 系统要求
 
-- M 系列 Mac。
-- Node.js 和 npm。
+- 下载 App：M 系列 Mac。
+- 源码运行：M 系列 Mac、Node.js 和 npm。
 - 可用的 OpenAI-compatible 视觉模型 API，用于图片分析。
 
 内置脚本只面向 Apple Silicon Mac。Intel Mac 或其他系统需要自行调整 Electron 打包流程。
 
-## 安装
+## 下载 App
+
+从 [Releases](https://github.com/Timyangyh/image-style-prompt-extractor/releases) 下载 `image-style-prompt-extractor-mac-arm64.zip`。
+
+使用方式：
+
+1. 解压 zip。
+2. 打开 `图片复刻大师.app`。
+3. 首次使用在“模型配置”里填写 API Base URL、Model Name 和 API Key。
+
+如果 macOS 阻止打开，先右键点击 App，选择“打开”。如果仍无法打开，可以把 App 放到“应用程序”后执行：
+
+```bash
+APP="/Applications/图片复刻大师.app"
+xattr -dr com.apple.quarantine "$APP"
+codesign --force --deep --sign - "$APP"
+open "$APP"
+```
+
+## 源码运行
 
 ```bash
 npm install
