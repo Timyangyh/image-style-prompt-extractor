@@ -7,7 +7,7 @@
 - 从海报、产品图、图表、资料卡、网页截图或 UI 截图中提取可复用的视觉风格。
 - 生成中文提示词模板，用于后续在外部图像模型中复用布局、光影、配色和视觉层级。
 - 把主体图、产品信息或编辑要求代入已解析出的风格结构。
-- 在本地完成提示词提取、生图、改图和结果对比，不把本机历史或密钥写进仓库。
+- 在本地完成提示词提取、生图、改图和结果对比。
 
 如果需要分析网页或应用界面，可以先截图，然后直接粘贴或上传到应用中分析。项目不包含 Chrome 浏览器插件或自动网页采集服务。
 
@@ -68,7 +68,7 @@ npm run dev
 - Model Name，例如 `gpt-4o-mini`
 - API Key
 
-图片分析流程使用 OpenAI-compatible Chat Completions Vision 接口。API Key 只保存在本机运行环境中，不包含在仓库里。
+图片分析流程使用 OpenAI-compatible Chat Completions Vision 接口。
 
 ## 生图和改图配置
 
@@ -77,8 +77,6 @@ npm run dev
 - Codex OAuth 本机登录：主进程读取本机 `~/.codex/auth.json`，渲染层只显示登录状态。
 - OpenAI-compatible Images API 或 Responses 图像工具。
 - OpenRouter Images API 供应商。
-
-API Key 和 OAuth token 属于本机运行密钥，不应提交到 Git 仓库。
 
 ## 常用命令
 
@@ -89,53 +87,6 @@ npm run build     # TypeScript 与 Electron Vite 构建检查
 npm run pack      # 生成未压缩 macOS app
 npm run dist:mac  # 生成 macOS dmg / zip
 ```
-
-## 生成便携包
-
-在 M 系列 Mac 上，可以双击或运行：
-
-```bash
-./make-portable.command
-```
-
-脚本会生成：
-
-```text
-portable/图片复刻大师-便携包
-portable/图片复刻大师-便携包.zip
-```
-
-这些都是本地构建产物，已被 `.gitignore` 排除，不应提交到 GitHub。
-
-只发布源码到 GitHub 时，不需要 Apple Developer ID 签名。只有把 `.app`、`.dmg` 或可直接运行的 zip 作为下载包分发时，才需要考虑 Developer ID 签名和 Apple notarization。
-
-## Agent 操作建议
-
-如果让 AI Agent 接手这个项目，建议给它以下步骤：
-
-```text
-请先阅读 README.md、AGENTS.md、package.json 和 SECURITY.md。
-这是一个 Electron + React + TypeScript 项目。
-不要提交 node_modules、out、release、portable、dist、build、.env、本机历史、API Key、OAuth token 或生成任务数据。
-修改后至少运行：
-npm run test:unit
-npm run build
-需要本机启动时运行：
-npm run dev
-或在 M 系列 Mac 上双击 start.command。
-```
-
-更多 Agent 约束见 `AGENTS.md`。
-
-## 仓库卫生
-
-不要提交：
-
-- `node_modules/`
-- `out/`、`release/`、`portable/`、`dist/`、`build/`
-- `.env*`
-- API Key、OAuth token、cookie、credential 文件或本机应用数据
-- 私人图片、生成历史、任务文件或本机日志
 
 ## 安全
 

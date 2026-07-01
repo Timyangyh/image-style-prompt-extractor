@@ -65,7 +65,3 @@ npm run pack
 ## 密钥边界
 
 API Key 和 Codex OAuth token 只能作为本机运行时密钥使用。渲染层只能接收是否已配置、是否已登录这类状态，不应接收明文密钥。
-
-## 打包说明
-
-`make-portable.command` 会生成本地便携包到 `portable/`，这是本机产物，不应提交到 GitHub。源码开源不需要 Developer ID 签名；只有分发可直接运行的 macOS app 时才需要处理签名和 notarization。
