@@ -1,0 +1,45 @@
+node_modules/
+
+# Build and packaging outputs
+out/
+dist/
+build/
+release/
+portable/
+coverage/
+test-results/
+playwright-report/
+
+# Runtime, caches, and local state
+.cache/
+.tmp/
+tmp/
+runs/
+.wxt/
+.output/
+.vite/
+.omx/
+.claude/
+*.log
+
+# Secrets and machine-local configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*token*
+*credential*
+*cookie*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Generated one-off bundles
+*.dmg
+*.asar
+*.app
