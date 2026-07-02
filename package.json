@@ -13,6 +13,7 @@
     "test:unit": "vitest run",
     "start": "electron-vite preview",
     "dist:mac": "npm run build && electron-builder --mac",
+    "dist:win": "npm run build && electron-builder --win zip --x64",
     "pack": "npm run build && electron-builder --dir"
   },
   "dependencies": {
@@ -53,6 +54,19 @@
         "dmg",
         "zip"
       ]
+    },
+    "win": {
+      "icon": "assets/app-icon.ico",
+      "executableName": "image-style-prompt-extractor",
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "image-style-prompt-extractor-win-${arch}.${ext}"
     }
   }
 }
