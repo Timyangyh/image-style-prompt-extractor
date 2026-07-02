@@ -72,7 +72,11 @@ Windows 使用方式：
 2. 打开解压后的 `image-style-prompt-extractor.exe`。
 3. 首次使用在“模型配置”里填写图片分析模型的 API Base URL、Model Name 和 API Key。
 
-Windows 包当前未做商业代码签名，首次运行时可能出现 Microsoft Defender SmartScreen 提示；确认来源是本仓库 Release 后，可以点击“更多信息”再选择“仍要运行”。请先解压再运行，不要直接在压缩包预览窗口里打开 exe。
+Windows 包当前未做商业代码签名，请先解压再运行，不要直接在压缩包预览窗口里打开 exe。首次运行时可能遇到几种系统安全提示：
+
+- 如果出现 Microsoft Defender SmartScreen 的“Windows 已保护你的电脑”蓝色弹窗，确认来源是本仓库 Release 后，可以点击“更多信息”，再选择“仍要运行”。
+- 如果没有出现弹窗、双击后没有反应，或没有“仍要运行”按钮，请右键点击 `image-style-prompt-extractor.exe`，打开“属性”，在“常规”页查看是否有“解除锁定 / Unblock”选项；如果有，勾选后点击“应用”，再重新运行。
+- 公司或学校管理的 Windows 设备可能通过策略禁止绕过 SmartScreen，这种情况下需要联系设备管理员，或换用个人设备运行。
 
 ### 配置模型
 
