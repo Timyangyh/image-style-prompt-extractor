@@ -237,7 +237,9 @@ export interface GenerationTask {
 export type ImageEditTaskStatus = GenerationTaskStatus;
 export type ImageEditTaskVisibility = GenerationTaskVisibility;
 export type ImageEditSourceKind = "uploaded_image" | "clipboard_image" | "generation_output" | "restored_edit_output";
-export type ImageEditFidelityMode = "reference" | "strict_mask";
+export type ImageEditFidelityMode = "origin_regenerate";
+export type ImageEditStoredFidelityMode = ImageEditFidelityMode | "reference" | "strict_mask";
+export type ImageEditRegenerationInputStrategy = "original_references" | "text_only";
 
 export interface ImageEditSourcePointer {
   kind: ImageEditSourceKind;
@@ -260,6 +262,26 @@ export interface ImageEditSourceImage {
   height?: number;
   createdAt: string;
   sourcePointer: ImageEditSourcePointer;
+}
+
+export interface ImageEditModelInputImage {
+  mimeType: "image/png";
+  dataUrl: string;
+  assetFileName?: string;
+  width: number;
+  height: number;
+  createdAt: string;
+  reason: "strict_mask" | "unsupported_source_format";
+}
+
+export interface ImageEditSourceIntegrity {
+  actualMimeType: "image/png" | "image/jpeg" | "image/webp";
+  byteLength: number;
+  width: number;
+  height: number;
+  pixelCount: number;
+  sha256: string;
+  canonicalBytesPreserved: true;
 }
 
 export interface ImageEditAnnotationImage {
@@ -288,6 +310,10 @@ export interface ImageEditMaskStats {
   transparentRatio?: number;
   bbox?: string;
   itemCount: number;
+  corePixelCount?: number;
+  componentCount?: number;
+  maxComponentLongestSideRatio?: number;
+  gateRejectionReasons?: string[];
   warnings?: string[];
 }
 
@@ -296,7 +322,89 @@ export interface ImageEditLocalProtectionMaskImage extends ImageEditMaskImage {
   stats?: ImageEditMaskStats;
 }
 
+export interface ImageEditLocalProtectionEligibility {
+  requested: boolean;
+  eligible: boolean;
+  reasons: string[];
+}
+
+export type ImageEditCompositorVersion = "source_locked_v2";
+
+export interface ImageEditCompositeComponentAudit {
+  index: number;
+  pixelCount: number;
+  bbox: string;
+  longestSideRatio: number;
+  boundarySampleCount: number;
+  boundaryRgbP95: number;
+  boundaryRgbP99: number;
+  boundaryGradientP95: number;
+}
+
+export interface ImageEditCompositeAudit {
+  status: "pending" | "passed" | "rejected" | "legacy_unverified";
+  compositorVersion?: ImageEditCompositorVersion;
+  evaluatedAt?: string;
+  reasons: string[];
+  width?: number;
+  height?: number;
+  corePixelCount?: number;
+  coreRatio?: number;
+  componentCount?: number;
+  maxComponentLongestSideRatio?: number;
+  boundarySampleCount?: number;
+  boundaryRgbP95?: number;
+  boundaryRgbP99?: number;
+  boundaryGradientP95?: number;
+  transitionWidth?: number;
+  outsideCoreChangedPixels?: number;
+  invalidAlphaPixels?: number;
+  components?: ImageEditCompositeComponentAudit[];
+}
+
 export type ImageEditAnnotationTool = "brush" | "arrow" | "box" | "text";
+
+export interface ImageEditPoint {
+  x: number;
+  y: number;
+}
+
+export type ImageEditAnnotationGeometry =
+  | {
+      tool: "box";
+      left: number;
+      top: number;
+      right: number;
+      bottom: number;
+      centerX: number;
+      centerY: number;
+      width: number;
+      height: number;
+    }
+  | {
+      tool: "arrow";
+      startX: number;
+      startY: number;
+      endX: number;
+      endY: number;
+    }
+  | {
+      tool: "brush";
+      left: number;
+      top: number;
+      right: number;
+      bottom: number;
+      centerX: number;
+      centerY: number;
+      coverageRatio: number;
+      effectiveLineWidth: number;
+    }
+  | {
+      tool: "text";
+      anchorX: number;
+      anchorY: number;
+      text: string;
+    };
 
 export interface ImageEditAnnotationItem {
   index: number;
@@ -304,6 +412,62 @@ export interface ImageEditAnnotationItem {
   tool: ImageEditAnnotationTool;
   note: string;
   positionHint?: string;
+  geometry?: ImageEditAnnotationGeometry;
+}
+
+export interface ImageEditResolvedAnnotation {
+  index: number;
+  targetObject: string;
+  currentState: string;
+  requestedChange: string;
+  preserve: string[];
+  spatialAnchors: string[];
+  originalText?: string;
+  replacementText?: string;
+  confidence: number;
+  ambiguity: string;
+  userConfirmed: boolean;
+}
+
+export interface ImageEditAnnotationResolution {
+  contentHash: string;
+  status: "needs_review" | "confirmed";
+  source: "vision_model" | "manual_fallback";
+  modelName?: string;
+  createdAt: string;
+  confirmedAt?: string;
+  items: ImageEditResolvedAnnotation[];
+}
+
+export interface ImageEditAnnotationResolveRequest {
+  sourceImageDataUrl: string;
+  annotationImageDataUrl: string;
+  annotationItems: ImageEditAnnotationItem[];
+  instruction: string;
+  basePrompt: string;
+}
+
+export interface ImageEditAnnotationResolveResponse {
+  resolution: ImageEditAnnotationResolution;
+  fallbackReason?: string;
+}
+
+export interface ImageEditOriginReference extends GenerationReferenceImage {
+  assetFileName?: string;
+  width?: number;
+  height?: number;
+  byteLength?: number;
+  sha256?: string;
+}
+
+export interface ImageEditRegenerationContext {
+  basePrompt: string;
+  generationTaskId?: string;
+  generationOutputId?: string;
+  sourceLabel: string;
+  importedAt: string;
+  inputStrategy: ImageEditRegenerationInputStrategy;
+  originalReferences: ImageEditOriginReference[];
 }
 
 export interface ImageEditRequestSettings {
@@ -323,12 +487,12 @@ export interface ImageEditRequestSettings {
 
 export interface ImageEditCreateRequest {
   sourceImage: ImageEditSourceImage;
+  sourceIntegrity?: ImageEditSourceIntegrity;
   annotationImage: ImageEditAnnotationImage;
-  maskImage?: ImageEditMaskImage;
-  localProtectionMaskImage?: ImageEditLocalProtectionMaskImage;
   annotationItems?: ImageEditAnnotationItem[];
+  annotationResolution?: ImageEditAnnotationResolution;
+  regenerationContext?: ImageEditRegenerationContext;
   fidelityMode?: ImageEditFidelityMode;
-  pixelProtectionEnabled?: boolean;
   instruction: string;
   settings: ImageEditRequestSettings;
 }
@@ -341,9 +505,6 @@ export interface ImageEditBackendSnapshot {
   apiMode: GenerationApiMode;
   imageModel: string;
   mainModel: string;
-  supportsMaskEdit?: boolean;
-  maskEditUnavailableReason?: string;
-  fidelityNote?: string;
 }
 
 export interface ImageEditDiagnostics {
@@ -353,13 +514,14 @@ export interface ImageEditDiagnostics {
   model?: string;
   requestedSize?: string;
   outputFormat?: GenerationRequestSettings["outputFormat"];
-  sourceImage?: { width?: number; height?: number; mimeType?: string; reencodedToPng?: boolean };
+  sourceImage?: { width?: number; height?: number; mimeType?: string };
   annotationImage?: { width?: number; height?: number; itemCount?: number };
-  localMask?: ImageEditMaskStats;
-  strictMaskSubmitted: boolean;
-  localMaskSubmittedToBackend: false;
-  supportsMaskEdit?: boolean;
-  maskEditUnavailableReason?: string;
+  regenerationInputStrategy?: ImageEditRegenerationInputStrategy;
+  originReferenceCount?: number;
+  annotationResolutionSource?: ImageEditAnnotationResolution["source"];
+  annotationResolutionStatus?: ImageEditAnnotationResolution["status"];
+  currentSourceSubmitted?: boolean;
+  annotationImageSubmitted?: boolean;
 }
 
 export interface ImageEditOutputVariant {
@@ -370,6 +532,8 @@ export interface ImageEditOutputVariant {
   height?: number;
   assetFileName?: string;
   createdAt: string;
+  compositorVersion?: ImageEditCompositorVersion;
+  verified?: boolean;
   warnings?: string[];
 }
 
@@ -388,18 +552,9 @@ export interface ImageEditOutput {
   sizeMismatch?: boolean;
   warnings?: string[];
   error?: string;
+  compositeAudit?: ImageEditCompositeAudit;
   protectedVariant?: ImageEditOutputVariant;
   protectedVariantUnavailableReason?: string;
-}
-
-export interface ImageEditProtectedVariantSaveRequest {
-  taskId: string;
-  outputId: string;
-  dataUrl: string;
-  mimeType: string;
-  width?: number;
-  height?: number;
-  warnings?: string[];
 }
 
 export interface ImageEditTaskVisibilityUpdate {
@@ -432,12 +587,18 @@ export interface ImageEditTask {
   archivedAt?: string;
   hiddenAt?: string;
   sourceImage: ImageEditSourceImage;
+  modelInputImage?: ImageEditModelInputImage;
+  sourceIntegrity?: ImageEditSourceIntegrity;
   annotationImage: ImageEditAnnotationImage;
   maskImage?: ImageEditMaskImage;
   localProtectionMaskImage?: ImageEditLocalProtectionMaskImage;
   annotationItems: ImageEditAnnotationItem[];
-  fidelityMode: ImageEditFidelityMode;
+  annotationResolution?: ImageEditAnnotationResolution;
+  regenerationContext?: ImageEditRegenerationContext;
+  fidelityMode: ImageEditStoredFidelityMode;
   pixelProtectionEnabled?: boolean;
+  localProtectionEligibility?: ImageEditLocalProtectionEligibility;
+  compositorVersion?: ImageEditCompositorVersion;
   instruction: string;
   finalPrompt: string;
   settings: ImageEditRequestSettings;
@@ -821,8 +982,8 @@ export interface AppApi {
   clearGenerationTasks: () => Promise<void>;
   saveGenerationOutputs: (request: GenerationOutputsSaveRequest) => Promise<GenerationOutputsSaveResult>;
   getImageEditTasks: () => Promise<ImageEditTask[]>;
+  resolveImageEditAnnotations: (request: ImageEditAnnotationResolveRequest) => Promise<ImageEditAnnotationResolveResponse>;
   createImageEditTask: (request: ImageEditCreateRequest) => Promise<ImageEditTask>;
-  saveImageEditProtectedVariant: (request: ImageEditProtectedVariantSaveRequest) => Promise<ImageEditTask>;
   cancelImageEditTask: (id: string) => Promise<ImageEditTask | null>;
   retryImageEditTask: (id: string) => Promise<ImageEditTask>;
   restoreImageEditTask: (id: string) => Promise<ImageEditTask | null>;

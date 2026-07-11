@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { safeStorage } from "electron";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -11,19 +11,26 @@ import type {
   GenerationRequestSettings,
   GenerationRequestSizeStrategy,
   ImageEditAnnotationItem,
+  ImageEditAnnotationResolution,
   ImageEditCreateRequest,
   ImageEditDiagnostics,
-  ImageEditFidelityMode,
   ImageEditLocalProtectionMaskImage,
   ImageEditMaskImage,
+  ImageEditModelInputImage,
   ImageEditOutput,
   ImageEditOutputVariant,
+  ImageEditOriginReference,
   ImageEditOutputsSaveRequest,
-  ImageEditProtectedVariantSaveRequest,
   ImageEditTask,
+  ImageEditStoredFidelityMode,
   ImageEditTaskVisibility,
   ImageEditTaskVisibilityUpdate
 } from "../src/shared/types";
+import {
+  assertConfirmedAnnotationResolution,
+  buildOriginRegenerationPrompt,
+  normalizeOriginAnnotationItems
+} from "../src/shared/image-edit-regeneration";
 import {
   generationAspectRatioOptions,
   normalizeGenerationSizeSettings,
@@ -90,23 +97,37 @@ interface StoredGenerationProviderForImageEdit {
   apiKey?: string;
 }
 
-type StoredImageEditSourceImage = Omit<ImageEditTask["sourceImage"], "dataUrl"> & { assetFileName: string };
-type StoredImageEditAnnotationImage = Omit<ImageEditTask["annotationImage"], "dataUrl"> & { assetFileName: string };
-type StoredImageEditMaskImage = Omit<ImageEditMaskImage, "dataUrl"> & { assetFileName: string };
-type StoredImageEditLocalProtectionMaskImage = Omit<ImageEditLocalProtectionMaskImage, "dataUrl"> & { assetFileName: string };
+type StoredImageEditSourceImage = Omit<ImageEditTask["sourceImage"], "dataUrl" | "thumbnailDataUrl"> & { assetFileName: string };
+type StoredImageEditModelInputImage = Omit<ImageEditModelInputImage, "dataUrl"> & { assetFileName: string };
+type StoredImageEditAnnotationImage = Omit<ImageEditTask["annotationImage"], "dataUrl" | "thumbnailDataUrl"> & { assetFileName: string };
+type StoredImageEditMaskImage = Omit<ImageEditMaskImage, "dataUrl" | "thumbnailDataUrl"> & { assetFileName: string };
+type StoredImageEditLocalProtectionMaskImage = Omit<ImageEditLocalProtectionMaskImage, "dataUrl" | "thumbnailDataUrl"> & { assetFileName: string };
 type StoredImageEditOutputVariant = Omit<ImageEditOutputVariant, "dataUrl"> & { assetFileName: string };
 type StoredImageEditOutput = Omit<ImageEditOutput, "dataUrl" | "protectedVariant"> & {
   assetFileName: string;
   protectedVariant?: StoredImageEditOutputVariant;
 };
+type StoredImageEditOriginReference = Omit<ImageEditOriginReference, "dataUrl" | "thumbnailDataUrl"> & {
+  assetFileName: string;
+};
 type StoredImageEditTask = Omit<
   ImageEditTask,
-  "sourceImage" | "annotationImage" | "maskImage" | "localProtectionMaskImage" | "outputs"
+  | "sourceImage"
+  | "modelInputImage"
+  | "annotationImage"
+  | "maskImage"
+  | "localProtectionMaskImage"
+  | "regenerationContext"
+  | "outputs"
 > & {
   sourceImage: StoredImageEditSourceImage;
+  modelInputImage?: StoredImageEditModelInputImage;
   annotationImage: StoredImageEditAnnotationImage;
   maskImage?: StoredImageEditMaskImage;
   localProtectionMaskImage?: StoredImageEditLocalProtectionMaskImage;
+  regenerationContext?: Omit<NonNullable<ImageEditTask["regenerationContext"]>, "originalReferences"> & {
+    originalReferences: StoredImageEditOriginReference[];
+  };
   outputs: StoredImageEditOutput[];
 };
 
@@ -118,10 +139,8 @@ const DEFAULT_OPENROUTER_IMAGE_MODEL = "openai/gpt-image-2";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_USER_AGENT = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) Codex Desktop";
 const CODEX_ORIGINATOR = "codex-tui";
-const OPENROUTER_EDIT_FIDELITY_NOTE = "OpenRouter /images + input_references 属于参考生图，不承诺严格源图保真。";
-const MASK_EDIT_UNAVAILABLE_OPENROUTER = "OpenRouter /images 是参考生成接口，不支持 alpha mask 严格编辑。";
-const MASK_EDIT_UNAVAILABLE_CODEX = "Codex OAuth 当前走 Responses image_generation，不支持本方案的 alpha mask 严格编辑。";
-const MASK_EDIT_UNAVAILABLE_RESPONSES = "OpenAI-compatible Responses 当前走 image_generation 工具，本方案 v1 不接入 mask 文件上传。";
+const MAX_IMAGE_EDIT_SOURCE_BYTES = 32 * 1024 * 1024;
+const MAX_IMAGE_EDIT_SOURCE_PIXELS = 12_000_000;
 
 const clamp = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max);
 
@@ -130,13 +149,6 @@ const normalizeTaskVisibility = (value: ImageEditTaskVisibility | undefined): Im
 
 const normalizeAnnotationTool = (tool: ImageEditAnnotationItem["tool"] | undefined): ImageEditAnnotationItem["tool"] =>
   tool === "arrow" || tool === "box" || tool === "text" ? tool : "brush";
-
-const annotationToolLabel = (tool: ImageEditAnnotationItem["tool"]): string => {
-  if (tool === "arrow") return "箭头";
-  if (tool === "box") return "框选";
-  if (tool === "text") return "文字批注";
-  return "画笔";
-};
 
 const normalizeAnnotationItems = (items: ImageEditAnnotationItem[] | undefined): ImageEditAnnotationItem[] =>
   (Array.isArray(items) ? items : [])
@@ -149,7 +161,8 @@ const normalizeAnnotationItems = (items: ImageEditAnnotationItem[] | undefined):
         label: `标注 ${index}`,
         tool,
         note: item.note?.trim().slice(0, 600) || "按总体改图说明处理此处。",
-        positionHint: item.positionHint?.trim().slice(0, 120) || undefined
+        positionHint: item.positionHint?.trim().slice(0, 120) || undefined,
+        geometry: item.geometry
       };
     });
 
@@ -164,10 +177,65 @@ const dataUrlToBuffer = (dataUrl: string): { mimeType: string; buffer: Buffer } 
   if (!match || match[2] !== ";base64") {
     throw new Error("改图图片必须是有效的 base64 图片数据。");
   }
-  return {
-    mimeType: match[1] || "image/png",
-    buffer: Buffer.from(match[3], "base64")
-  };
+  const encoded = match[3].replace(/\s/g, "");
+  if (!encoded || !/^[a-z0-9+/]+={0,2}$/i.test(encoded)) {
+    throw new Error("改图图片必须是有效的 base64 图片数据。");
+  }
+  const buffer = Buffer.from(encoded, "base64");
+  if (!buffer.length) throw new Error("改图图片数据为空。");
+  return { mimeType: match[1] || "image/png", buffer };
+};
+
+type SupportedImageMimeType = "image/png" | "image/jpeg" | "image/webp";
+
+const sniffSupportedImageMimeType = (buffer: Buffer): SupportedImageMimeType | null => {
+  if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (
+    buffer.length >= 12 &&
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return null;
+};
+
+const inspectImageDataUrl = (
+  dataUrl: string,
+  label: string,
+  enforceSourceLimits = false
+): {
+  mimeType: SupportedImageMimeType;
+  buffer: Buffer;
+  width: number;
+  height: number;
+  size: string;
+} => {
+  const { buffer } = dataUrlToBuffer(dataUrl);
+  const mimeType = sniffSupportedImageMimeType(buffer);
+  if (!mimeType) throw new Error(`${label}必须是可解码的 PNG、JPEG 或 WebP 图片。`);
+  const dimensions = parseGenerationOutputDimensions(dataUrlFromBuffer(buffer, mimeType));
+  if (!dimensions) throw new Error(`${label}无法从图片字节解析真实尺寸。`);
+  if (enforceSourceLimits && buffer.length > MAX_IMAGE_EDIT_SOURCE_BYTES) {
+    throw new Error("改图源图原始数据超过 32MB，已拒绝且不会静默压缩。");
+  }
+  if (enforceSourceLimits && dimensions.width * dimensions.height > MAX_IMAGE_EDIT_SOURCE_PIXELS) {
+    throw new Error("改图源图解码像素超过 1200 万，已拒绝且不会静默缩小。");
+  }
+  return { mimeType, buffer, ...dimensions };
 };
 
 const dataUrlFromBuffer = (buffer: Buffer, mimeType: string): string => `data:${mimeType};base64,${buffer.toString("base64")}`;
@@ -181,8 +249,27 @@ const imageExtension = (mimeType: string): "jpg" | "png" | "webp" => {
 const normalizeProviderType = (providerType: GenerationProviderType | undefined): GenerationProviderType =>
   providerType === "openrouter" ? "openrouter" : "openai_compatible";
 
-const normalizeFidelityMode = (value: ImageEditFidelityMode | undefined): ImageEditFidelityMode =>
-  value === "strict_mask" ? "strict_mask" : "reference";
+const normalizeFidelityMode = (value: ImageEditStoredFidelityMode | undefined): ImageEditStoredFidelityMode =>
+  value === "strict_mask" || value === "origin_regenerate" ? value : "reference";
+
+export const imageEditAnnotationContentHash = (
+  sourceDataUrl: string,
+  annotationItems: ImageEditAnnotationItem[],
+  instruction: string,
+  basePrompt: string
+): string => {
+  const source = dataUrlToBuffer(sourceDataUrl).buffer;
+  const normalizedItems = normalizeOriginAnnotationItems(annotationItems);
+  return createHash("sha256")
+    .update(source)
+    .update("\0")
+    .update(JSON.stringify(normalizedItems))
+    .update("\0")
+    .update(instruction.trim())
+    .update("\0")
+    .update(basePrompt.trim())
+    .digest("hex");
+};
 
 const decryptStoredApiKey = (
   stored: Pick<StoredGenerationConfigForImageEdit | StoredGenerationProviderForImageEdit, "encryptedApiKey" | "saveApiKey" | "apiKey">
@@ -258,31 +345,25 @@ const toGenerationSettings = (settings: ImageEditTask["settings"]): GenerationRe
   promptMode: "strict"
 });
 
-export const imageEditMaskCapabilityForBackend = (
-  backend: { authSource: GenerationAuthSource; providerType: GenerationProviderType; apiMode: GenerationApiMode }
-): { supportsMaskEdit: boolean; maskEditUnavailableReason?: string } => {
-  if (backend.authSource === "codex_oauth") {
-    return { supportsMaskEdit: false, maskEditUnavailableReason: MASK_EDIT_UNAVAILABLE_CODEX };
-  }
-  if (backend.providerType === "openrouter") {
-    return { supportsMaskEdit: false, maskEditUnavailableReason: MASK_EDIT_UNAVAILABLE_OPENROUTER };
-  }
-  if (backend.apiMode !== "images") {
-    return { supportsMaskEdit: false, maskEditUnavailableReason: MASK_EDIT_UNAVAILABLE_RESPONSES };
-  }
-  return { supportsMaskEdit: true };
-};
+export const forceOriginRegenerationResponsesAction = (payload: Record<string, unknown>): Record<string, unknown> => ({
+  ...payload,
+  tools: Array.isArray(payload.tools)
+    ? payload.tools.map((tool) =>
+        tool && typeof tool === "object" && (tool as { type?: string }).type === "image_generation"
+          ? { ...(tool as Record<string, unknown>), action: "generate" }
+          : tool
+      )
+    : payload.tools
+});
 
 const backendSnapshotForTask = (config: EffectiveImageEditBackend): ImageEditTask["backend"] => ({
-  ...imageEditMaskCapabilityForBackend(config),
   authSource: config.authSource,
   providerType: config.providerType,
   providerName: config.providerName,
   apiBaseUrl: config.authSource === "api" ? config.apiBaseUrl : undefined,
   apiMode: config.authSource === "codex_oauth" ? "responses" : config.providerType === "openrouter" ? "images" : config.apiMode,
   imageModel: config.imageModel,
-  mainModel: config.mainModel,
-  fidelityNote: config.providerType === "openrouter" ? OPENROUTER_EDIT_FIDELITY_NOTE : undefined
+  mainModel: config.mainModel
 });
 
 const diagnosticsBackendType = (
@@ -299,9 +380,8 @@ const diagnosticsBackendType = (
 const diagnosticsForTask = (
   request: ImageEditCreateRequest,
   backend: EffectiveImageEditBackend | null,
-  backendSnapshot: ImageEditTask["backend"] | undefined
+  _backendSnapshot: ImageEditTask["backend"] | undefined
 ): ImageEditDiagnostics => {
-  const strictMaskSubmitted = normalizeFidelityMode(request.fidelityMode) === "strict_mask" && Boolean(request.maskImage);
   const backendType = diagnosticsBackendType(backend, request);
   return {
     backendType,
@@ -316,25 +396,21 @@ const diagnosticsForTask = (
     requestedSize: request.settings.size,
     outputFormat: request.settings.outputFormat,
     sourceImage: {
-      width: request.sourceImage.width,
-      height: request.sourceImage.height,
-      mimeType: request.sourceImage.mimeType,
-      reencodedToPng: normalizeFidelityMode(request.fidelityMode) === "strict_mask" && request.sourceImage.mimeType === "image/png"
+      width: request.sourceIntegrity?.width || request.sourceImage.width,
+      height: request.sourceIntegrity?.height || request.sourceImage.height,
+      mimeType: request.sourceIntegrity?.actualMimeType || request.sourceImage.mimeType
     },
     annotationImage: {
       width: parseGenerationOutputDimensions(request.annotationImage.dataUrl)?.width,
       height: parseGenerationOutputDimensions(request.annotationImage.dataUrl)?.height,
       itemCount: request.annotationImage.itemCount
     },
-    localMask: request.localProtectionMaskImage?.stats || {
-      width: request.localProtectionMaskImage?.width,
-      height: request.localProtectionMaskImage?.height,
-      itemCount: request.localProtectionMaskImage?.itemCount || 0
-    },
-    strictMaskSubmitted,
-    localMaskSubmittedToBackend: false,
-    supportsMaskEdit: backendSnapshot?.supportsMaskEdit,
-    maskEditUnavailableReason: backendSnapshot?.maskEditUnavailableReason
+    regenerationInputStrategy: request.regenerationContext?.inputStrategy,
+    originReferenceCount: request.regenerationContext?.originalReferences?.length || 0,
+    annotationResolutionSource: request.annotationResolution?.source,
+    annotationResolutionStatus: request.annotationResolution?.status,
+    currentSourceSubmitted: false,
+    annotationImageSubmitted: false
   };
 };
 
@@ -429,52 +505,6 @@ const requestEditForm = async (
   return text;
 };
 
-const requestMaskedEditForm = async (
-  url: string,
-  apiKey: string,
-  prompt: string,
-  settings: GenerationRequestSettings,
-  sourceImageDataUrl: string,
-  maskImageDataUrl: string,
-  signal: AbortSignal
-): Promise<string> => {
-  const source = dataUrlToBuffer(sourceImageDataUrl);
-  const mask = dataUrlToBuffer(maskImageDataUrl);
-  if (source.mimeType !== "image/png" || mask.mimeType !== "image/png") {
-    throw new Error("严格保真模式要求源图和 mask 都是 PNG。");
-  }
-  const sourceDimensions = parseGenerationOutputDimensions(sourceImageDataUrl);
-  const maskDimensions = parseGenerationOutputDimensions(maskImageDataUrl);
-  if (
-    sourceDimensions &&
-    maskDimensions &&
-    (sourceDimensions.width !== maskDimensions.width || sourceDimensions.height !== maskDimensions.height)
-  ) {
-    throw new Error("严格保真模式的源图和 mask 必须同尺寸。");
-  }
-
-  const form = new FormData();
-  const payload = buildImagesGenerationPayload(prompt, settings);
-  Object.entries(payload).forEach(([key, value]) => {
-    if (key === "n" || value !== undefined) form.append(key, String(value));
-  });
-  form.append("image", new Blob([new Uint8Array(source.buffer)], { type: "image/png" }), "source.png");
-  form.append("mask", new Blob([new Uint8Array(mask.buffer)], { type: "image/png" }), "mask.png");
-
-  const response = await fetch(url, {
-    method: "POST",
-    signal,
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: form
-  });
-  const text = await response.text();
-  if (!response.ok) throw new ModelHttpError(response.status, text);
-  return text;
-};
-
 const codexHeaders = (authState: CodexAuthState): Record<string, string> => {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -543,11 +573,7 @@ const requestOpenRouterImageEdit = async (
     });
     const text = await response.text();
     if (response.ok) {
-      const results = await parseOpenRouterImagesResponse(text, backend.apiKey, settings);
-      return results.map((result) => ({
-        ...result,
-        warnings: [...(result.warnings || []), OPENROUTER_EDIT_FIDELITY_NOTE]
-      }));
+      return parseOpenRouterImagesResponse(text, backend.apiKey, settings);
     }
     lastFailure = { status: response.status, text };
     if (!isOpenRouterParameterError(response.status, text) || sizeStrategy === "openrouter_aspect_ratio") {
@@ -609,94 +635,98 @@ export const imageEditSettingsFromSource = (
 
 const normalizeCreateRequest = (request: ImageEditCreateRequest): ImageEditCreateRequest => {
   if (!request.sourceImage.dataUrl.startsWith("data:image/")) throw new Error("请先导入一张可改图的源图。");
-  if (!request.annotationImage.dataUrl.startsWith("data:image/")) throw new Error("请先完成标注后再开始改图。");
+  if (!request.annotationImage.dataUrl.startsWith("data:image/")) throw new Error("请先完成标注后再生成修订版。");
+  if (request.fidelityMode && request.fidelityMode !== "origin_regenerate") {
+    throw new Error("改图工作台现在只支持原始素材重生成修订版。");
+  }
+  const legacyRequest = request as ImageEditCreateRequest & {
+    modelInputImage?: unknown;
+    maskImage?: unknown;
+    localProtectionMaskImage?: unknown;
+  };
+  if (legacyRequest.modelInputImage || legacyRequest.maskImage || legacyRequest.localProtectionMaskImage) {
+    throw new Error("重生成修订版不得提交当前生成图的模型输入副本或任何 mask。");
+  }
+
   const instruction = request.instruction.trim();
-  const annotationItems = normalizeAnnotationItems(request.annotationItems);
-  const fidelityMode = normalizeFidelityMode(request.fidelityMode);
-  const hasLocalInstruction = annotationItems.some((item) => item.note && item.note !== "按总体改图说明处理此处。");
-  if (!instruction && !hasLocalInstruction) {
-    throw new Error("请填写总体改图说明，或至少为一处标注填写修改要求。");
+  const annotationItems = normalizeOriginAnnotationItems(request.annotationItems || []);
+  const regenerationContext = request.regenerationContext;
+  if (!regenerationContext?.basePrompt.trim()) {
+    throw new Error("重生成修订版缺少第一次生图的基础提示词。");
   }
-  if (fidelityMode === "strict_mask") {
-    if (!annotationItems.length || request.annotationImage.itemCount <= 0) {
-      throw new Error("严格保真模式至少需要 1 个编号标注，用于生成 alpha mask。");
-    }
-    if (!request.maskImage?.dataUrl.startsWith("data:image/")) {
-      throw new Error("严格保真模式需要同尺寸 alpha mask PNG。");
-    }
-  }
-  const sourceDimensions = parseGenerationOutputDimensions(request.sourceImage.dataUrl);
-  const normalizedSize = normalizeGenerationSizeSettings(request.settings);
-  const requestedSize = String(request.settings.size ?? "").trim();
-  const sourceExactSize = sourceDimensions ? `${sourceDimensions.width}x${sourceDimensions.height}` : "";
-  const shouldKeepSourceExactSize =
-    fidelityMode === "reference" &&
-    request.pixelProtectionEnabled !== false &&
-    Boolean(request.localProtectionMaskImage?.dataUrl) &&
-    requestedSize === sourceExactSize;
-  const normalizedRequestSize = shouldKeepSourceExactSize ? sourceExactSize : normalizedSize.size;
-  const maskDimensions = request.maskImage?.dataUrl ? parseGenerationOutputDimensions(request.maskImage.dataUrl) : null;
-  const localMaskDimensions = request.localProtectionMaskImage?.dataUrl
-    ? parseGenerationOutputDimensions(request.localProtectionMaskImage.dataUrl)
-    : null;
-  if (fidelityMode === "strict_mask" && sourceDimensions && maskDimensions) {
-    if (sourceDimensions.width !== maskDimensions.width || sourceDimensions.height !== maskDimensions.height) {
-      throw new Error("严格保真模式的源图和 mask 必须同尺寸。");
-    }
-  }
-  return {
-    ...request,
-    fidelityMode,
-    instruction,
+  const requestedOriginReferences = Array.isArray(regenerationContext.originalReferences)
+    ? regenerationContext.originalReferences
+    : [];
+  if (requestedOriginReferences.length > 8) throw new Error("原始主体参考图最多允许 8 张。");
+
+  const sourceAsset = inspectImageDataUrl(request.sourceImage.dataUrl, "canonical source", true);
+  const annotationAsset = inspectImageDataUrl(request.annotationImage.dataUrl, "改图定位图");
+  const normalizedReferences = requestedOriginReferences.map((reference, index) => {
+    const asset = inspectImageDataUrl(reference.dataUrl, `原始主体参考图 ${index + 1}`, true);
+    return {
+      ...reference,
+      name: reference.name.trim() || `原始主体参考图 ${index + 1}`,
+      mimeType: asset.mimeType,
+      width: asset.width,
+      height: asset.height,
+      byteLength: asset.buffer.length,
+      sha256: createHash("sha256").update(asset.buffer).digest("hex")
+    };
+  });
+  const normalizedRegenerationContext = {
+    ...regenerationContext,
+    basePrompt: regenerationContext.basePrompt.trim(),
+    sourceLabel: regenerationContext.sourceLabel.trim() || "手动重生成",
+    inputStrategy: normalizedReferences.length > 0 ? ("original_references" as const) : ("text_only" as const),
+    originalReferences: normalizedReferences
+  };
+  const expectedResolutionHash = imageEditAnnotationContentHash(
+    request.sourceImage.dataUrl,
     annotationItems,
+    instruction,
+    normalizedRegenerationContext.basePrompt
+  );
+  const annotationResolution = assertConfirmedAnnotationResolution(
+    request.annotationResolution,
+    annotationItems,
+    expectedResolutionHash
+  );
+  const normalizedSize = normalizeGenerationSizeSettings(request.settings);
+
+  return {
     sourceImage: {
       ...request.sourceImage,
-      mimeType: dataUrlToBuffer(request.sourceImage.dataUrl).mimeType,
-      width: request.sourceImage.width || sourceDimensions?.width,
-      height: request.sourceImage.height || sourceDimensions?.height
+      mimeType: sourceAsset.mimeType,
+      width: sourceAsset.width,
+      height: sourceAsset.height
+    },
+    sourceIntegrity: {
+      actualMimeType: sourceAsset.mimeType,
+      byteLength: sourceAsset.buffer.length,
+      width: sourceAsset.width,
+      height: sourceAsset.height,
+      pixelCount: sourceAsset.width * sourceAsset.height,
+      sha256: createHash("sha256").update(sourceAsset.buffer).digest("hex"),
+      canonicalBytesPreserved: true
     },
     annotationImage: {
       ...request.annotationImage,
-      mimeType: dataUrlToBuffer(request.annotationImage.dataUrl).mimeType,
-      itemCount: Math.max(Math.round(request.annotationImage.itemCount || 0), 0)
+      mimeType: annotationAsset.mimeType,
+      itemCount: annotationItems.length
     },
-    maskImage: request.maskImage
-      ? {
-          ...request.maskImage,
-          mimeType: dataUrlToBuffer(request.maskImage.dataUrl).mimeType,
-          width: request.maskImage.width || maskDimensions?.width,
-          height: request.maskImage.height || maskDimensions?.height,
-          itemCount: Math.max(Math.round(request.maskImage.itemCount || 0), 0)
-        }
-      : undefined,
-    localProtectionMaskImage: request.localProtectionMaskImage
-      ? {
-          ...request.localProtectionMaskImage,
-          purpose: "local_protection",
-          mimeType: dataUrlToBuffer(request.localProtectionMaskImage.dataUrl).mimeType,
-          width: request.localProtectionMaskImage.width || localMaskDimensions?.width,
-          height: request.localProtectionMaskImage.height || localMaskDimensions?.height,
-          itemCount: Math.max(Math.round(request.localProtectionMaskImage.itemCount || 0), 0),
-          stats: {
-            ...request.localProtectionMaskImage.stats,
-            width: request.localProtectionMaskImage.stats?.width || request.localProtectionMaskImage.width || localMaskDimensions?.width,
-            height: request.localProtectionMaskImage.stats?.height || request.localProtectionMaskImage.height || localMaskDimensions?.height,
-            itemCount: Math.max(Math.round(request.localProtectionMaskImage.stats?.itemCount || request.localProtectionMaskImage.itemCount || 0), 0)
-          }
-        }
-      : undefined,
-    pixelProtectionEnabled: request.pixelProtectionEnabled !== false,
+    annotationItems,
+    annotationResolution,
+    regenerationContext: normalizedRegenerationContext,
+    fidelityMode: "origin_regenerate",
+    instruction,
     settings: {
       ...request.settings,
       ...normalizedSize,
-      size: normalizedRequestSize,
-      outputFormat: request.settings.outputFormat || "png",
-      outputCompression: sanitizeImageEditOutputCompression(request.settings),
-      n: clamp(Math.round(request.settings.n || 1), 1, 4)
+      n: clamp(Math.round(request.settings.n || 1), 1, 4),
+      outputCompression: sanitizeImageEditOutputCompression(request.settings)
     }
   };
 };
-
 export class ImageEditService {
   private readonly concurrency: number;
   private readonly runner: ImageEditTaskRunner;
@@ -728,7 +758,7 @@ export class ImageEditService {
   }
 
   private async writeAsset(taskId: string, fileName: string, dataUrl: string): Promise<string> {
-    const { buffer, mimeType } = dataUrlToBuffer(dataUrl);
+    const { buffer, mimeType } = inspectImageDataUrl(dataUrl, "改图任务资产");
     const fileNameWithExtension = fileName.includes(".") ? fileName : `${fileName}.${imageExtension(mimeType)}`;
     await mkdir(this.assetsDir(taskId), { recursive: true });
     await writeFile(join(this.assetsDir(taskId), fileNameWithExtension), buffer);
@@ -741,20 +771,41 @@ export class ImageEditService {
   }
 
   private stripTaskAssets(task: ImageEditTask): StoredImageEditTask {
-    const { dataUrl: _sourceDataUrl, ...sourceImage } = task.sourceImage;
-    const { dataUrl: _annotationDataUrl, ...annotationImage } = task.annotationImage;
+    const { dataUrl: _sourceDataUrl, thumbnailDataUrl: _sourceThumbnailDataUrl, ...sourceImage } = task.sourceImage;
+    const modelInputImage = task.modelInputImage
+      ? (({ dataUrl: _modelInputDataUrl, ...metadata }) => ({
+          ...metadata,
+          assetFileName: metadata.assetFileName || "model-input.png"
+        }))(task.modelInputImage)
+      : undefined;
+    const { dataUrl: _annotationDataUrl, thumbnailDataUrl: _annotationThumbnailDataUrl, ...annotationImage } = task.annotationImage;
     const maskImage = task.maskImage
-      ? (({ dataUrl: _maskDataUrl, ...metadata }) => ({
+      ? (({ dataUrl: _maskDataUrl, thumbnailDataUrl: _maskThumbnailDataUrl, ...metadata }) => ({
           ...metadata,
           assetFileName: metadata.assetFileName || "mask.png"
         }))(task.maskImage)
       : undefined;
     const localProtectionMaskImage = task.localProtectionMaskImage
-      ? (({ dataUrl: _localMaskDataUrl, ...metadata }) => ({
+      ? (({ dataUrl: _localMaskDataUrl, thumbnailDataUrl: _localMaskThumbnailDataUrl, ...metadata }) => ({
           ...metadata,
           purpose: "local_protection" as const,
           assetFileName: metadata.assetFileName || "local-protection-mask.png"
         }))(task.localProtectionMaskImage)
+      : undefined;
+    const regenerationContext = task.regenerationContext
+      ? {
+          ...task.regenerationContext,
+          originalReferences: (Array.isArray(task.regenerationContext.originalReferences)
+            ? task.regenerationContext.originalReferences
+            : []
+          ).map((reference, index) => {
+            const { dataUrl: _referenceDataUrl, thumbnailDataUrl: _referenceThumbnailDataUrl, ...metadata } = reference;
+            return {
+              ...metadata,
+              assetFileName: metadata.assetFileName || `origin-reference-${String(index + 1).padStart(2, "0")}.png`
+            };
+          })
+        }
       : undefined;
     return {
       ...task,
@@ -763,12 +814,14 @@ export class ImageEditService {
         ...sourceImage,
         assetFileName: sourceImage.assetFileName || "source.png"
       },
+      modelInputImage,
       annotationImage: {
         ...annotationImage,
         assetFileName: annotationImage.assetFileName || "annotation.png"
       },
       maskImage,
       localProtectionMaskImage,
+      regenerationContext,
       outputs: task.outputs.map((output, index) => {
         const { dataUrl: _outputDataUrl, protectedVariant, ...metadata } = output;
         const storedProtectedVariant = protectedVariant
@@ -791,6 +844,13 @@ export class ImageEditService {
     const sourceDataUrl = await this.readAssetDataUrl(task.id, task.sourceImage.assetFileName, task.sourceImage.mimeType).catch(
       () => ""
     );
+    const modelInputDataUrl = task.modelInputImage
+      ? await this.readAssetDataUrl(
+          task.id,
+          task.modelInputImage.assetFileName,
+          task.modelInputImage.mimeType
+        ).catch(() => "")
+      : "";
     const annotationDataUrl = await this.readAssetDataUrl(
       task.id,
       task.annotationImage.assetFileName,
@@ -806,6 +866,20 @@ export class ImageEditService {
           task.localProtectionMaskImage.mimeType
         ).catch(() => "")
       : "";
+    const regenerationContext = task.regenerationContext
+      ? {
+          ...task.regenerationContext,
+          originalReferences: await Promise.all(
+            (Array.isArray(task.regenerationContext.originalReferences)
+              ? task.regenerationContext.originalReferences
+              : []
+            ).map(async (reference) => {
+              const dataUrl = await this.readAssetDataUrl(task.id, reference.assetFileName, reference.mimeType).catch(() => "");
+              return { ...reference, dataUrl, thumbnailDataUrl: dataUrl };
+            })
+          )
+        }
+      : undefined;
     const outputs = await Promise.all(
       task.outputs.map(async (output) => {
         const protectedVariant = output.protectedVariant
@@ -821,6 +895,14 @@ export class ImageEditService {
         return {
           ...output,
           dataUrl: await this.readAssetDataUrl(task.id, output.assetFileName, output.mimeType).catch(() => ""),
+          compositeAudit:
+            output.compositeAudit ||
+            (protectedVariant
+              ? {
+                  status: "legacy_unverified" as const,
+                  reasons: ["这是 Source-Locked V2 之前生成的旧版保护图，没有通过新门禁。"]
+                }
+              : undefined),
           protectedVariant
         };
       })
@@ -831,25 +913,36 @@ export class ImageEditService {
       annotationItems: normalizeAnnotationItems(task.annotationItems),
       sourceImage: {
         ...task.sourceImage,
-        dataUrl: sourceDataUrl
+        dataUrl: sourceDataUrl,
+        thumbnailDataUrl: sourceDataUrl
       },
+      modelInputImage: task.modelInputImage
+        ? {
+            ...task.modelInputImage,
+            dataUrl: modelInputDataUrl
+          }
+        : undefined,
       annotationImage: {
         ...task.annotationImage,
-        dataUrl: annotationDataUrl
+        dataUrl: annotationDataUrl,
+        thumbnailDataUrl: annotationDataUrl
       },
       maskImage: task.maskImage
         ? {
             ...task.maskImage,
-            dataUrl: maskDataUrl
+            dataUrl: maskDataUrl,
+            thumbnailDataUrl: maskDataUrl
           }
         : undefined,
       localProtectionMaskImage: task.localProtectionMaskImage
         ? {
             ...task.localProtectionMaskImage,
             purpose: "local_protection",
-            dataUrl: localProtectionMaskDataUrl
+            dataUrl: localProtectionMaskDataUrl,
+            thumbnailDataUrl: localProtectionMaskDataUrl
           }
         : undefined,
+      regenerationContext,
       outputs
     };
   }
@@ -861,25 +954,17 @@ export class ImageEditService {
   async createTask(request: ImageEditCreateRequest): Promise<ImageEditTask> {
     const normalized = normalizeCreateRequest(request);
     const backend = this.usesInjectedRunner ? null : await this.getEffectiveBackend();
-    if (normalized.fidelityMode === "strict_mask" && backend) {
-      const capability = imageEditMaskCapabilityForBackend(backend);
-      if (!capability.supportsMaskEdit) {
-        throw new Error(
-          capability.maskEditUnavailableReason ||
-            "当前后端不支持 mask 严格编辑，请切换到 OpenAI-compatible Images 后端，或继续使用参考生成模式。"
-        );
-      }
-    }
     const now = new Date().toISOString();
     const taskId = randomUUID();
     const sourceAssetFileName = await this.writeAsset(taskId, "source", normalized.sourceImage.dataUrl);
     const annotationAssetFileName = await this.writeAsset(taskId, "annotation", normalized.annotationImage.dataUrl);
-    const maskAssetFileName = normalized.maskImage
-      ? await this.writeAsset(taskId, "mask", normalized.maskImage.dataUrl)
-      : undefined;
-    const localProtectionMaskAssetFileName = normalized.localProtectionMaskImage
-      ? await this.writeAsset(taskId, "local-protection-mask", normalized.localProtectionMaskImage.dataUrl)
-      : undefined;
+    const originReferenceAssetFileNames = normalized.regenerationContext
+      ? await Promise.all(
+          normalized.regenerationContext.originalReferences.map((reference, index) =>
+            this.writeAsset(taskId, `origin-reference-${String(index + 1).padStart(2, "0")}`, reference.dataUrl)
+          )
+        )
+      : [];
     const settings = backend
       ? {
           ...normalized.settings,
@@ -904,31 +989,30 @@ export class ImageEditService {
         ...normalized.sourceImage,
         assetFileName: sourceAssetFileName
       },
+      sourceIntegrity: normalized.sourceIntegrity,
       annotationImage: {
         ...normalized.annotationImage,
         assetFileName: annotationAssetFileName
       },
-      maskImage: normalized.maskImage
-        ? {
-            ...normalized.maskImage,
-            assetFileName: maskAssetFileName
-          }
-        : undefined,
-      localProtectionMaskImage: normalized.localProtectionMaskImage
-        ? {
-            ...normalized.localProtectionMaskImage,
-            assetFileName: localProtectionMaskAssetFileName
-          }
-        : undefined,
       annotationItems: normalized.annotationItems || [],
-      fidelityMode: normalized.fidelityMode || "reference",
-      pixelProtectionEnabled: normalized.pixelProtectionEnabled !== false,
+      annotationResolution: normalized.annotationResolution,
+      regenerationContext: normalized.regenerationContext
+        ? {
+            ...normalized.regenerationContext,
+            originalReferences: normalized.regenerationContext.originalReferences.map((reference, index) => ({
+              ...reference,
+              assetFileName: originReferenceAssetFileNames[index]
+            }))
+          }
+        : undefined,
+      fidelityMode: "origin_regenerate",
       instruction: normalized.instruction,
-      finalPrompt: buildImageEditFinalPrompt(
+      finalPrompt: buildOriginRegenerationPrompt(
+        normalized.regenerationContext?.basePrompt || "",
         normalized.instruction,
-        settings.size,
         normalized.annotationItems || [],
-        normalized.fidelityMode
+        normalized.annotationResolution as ImageEditAnnotationResolution,
+        settings
       ),
       settings,
       backend: backendSnapshot,
@@ -971,6 +1055,9 @@ export class ImageEditService {
     if (sourceTask.status === "queued" || sourceTask.status === "running") {
       throw new Error("排队中或改图中的任务不能重复提交。");
     }
+    if (sourceTask.fidelityMode !== "origin_regenerate" || !sourceTask.regenerationContext) {
+      throw new Error("旧版改图任务仅保留历史结果，不能沿用已移除的执行方式重试。");
+    }
     return this.createTask({
       sourceImage: {
         ...sourceTask.sourceImage,
@@ -986,22 +1073,13 @@ export class ImageEditService {
         ...sourceTask.annotationImage,
         createdAt: new Date().toISOString()
       },
-      maskImage: sourceTask.maskImage
-        ? {
-            ...sourceTask.maskImage,
-            createdAt: new Date().toISOString()
-          }
-        : undefined,
-      localProtectionMaskImage: sourceTask.localProtectionMaskImage
-        ? {
-            ...sourceTask.localProtectionMaskImage,
-            purpose: "local_protection",
-            createdAt: new Date().toISOString()
-          }
-        : undefined,
       annotationItems: sourceTask.annotationItems,
-      fidelityMode: sourceTask.fidelityMode,
-      pixelProtectionEnabled: sourceTask.pixelProtectionEnabled !== false,
+      annotationResolution: sourceTask.annotationResolution,
+      regenerationContext: {
+        ...sourceTask.regenerationContext,
+        originalReferences: sourceTask.regenerationContext.originalReferences.map((reference) => ({ ...reference }))
+      },
+      fidelityMode: "origin_regenerate",
       instruction: sourceTask.instruction,
       settings: sourceTask.settings
     });
@@ -1061,54 +1139,6 @@ export class ImageEditService {
 
   async clearAll(): Promise<void> {
     await this.clearTasks();
-  }
-
-  async saveProtectedVariant(request: ImageEditProtectedVariantSaveRequest): Promise<ImageEditTask> {
-    if (!request.taskId || !request.outputId) throw new Error("缺少改图任务或输出标识。");
-    if (!request.dataUrl.startsWith("data:image/")) throw new Error("本地保护版必须是有效图片。");
-    const now = new Date().toISOString();
-    const task = await this.mutateTasks(async (tasks) => {
-      const taskIndex = tasks.findIndex((item) => item.id === request.taskId);
-      if (taskIndex === -1) throw new Error("没有找到要保存本地保护版的改图任务。");
-      const sourceTask = tasks[taskIndex];
-      if (sourceTask.status === "queued" || sourceTask.status === "running") {
-        throw new Error("改图任务仍在运行，暂不能保存本地保护版。");
-      }
-      const outputIndex = sourceTask.outputs.findIndex((output) => output.id === request.outputId);
-      if (outputIndex === -1) throw new Error("没有找到要绑定本地保护版的改图输出。");
-      const assetFileName = await this.writeAsset(
-        sourceTask.id,
-        `output-${String(outputIndex + 1).padStart(2, "0")}-pixel-protected`,
-        request.dataUrl
-      );
-      const { mimeType } = dataUrlToBuffer(request.dataUrl);
-      const outputs = sourceTask.outputs.map((output, index) =>
-        index === outputIndex
-          ? {
-              ...output,
-              protectedVariantUnavailableReason: undefined,
-              protectedVariant: {
-                kind: "pixel_protected" as const,
-                mimeType: request.mimeType || mimeType,
-                width: request.width,
-                height: request.height,
-                assetFileName,
-                createdAt: now,
-                warnings: Array.isArray(request.warnings) ? request.warnings.slice(0, 10) : []
-              }
-            }
-          : output
-      );
-      const nextTask: StoredImageEditTask = {
-        ...sourceTask,
-        outputs,
-        updatedAt: now
-      };
-      const nextTasks = [...tasks];
-      nextTasks[taskIndex] = nextTask;
-      return { tasks: nextTasks, result: nextTask };
-    });
-    return this.hydrateTask(task);
   }
 
   async saveOutputs(_request: ImageEditOutputsSaveRequest): Promise<never> {
@@ -1178,24 +1208,32 @@ export class ImageEditService {
       const outputs: ImageEditOutput[] = [];
       for (const [index, result] of results.entries()) {
         const outputId = randomUUID();
-        const assetFileName = await this.writeAsset(task.id, `output-${String(index + 1).padStart(2, "0")}`, result.dataUrl);
+        const inspectedOutput = inspectImageDataUrl(result.dataUrl, `AI 原始输出 ${index + 1}`);
+        const canonicalOutputDataUrl = dataUrlFromBuffer(inspectedOutput.buffer, inspectedOutput.mimeType);
+        const assetFileName = await this.writeAsset(
+          task.id,
+          `output-${String(index + 1).padStart(2, "0")}`,
+          canonicalOutputDataUrl
+        );
         outputs.push({
           ...result,
+          dataUrl: canonicalOutputDataUrl,
+          mimeType: inspectedOutput.mimeType,
+          actualSize: inspectedOutput.size,
+          actualWidth: inspectedOutput.width,
+          actualHeight: inspectedOutput.height,
+          sizeMismatch: Boolean(result.requestedSize && result.requestedSize !== inspectedOutput.size),
           id: outputId,
           createdAt: now,
           assetFileName
         });
       }
+      const outputProblem = summarizeOutputProblems(outputs, task.settings.n);
       const finishedTask: ImageEditTask = {
         ...hydratedTask,
         outputs,
-        status:
-          outputs.length >= task.settings.n && !summarizeOutputProblems(outputs, task.settings.n)
-            ? "succeeded"
-            : outputs.length
-              ? "partial_failed"
-              : "failed",
-        error: summarizeOutputProblems(outputs, task.settings.n),
+        status: !outputs.length ? "failed" : outputProblem ? "partial_failed" : "succeeded",
+        error: outputProblem,
         updatedAt: now,
         completedAt: now
       };
@@ -1219,7 +1257,33 @@ export class ImageEditService {
 
   private async readTasks(): Promise<StoredImageEditTask[]> {
     const tasks = await readJsonFile<StoredImageEditTask[]>(this.tasksPath(), []);
-    return Array.isArray(tasks) ? tasks : [];
+    if (!Array.isArray(tasks)) return [];
+    let changed = false;
+    const withoutThumbnail = <T extends object>(value: T): T => {
+      if (!("thumbnailDataUrl" in value)) return value;
+      const { thumbnailDataUrl: _thumbnailDataUrl, ...metadata } = value as T & { thumbnailDataUrl?: string };
+      changed = true;
+      return metadata as T;
+    };
+    const sanitized = tasks.map((task) => ({
+      ...task,
+      sourceImage: withoutThumbnail(task.sourceImage),
+      annotationImage: withoutThumbnail(task.annotationImage),
+      maskImage: task.maskImage ? withoutThumbnail(task.maskImage) : undefined,
+      localProtectionMaskImage: task.localProtectionMaskImage
+        ? withoutThumbnail(task.localProtectionMaskImage)
+        : undefined,
+      regenerationContext: task.regenerationContext
+        ? {
+            ...task.regenerationContext,
+            originalReferences: task.regenerationContext.originalReferences.map((reference) =>
+              withoutThumbnail(reference)
+            )
+          }
+        : undefined
+    }));
+    if (changed) await this.writeTasks(sanitized);
+    return sanitized;
   }
 
   private async getEffectiveBackend(): Promise<EffectiveImageEditBackend> {
@@ -1237,43 +1301,26 @@ export class ImageEditService {
   }
 
   private async runImageEditModel(task: ImageEditTask, signal: AbortSignal): Promise<ImageEditRunnerOutput[]> {
+    if (task.fidelityMode !== "origin_regenerate" || !task.regenerationContext) {
+      throw new Error("旧版改图任务仅保留历史结果，已不再执行旁路参考或严格 mask 请求。");
+    }
     const backend = await this.getEffectiveBackend();
     const settings = toGenerationSettings(task.settings);
-    const fidelityMode = normalizeFidelityMode(task.fidelityMode);
-
-    if (fidelityMode === "strict_mask") {
-      const capability = imageEditMaskCapabilityForBackend(backend);
-      if (!capability.supportsMaskEdit) {
-        throw new Error(
-          capability.maskEditUnavailableReason ||
-            "当前后端不支持 mask 严格编辑，请切换到 OpenAI-compatible Images 后端，或继续使用参考生成模式。"
-        );
-      }
-      if (!task.maskImage?.dataUrl?.startsWith("data:image/")) {
-        throw new Error("严格保真模式缺少 alpha mask PNG，请重新提交任务。");
-      }
-      const text = await requestMaskedEditForm(
-        generationEndpoint(backend.apiBaseUrl, "images/edits"),
-        backend.apiKey,
-        task.finalPrompt,
-        settings,
-        task.sourceImage.dataUrl,
-        task.maskImage.dataUrl,
-        signal
-      );
-      return parseImagesResponse(text, backend.apiKey, settings);
+    const originalReferences = task.regenerationContext.originalReferences
+      .map((reference) => reference.dataUrl)
+      .filter((dataUrl) => dataUrl.startsWith("data:image/"));
+    if (task.regenerationContext.inputStrategy === "original_references" && !originalReferences.length) {
+      throw new Error("原始主体参考图资产缺失，不能静默改用当前生成结果。请重新从生图任务导入，或明确使用纯文字重生成。");
     }
-
-    const referenceImages = [task.sourceImage.dataUrl, task.annotationImage.dataUrl].filter((dataUrl) =>
-      dataUrl.startsWith("data:image/")
-    );
 
     if (backend.authSource === "codex_oauth") {
       let authState = await loadCodexAuthState();
       const results: ImageEditRunnerOutput[] = [];
       for (let index = 0; index < task.settings.n; index += 1) {
         const response = await requestCodexResponses(
-          buildCodexResponsesPayload(task.finalPrompt, settings, referenceImages),
+          forceOriginRegenerationResponsesAction(
+            buildCodexResponsesPayload(task.finalPrompt, settings, originalReferences)
+          ),
           authState,
           signal
         );
@@ -1282,37 +1329,44 @@ export class ImageEditService {
       }
       return results.slice(0, task.settings.n);
     }
-
     if (backend.providerType === "openrouter") {
-      return requestOpenRouterImageEdit(backend, task.finalPrompt, settings, referenceImages, signal);
+      return requestOpenRouterImageEdit(backend, task.finalPrompt, settings, originalReferences, signal);
     }
-
     if (backend.apiMode === "responses") {
       const results: ImageEditRunnerOutput[] = [];
       for (let index = 0; index < task.settings.n; index += 1) {
-        const text = await requestJson(
+        const responseText = await requestJson(
           generationEndpoint(backend.apiBaseUrl, "responses"),
           backend.apiKey,
-          buildResponsesPayload(task.finalPrompt, settings, referenceImages),
+          forceOriginRegenerationResponsesAction(
+            buildResponsesPayload(task.finalPrompt, settings, originalReferences)
+          ),
           signal,
           "text/event-stream"
         );
-        results.push(...parseResponsesImageResponse(text, settings));
+        results.push(...parseResponsesImageResponse(responseText, settings));
       }
       return results.slice(0, task.settings.n);
     }
-
-    const text = await requestEditForm(
-      generationEndpoint(backend.apiBaseUrl, "images/edits"),
+    if (originalReferences.length) {
+      const responseText = await requestEditForm(
+        generationEndpoint(backend.apiBaseUrl, "images/edits"),
+        backend.apiKey,
+        task.finalPrompt,
+        settings,
+        originalReferences,
+        signal
+      );
+      return parseImagesResponse(responseText, backend.apiKey, settings);
+    }
+    const responseText = await requestJson(
+      generationEndpoint(backend.apiBaseUrl, "images/generations"),
       backend.apiKey,
-      task.finalPrompt,
-      settings,
-      referenceImages,
+      buildImagesGenerationPayload(task.finalPrompt, settings),
       signal
     );
-    return parseImagesResponse(text, backend.apiKey, settings);
+    return parseImagesResponse(responseText, backend.apiKey, settings);
   }
-
   private async reconcileStaleRunningTasks(tasks: StoredImageEditTask[]): Promise<StoredImageEditTask[]> {
     let changed = false;
     const now = new Date().toISOString();
@@ -1365,38 +1419,3 @@ export class ImageEditService {
     });
   }
 }
-
-export const buildImageEditFinalPrompt = (
-  instruction: string,
-  size: string,
-  annotationItems: ImageEditAnnotationItem[] = [],
-  fidelityMode: ImageEditFidelityMode = "reference"
-): string => {
-  const normalizedItems = normalizeAnnotationItems(annotationItems);
-  const itemLines = normalizedItems.map((item) => {
-    const position = item.positionHint ? `，${item.positionHint}` : "";
-    return `${item.label}（${annotationToolLabel(item.tool)}${position}）：${item.note}`;
-  });
-  const isStrictMask = normalizeFidelityMode(fidelityMode) === "strict_mask";
-  return [
-    isStrictMask ? "请根据源图、alpha mask 和编号修改清单完成一次单源图严格局部改图。" : "请根据源图和标注层完成一次单源图改图。",
-    isStrictMask
-      ? "严格 mask 模式下，alpha mask 的透明区域是允许编辑区，不透明区域必须按源图保留；编号定位图只用于任务预览和下方文字清单，不作为模型图像输入。"
-      : "干净源图是主体、构图、纹理、文字和细节的唯一依据；标注层图片只是低遮挡定位图，不能用它替代或覆盖源图细节。",
-    `总体改图说明：${instruction.trim() || "无额外总体说明，严格按编号标注项处理。"}`,
-    normalizedItems.length
-      ? "标注层中的编号圆点、箭头和框选都是临时定位标记；每个编号只对应下方同编号修改要求，必须逐项对应执行，不要交换位置、不要把一个编号的要求应用到另一个编号。"
-      : "",
-    normalizedItems.length ? ["编号标注修改清单：", ...itemLines].join("\n") : "",
-    "必须保留源图的主要主体、构图关系、整体风格、视角和画幅比例。",
-    "未被编号标注覆盖的区域必须按干净源图保留，不要做美化、磨皮、锐化、补纹理、改光影或重绘。",
-    "人物脸部、五官、发际线、手臂、手部和所有裸露皮肤属于高保真保护区域；除非同编号修改要求明确点名，否则保持源图肤色、肤质、平滑度、阴影过渡和身份细节。",
-    "如果标注靠近人物但修改对象是背景、道具或文字，只修改对应背景、道具或文字，不改变人物皮肤、脸部和肢体结构。",
-    "只应用标注层和用户文字说明指向的修改，不要扩展成无关重绘。",
-    "负面约束：不要新增斑驳暗纹、网格纹、水印感纹理、脏污颗粒、异常局部阴影、塑料皮肤、蜡像质感、过度磨皮或锐化噪点。",
-    "最终输出必须是干净修订图：移除所有编号圆点、箭头、批注文字、框选线、选择边框、光标、工具栏和任何标注 UI 痕迹。",
-    `输出画布目标尺寸为 ${size} 像素。`
-  ]
-    .filter(Boolean)
-    .join("\n");
-};

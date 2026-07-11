@@ -2,32 +2,81 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import {
   ImageEditService,
-  buildImageEditFinalPrompt,
   closestImageEditAspectRatio,
-  imageEditMaskCapabilityForBackend,
+  forceOriginRegenerationResponsesAction,
+  imageEditAnnotationContentHash,
   imageEditResolutionForDimensions,
   imageEditSettingsFromSource
 } from "./image-edit";
 import type { ImageEditCreateRequest } from "../src/shared/types";
 
+const crcTable = Array.from({ length: 256 }, (_item, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  return value >>> 0;
+});
+
+const crc32 = (buffer: Buffer): number => {
+  let value = 0xffffffff;
+  for (const byte of buffer) value = crcTable[(value ^ byte) & 0xff] ^ (value >>> 8);
+  return (value ^ 0xffffffff) >>> 0;
+};
+
+const pngChunk = (type: string, data: Buffer): Buffer => {
+  const typeBytes = Buffer.from(type, "ascii");
+  const chunk = Buffer.alloc(12 + data.length);
+  chunk.writeUInt32BE(data.length, 0);
+  typeBytes.copy(chunk, 4);
+  data.copy(chunk, 8);
+  chunk.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])), 8 + data.length);
+  return chunk;
+};
+
+const pngCache = new Map<string, Buffer>();
+
 const pngBytes = (width: number, height: number): Buffer => {
-  const buffer = Buffer.alloc(33);
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(buffer, 0);
-  buffer.writeUInt32BE(13, 8);
-  buffer.write("IHDR", 12, "ascii");
-  buffer.writeUInt32BE(width, 16);
-  buffer.writeUInt32BE(height, 20);
-  buffer[24] = 8;
-  buffer[25] = 6;
+  const key = `${width}x${height}`;
+  const cached = pngCache.get(key);
+  if (cached) return cached;
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const scanlines = Buffer.alloc((width * 4 + 1) * height);
+  const row = Buffer.alloc(width * 4 + 1);
+  row[0] = 0;
+  for (let x = 0; x < width; x += 1) {
+    const offset = 1 + x * 4;
+    row[offset] = 32;
+    row[offset + 1] = 96;
+    row[offset + 2] = 160;
+    row[offset + 3] = x === 0 ? 96 : 255;
+  }
+  for (let y = 0; y < height; y += 1) {
+    row.copy(scanlines, y * row.length);
+  }
+  const buffer = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(scanlines, { level: 6 })),
+    pngChunk("IEND", Buffer.alloc(0))
+  ]);
+  pngCache.set(key, buffer);
   return buffer;
 };
 
 const dataUrl = (width: number, height: number): string =>
   `data:image/png;base64,${pngBytes(width, height).toString("base64")}`;
 
-const createRequest = (sourceDataUrl = dataUrl(1915, 821)): ImageEditCreateRequest => ({
+const jpeg1x1 =
+  "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/AP/EABQQAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEAAQUCf//EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQMBAT8Bf//EABQRAQAAAAAAAAAAAAAAAAAAABD/2gAIAQIBAT8Bf//EABQQAQAAAAAAAAAAAAAAAAAAABD/2gAIAQEABj8Cf//Z";
+const webp1x1 = "data:image/webp;base64,UklGRiAAAABXRUJQVlA4IBQAAAAwAQCdASoBAAEADsD+JaQAA3AAAA==";
+
+const createBaseRequest = (sourceDataUrl = dataUrl(1915, 821)): ImageEditCreateRequest => ({
   sourceImage: {
     id: "source-1",
     name: "source.png",
@@ -76,35 +125,90 @@ const createRequest = (sourceDataUrl = dataUrl(1915, 821)): ImageEditCreateReque
   })
 });
 
-const createRequestWithLocalMask = (sourceDataUrl = dataUrl(1915, 821)): ImageEditCreateRequest => {
-  const request = createRequest(sourceDataUrl);
-  return {
-    ...request,
-    settings: {
-      ...request.settings,
-      size: "1915x821"
-    },
-    localProtectionMaskImage: {
-      purpose: "local_protection",
-      mimeType: "image/png",
-      dataUrl: dataUrl(1915, 821),
-      thumbnailDataUrl: dataUrl(320, 180),
-      itemCount: 2,
-      width: 1915,
-      height: 821,
-      createdAt: "2026-06-26T00:00:00.000Z",
-      stats: {
-        width: 1915,
-        height: 821,
-        itemCount: 2,
-        transparentRatio: 0.08,
-        bbox: "10,12,120x90",
-        warnings: []
+const createOriginRegenerationRequest = (
+  withOriginalReference = true,
+  sourceDataUrl = dataUrl(1915, 821)
+): ImageEditCreateRequest => {
+  const base = createBaseRequest(sourceDataUrl);
+  const annotationItems: NonNullable<ImageEditCreateRequest["annotationItems"]> = [
+    {
+      index: 1,
+      label: "标注 1",
+      tool: "box",
+      note: "只把右侧扩音器外壳改成青绿色。",
+      positionHint: "框选左上角 85.1% x 1.2%，右下角 97.2% x 21.8%",
+      geometry: {
+        tool: "box",
+        left: 0.851,
+        top: 0.012,
+        right: 0.972,
+        bottom: 0.218,
+        centerX: 0.9115,
+        centerY: 0.115,
+        width: 0.121,
+        height: 0.206
       }
+    }
+  ];
+  const regenerationContext = {
+    basePrompt: "第一次生图的原始融合提示词。",
+    generationTaskId: "generation-task-1",
+    generationOutputId: "generation-output-1",
+    sourceLabel: "最终融合提示词",
+    importedAt: "2026-07-11T00:00:00.000Z",
+    inputStrategy: withOriginalReference ? ("original_references" as const) : ("text_only" as const),
+    originalReferences: withOriginalReference
+      ? [
+          {
+            id: "origin-reference-1",
+            name: "original-subject.png",
+            mimeType: "image/png",
+            dataUrl: dataUrl(64, 64),
+            thumbnailDataUrl: dataUrl(32, 32),
+            createdAt: "2026-07-11T00:00:00.000Z"
+          }
+        ]
+      : []
+  };
+  const contentHash = imageEditAnnotationContentHash(
+    sourceDataUrl,
+    annotationItems,
+    "保持主体身份和宏观构图。",
+    regenerationContext.basePrompt
+  );
+  return {
+    ...base,
+    fidelityMode: "origin_regenerate",
+    instruction: "保持主体身份和宏观构图。",
+    annotationImage: { ...base.annotationImage, itemCount: 1 },
+    annotationItems,
+    annotationResolution: {
+      contentHash,
+      source: "vision_model",
+      modelName: "vision-test",
+      createdAt: "2026-07-11T00:00:00.000Z",
+      confirmedAt: "2026-07-11T00:01:00.000Z",
+      status: "confirmed",
+      items: [
+        {
+          index: 1,
+          targetObject: "右侧人物头顶上方的扩音器",
+          currentState: "橙色外壳、白色喇叭口",
+          requestedChange: "只将橙色外壳改为青绿色",
+          preserve: ["保持大小、位置、角度和白色喇叭口", "不改变相邻人物脸部和手势"],
+          spatialAnchors: ["位于右侧人物头顶上方"],
+          confidence: 0.94,
+          ambiguity: "",
+          userConfirmed: true
+        }
+      ]
     },
-    pixelProtectionEnabled: true
+    regenerationContext
   };
 };
+
+const createRequest = (sourceDataUrl = dataUrl(1915, 821)): ImageEditCreateRequest =>
+  createOriginRegenerationRequest(true, sourceDataUrl);
 
 const writeGenerationConfig = async (
   rootDir: string,
@@ -168,65 +272,106 @@ describe("image edit size helpers", () => {
     });
   });
 
-  it("builds a clean-edit final prompt with annotation removal constraints", () => {
-    const prompt = buildImageEditFinalPrompt("删除左上角红框里的字", "1024x1024", createRequest().annotationItems);
-    expect(prompt).toContain("标注 1（框选，位于画面约 64% x 22%）：把右侧标题改成金色。");
-    expect(prompt).toContain("标注 2（箭头，位于画面约 22% x 58%）：去掉箭头指向的小红点。");
-    expect(prompt).toContain("干净源图是主体、构图、纹理、文字和细节的唯一依据");
-    expect(prompt).toContain("每个编号只对应下方同编号修改要求");
-    expect(prompt).toContain("移除所有编号圆点、箭头、批注文字、框选线");
-  });
-
-  it("protects unmarked portrait skin from generated texture artifacts", () => {
-    const prompt = buildImageEditFinalPrompt("在背景里增加金币元素", "3808x1632", createRequest().annotationItems);
-    expect(prompt).toContain("未被编号标注覆盖的区域必须按干净源图保留");
-    expect(prompt).toContain("人物脸部、五官、发际线、手臂、手部和所有裸露皮肤属于高保真保护区域");
-    expect(prompt).toContain("不要新增斑驳暗纹、网格纹、水印感纹理");
-    expect(prompt).toContain("不改变人物皮肤、脸部和肢体结构");
-  });
-
-  it("describes strict mask mode as source plus alpha mask instead of annotation image input", () => {
-    const prompt = buildImageEditFinalPrompt("只修改标注区域", "1024x1024", createRequest().annotationItems, "strict_mask");
-    expect(prompt).toContain("源图、alpha mask 和编号修改清单");
-    expect(prompt).toContain("透明区域是允许编辑区，不透明区域必须按源图保留");
-    expect(prompt).toContain("定位图只用于任务预览和下方文字清单，不作为模型图像输入");
-  });
-});
-
-describe("image edit mask capability matrix", () => {
-  it("only enables strict mask edits for OpenAI-compatible Images backends", () => {
-    expect(
-      imageEditMaskCapabilityForBackend({
-        authSource: "api",
-        providerType: "openai_compatible",
-        apiMode: "images"
-      })
-    ).toMatchObject({ supportsMaskEdit: true });
-    expect(
-      imageEditMaskCapabilityForBackend({
-        authSource: "api",
-        providerType: "openai_compatible",
-        apiMode: "responses"
-      })
-    ).toMatchObject({ supportsMaskEdit: false });
-    expect(
-      imageEditMaskCapabilityForBackend({
-        authSource: "api",
-        providerType: "openrouter",
-        apiMode: "images"
-      })
-    ).toMatchObject({ supportsMaskEdit: false });
-    expect(
-      imageEditMaskCapabilityForBackend({
-        authSource: "codex_oauth",
-        providerType: "openai_compatible",
-        apiMode: "responses"
-      })
-    ).toMatchObject({ supportsMaskEdit: false });
+  it("forces origin regeneration Responses tools to generate", () => {
+    const payload = forceOriginRegenerationResponsesAction({
+      tools: [{ type: "image_generation", action: "edit", size: "864x1536" }]
+    });
+    expect(payload.tools).toEqual([{ type: "image_generation", action: "generate", size: "864x1536" }]);
   });
 });
 
 describe("ImageEditService task storage", () => {
+  it("preserves canonical PNG, JPEG and WebP bytes while overriding renderer metadata from bytes", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-canonical-formats-"));
+    try {
+      const service = new ImageEditService(rootDir, {
+        concurrency: 1,
+        runner: async () => [{ dataUrl: dataUrl(64, 32), mimeType: "image/png", requestedSize: "1024x1024" }]
+      });
+      const fixtures = [
+        { dataUrl: dataUrl(64, 32), mimeType: "image/png", width: 64, height: 32 },
+        { dataUrl: jpeg1x1, mimeType: "image/jpeg", width: 1, height: 1 },
+        { dataUrl: webp1x1, mimeType: "image/webp", width: 1, height: 1 }
+      ] as const;
+
+      for (const fixture of fixtures) {
+        const request = createRequest(fixture.dataUrl);
+        request.sourceImage = {
+          ...request.sourceImage,
+          mimeType: "image/gif",
+          width: 999,
+          height: 999
+        };
+        const task = await service.createTask(request);
+        await waitFor(async () => (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded"));
+        const stored = (await service.getTasks()).find((item) => item.id === task.id);
+        expect(stored?.sourceImage.mimeType).toBe(fixture.mimeType);
+        expect(stored?.sourceImage.width).toBe(fixture.width);
+        expect(stored?.sourceImage.height).toBe(fixture.height);
+        expect(stored?.sourceIntegrity).toMatchObject({
+          actualMimeType: fixture.mimeType,
+          width: fixture.width,
+          height: fixture.height,
+          canonicalBytesPreserved: true
+        });
+        expect(Buffer.from(stored?.sourceImage.dataUrl.split(",")[1] || "", "base64")).toEqual(
+          Buffer.from(fixture.dataUrl.split(",")[1], "base64")
+        );
+      }
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a decodable transparent 4K source and rejects sources above 12 million pixels", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-canonical-4k-"));
+    try {
+      const service = new ImageEditService(rootDir, {
+        concurrency: 1,
+        runner: async () => [{ dataUrl: dataUrl(1024, 576), mimeType: "image/png", requestedSize: "3840x2160" }]
+      });
+      const fourKDataUrl = dataUrl(3840, 2160);
+      const task = await service.createTask(createRequest(fourKDataUrl));
+      await waitFor(async () => (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded"));
+      const stored = (await service.getTasks()).find((item) => item.id === task.id);
+      expect(stored?.sourceIntegrity).toMatchObject({ width: 3840, height: 2160, pixelCount: 8_294_400 });
+      expect(Buffer.from(stored?.sourceImage.dataUrl.split(",")[1] || "", "base64")).toEqual(pngBytes(3840, 2160));
+
+      await expect(service.createTask(createRequest(dataUrl(4000, 3001)))).rejects.toThrow(/1200 万/);
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the selected prior output bytes directly as the next canonical source", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-continue-lossless-"));
+    try {
+      const firstOutput = dataUrl(800, 600);
+      const service = new ImageEditService(rootDir, {
+        concurrency: 1,
+        runner: async () => [{ dataUrl: firstOutput, mimeType: "image/png", requestedSize: "800x600" }]
+      });
+      const firstTask = await service.createTask(createRequest(dataUrl(640, 480)));
+      await waitFor(async () => (await service.getTasks()).some((item) => item.id === firstTask.id && item.status === "succeeded"));
+      const firstFinished = (await service.getTasks()).find((item) => item.id === firstTask.id);
+      const nextRequest = createRequest(firstFinished?.outputs[0].dataUrl || "");
+      nextRequest.sourceImage.sourcePointer = {
+        kind: "restored_edit_output",
+        imageEditTaskId: firstTask.id,
+        imageEditOutputId: firstFinished?.outputs[0].id,
+        importedAt: "2026-06-26T00:00:00.000Z"
+      };
+      const nextTask = await service.createTask(nextRequest);
+      await waitFor(async () => (await service.getTasks()).some((item) => item.id === nextTask.id && item.status === "succeeded"));
+      const nextFinished = (await service.getTasks()).find((item) => item.id === nextTask.id);
+      expect(Buffer.from(nextFinished?.sourceImage.dataUrl.split(",")[1] || "", "base64")).toEqual(
+        Buffer.from(firstOutput.split(",")[1], "base64")
+      );
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("stores large source and annotation images as assets while tasks.json keeps metadata", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "image-edit-assets-"));
     try {
@@ -249,8 +394,8 @@ describe("ImageEditService task storage", () => {
       expect(finished.sourceImage.dataUrl).toMatch(/^data:image\/png;base64,/);
       expect(finished.annotationImage.dataUrl).toMatch(/^data:image\/png;base64,/);
       expect(finished.outputs[0].dataUrl).toMatch(/^data:image\/png;base64,/);
-      expect(finished.annotationItems).toHaveLength(2);
-      expect(finished.finalPrompt).toContain("标注 2（箭头");
+      expect(finished.annotationItems).toHaveLength(1);
+      expect(finished.finalPrompt).toContain("局部修订 1");
 
       const storedText = await readFile(join(rootDir, "image-edit", "tasks.json"), "utf8");
       expect(storedText).not.toContain(finished.sourceImage.dataUrl);
@@ -259,61 +404,7 @@ describe("ImageEditService task storage", () => {
       expect(storedText).toContain("source.png");
       expect(storedText).toContain("annotation.png");
       expect(storedText).toContain("output-01.png");
-      expect(storedText).toContain("把右侧标题改成金色。");
-    } finally {
-      await rm(rootDir, { recursive: true, force: true });
-    }
-  });
-
-  it("stores local protection masks and protected variants as assets", async () => {
-    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-local-mask-assets-"));
-    try {
-      const runner = vi.fn(async () => [
-        {
-          dataUrl: dataUrl(1915, 821),
-          mimeType: "image/png",
-          requestedSize: "1915x821",
-          actualSize: "1915x821",
-          actualWidth: 1915,
-          actualHeight: 821
-        }
-      ]);
-      const service = new ImageEditService(rootDir, { runner, concurrency: 1 });
-      const task = await service.createTask(createRequestWithLocalMask());
-      await waitFor(async () => (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded"));
-      const [finished] = (await service.getTasks()).filter((item) => item.id === task.id);
-      const updated = await service.saveProtectedVariant({
-        taskId: finished.id,
-        outputId: finished.outputs[0].id,
-        dataUrl: dataUrl(1915, 821),
-        mimeType: "image/png",
-        width: 1915,
-        height: 821,
-        warnings: ["本地保护版是软件后处理结果，不是 AI 原始结果。"]
-      });
-
-      expect(updated.localProtectionMaskImage?.dataUrl).toMatch(/^data:image\/png;base64,/);
-      expect(updated.localProtectionMaskImage?.purpose).toBe("local_protection");
-      expect(updated.settings.size).toBe("1915x821");
-      expect(updated.diagnostics?.requestedSize).toBe("1915x821");
-      expect(updated.finalPrompt).toContain("1915x821");
-      expect(updated.outputs).toHaveLength(1);
-      expect(updated.outputs[0].protectedVariant?.dataUrl).toMatch(/^data:image\/png;base64,/);
-      expect(updated.outputs[0].protectedVariant?.kind).toBe("pixel_protected");
-      expect(updated.diagnostics?.localMaskSubmittedToBackend).toBe(false);
-      expect(updated.diagnostics?.strictMaskSubmitted).toBe(false);
-      expect(updated.diagnostics?.localMask?.transparentRatio).toBe(0.08);
-
-      const storedText = await readFile(join(rootDir, "image-edit", "tasks.json"), "utf8");
-      expect(storedText).toContain("local-protection-mask.png");
-      expect(storedText).toContain("pixel-protected.png");
-      expect(storedText).not.toContain(updated.sourceImage.dataUrl);
-      expect(storedText).not.toContain(updated.localProtectionMaskImage?.dataUrl || "missing-local-mask");
-      expect(storedText).not.toContain(updated.outputs[0].dataUrl);
-      expect(storedText).not.toContain(updated.outputs[0].protectedVariant?.dataUrl || "missing-variant");
-      expect(storedText).not.toContain("apiKey");
-      expect(storedText).not.toContain("access_token");
-      expect(storedText).not.toContain("refresh_token");
+      expect(storedText).toContain("只把右侧扩音器外壳改成青绿色。");
     } finally {
       await rm(rootDir, { recursive: true, force: true });
     }
@@ -406,63 +497,115 @@ describe("ImageEditService task storage", () => {
       await rm(rootDir, { recursive: true, force: true });
     }
   });
+
+  it("keeps removed-mode history readable but rejects legacy retries", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-legacy-readonly-"));
+    try {
+      const service = new ImageEditService(rootDir, {
+        concurrency: 1,
+        runner: async () => [{ dataUrl: dataUrl(864, 1536), mimeType: "image/png", requestedSize: "864x1536" }]
+      });
+      const task = await service.createTask(createRequest());
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded")
+      );
+      const tasksPath = join(rootDir, "image-edit", "tasks.json");
+      const stored = JSON.parse(await readFile(tasksPath, "utf8")) as Array<Record<string, unknown>>;
+      stored[0].fidelityMode = "reference";
+      await writeFile(tasksPath, JSON.stringify(stored, null, 2));
+
+      const restarted = new ImageEditService(rootDir, { concurrency: 1 });
+      const [legacyTask] = await restarted.getTasks();
+      expect(legacyTask.fidelityMode).toBe("reference");
+      expect(legacyTask.outputs[0].dataUrl).toMatch(/^data:image\/png;base64,/);
+      await expect(restarted.retryTask(legacyTask.id)).rejects.toThrow("旧版改图任务仅保留历史结果");
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("ImageEditService model routing", () => {
-  it("sends clean source and annotation images to OpenAI-compatible image edits", async () => {
-    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-openai-route-"));
-    const fetchMock = vi.fn(() =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            data: [{ b64_json: pngBytes(2688, 1152).toString("base64") }]
-          }),
-          { status: 200 }
-        )
-      )
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
+  it("stores origin references as separate assets and rejects stale or unconfirmed resolutions", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-origin-storage-"));
     try {
-      await writeGenerationConfig(rootDir, {
-        providerType: "openai_compatible",
-        apiMode: "images",
-        apiBaseUrl: "https://api.example.com/v1",
-        imageModel: "gpt-image-2"
+      const service = new ImageEditService(rootDir, {
+        concurrency: 1,
+        runner: async () => [{ dataUrl: dataUrl(864, 1536), mimeType: "image/png", requestedSize: "864x1536" }]
       });
-      const service = new ImageEditService(rootDir, { concurrency: 1 });
-      const task = await service.createTask(createRequest());
-      await waitFor(async () => (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded"));
+      const request = createOriginRegenerationRequest();
+      const task = await service.createTask(request);
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded")
+      );
+      const storedJson = await readFile(join(rootDir, "image-edit", "tasks.json"), "utf8");
+      expect(storedJson).not.toContain("data:image");
+      expect(storedJson).not.toMatch(/api[_-]?key|access_token|refresh_token|id_token/i);
+      const stored = JSON.parse(storedJson) as Array<{
+        regenerationContext?: { originalReferences: Array<{ assetFileName: string }> };
+      }>;
+      const assetFileName = stored[0].regenerationContext?.originalReferences[0].assetFileName || "";
+      expect(assetFileName).toMatch(/^origin-reference-01\./);
+      expect((await stat(join(rootDir, "image-edit", "assets", task.id, assetFileName))).isFile()).toBe(true);
+      const hydrated = (await service.getTasks()).find((item) => item.id === task.id);
+      expect(hydrated?.regenerationContext?.originalReferences[0].dataUrl).toBe(dataUrl(64, 64));
+      expect(hydrated?.diagnostics).toMatchObject({
+        regenerationInputStrategy: "original_references",
+        originReferenceCount: 1,
+        currentSourceSubmitted: false,
+        annotationImageSubmitted: false
+      });
+      const legacyStored = JSON.parse(storedJson) as Array<Record<string, any>>;
+      legacyStored[0].sourceImage.thumbnailDataUrl = dataUrl(32, 32);
+      legacyStored[0].annotationImage.thumbnailDataUrl = dataUrl(32, 32);
+      await writeFile(join(rootDir, "image-edit", "tasks.json"), JSON.stringify(legacyStored, null, 2));
+      const restartedService = new ImageEditService(rootDir, {
+        concurrency: 1,
+        runner: async () => [{ dataUrl: dataUrl(864, 1536), mimeType: "image/png", requestedSize: "864x1536" }]
+      });
+      const restartedTask = (await restartedService.getTasks()).find((item) => item.id === task.id);
+      expect(restartedTask?.regenerationContext?.originalReferences[0].dataUrl).toBe(dataUrl(64, 64));
+      expect(await readFile(join(rootDir, "image-edit", "tasks.json"), "utf8")).not.toContain("data:image");
+      const retried = await restartedService.retryTask(task.id);
+      await waitFor(async () =>
+        (await restartedService.getTasks()).some((item) => item.id === retried.id && item.status === "succeeded")
+      );
+      expect(
+        (await restartedService.getTasks()).find((item) => item.id === retried.id)?.regenerationContext
+          ?.generationTaskId
+      ).toBe("generation-task-1");
 
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-      expect(url).toBe("https://api.example.com/v1/images/edits");
-      expect(init.method).toBe("POST");
-      expect((init.headers as Record<string, string>).Authorization).toBe("Bearer test-key");
-      const form = init.body as FormData;
-      expect(form.getAll("image")).toHaveLength(2);
-      expect(form.get("model")).toBe("gpt-image-2");
-      expect(String(form.get("prompt"))).toContain("最终输出必须是干净修订图");
+      await expect(
+        service.createTask({
+          ...request,
+          annotationResolution: { ...request.annotationResolution!, status: "needs_review", confirmedAt: undefined }
+        })
+      ).rejects.toThrow(/尚未完成确认/);
+      await expect(
+        service.createTask({
+          ...request,
+          instruction: "已经变化的总体说明。"
+        })
+      ).rejects.toThrow(/已变化/);
+      await restartedService.deleteTask(task.id);
+      await restartedService.deleteTask(retried.id);
+      await expect(stat(join(rootDir, "image-edit", "assets", task.id))).rejects.toThrow();
+      await expect(stat(join(rootDir, "image-edit", "assets", retried.id))).rejects.toThrow();
     } finally {
-      vi.unstubAllGlobals();
       await rm(rootDir, { recursive: true, force: true });
     }
   });
 
-  it("sends strict mask edits as one PNG source image plus one PNG mask", async () => {
-    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-strict-mask-route-"));
+  it("sends only original references for OpenAI-compatible origin regeneration", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-origin-openai-route-"));
     const fetchMock = vi.fn(() =>
       Promise.resolve(
-        new Response(
-          JSON.stringify({
-            data: [{ b64_json: pngBytes(2688, 1152).toString("base64") }]
-          }),
-          { status: 200 }
-        )
+        new Response(JSON.stringify({ data: [{ b64_json: pngBytes(864, 1536).toString("base64") }] }), {
+          status: 200
+        })
       )
     );
     vi.stubGlobal("fetch", fetchMock);
-
     try {
       await writeGenerationConfig(rootDir, {
         providerType: "openai_compatible",
@@ -471,93 +614,115 @@ describe("ImageEditService model routing", () => {
         imageModel: "gpt-image-2"
       });
       const service = new ImageEditService(rootDir, { concurrency: 1 });
-      const request = createRequest();
-      const task = await service.createTask({
-        ...request,
-        fidelityMode: "strict_mask",
-        sourceImage: {
-          ...request.sourceImage,
-          mimeType: "image/png",
-          dataUrl: dataUrl(1915, 821)
-        },
-        maskImage: {
-          mimeType: "image/png",
-          dataUrl: dataUrl(1915, 821),
-          itemCount: 2,
-          width: 1915,
-          height: 821,
-          createdAt: "2026-06-25T00:00:00.000Z"
-        }
-      });
-      await waitFor(async () => (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded"));
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const task = await service.createTask(createOriginRegenerationRequest());
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && !["queued", "running"].includes(item.status))
+      );
       const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(url).toBe("https://api.example.com/v1/images/edits");
       const form = init.body as FormData;
       expect(form.getAll("image")).toHaveLength(1);
-      expect(form.getAll("mask")).toHaveLength(1);
-      expect(String(form.get("prompt"))).toContain("alpha mask");
-      expect(String(form.get("prompt"))).toContain("定位图只用于任务预览");
-      const [finished] = (await service.getTasks()).filter((item) => item.id === task.id);
-      expect(finished.fidelityMode).toBe("strict_mask");
-      expect(finished.maskImage?.dataUrl).toMatch(/^data:image\/png;base64,/);
-      expect(finished.backend?.supportsMaskEdit).toBe(true);
+      expect(form.getAll("mask")).toHaveLength(0);
+      const image = form.get("image") as File;
+      expect(image.size).toBe(pngBytes(64, 64).length);
+      expect(String(form.get("prompt"))).toContain("第一次生图的原始融合提示词");
+      expect(String(form.get("prompt"))).not.toMatch(/看标注图|按红框|修改这里/);
     } finally {
       vi.unstubAllGlobals();
       await rm(rootDir, { recursive: true, force: true });
     }
   });
 
-  it("rejects strict mask tasks on OpenRouter before sending a request", async () => {
-    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-strict-mask-openrouter-"));
-    const fetchMock = vi.fn();
+  it("uses images/generations for text-only origin regeneration", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-origin-text-only-route-"));
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ data: [{ b64_json: pngBytes(864, 1536).toString("base64") }] }), {
+          status: 200
+        })
+      )
+    );
     vi.stubGlobal("fetch", fetchMock);
-
     try {
       await writeGenerationConfig(rootDir, {
-        providerType: "openrouter",
+        providerType: "openai_compatible",
         apiMode: "images",
-        apiBaseUrl: "https://openrouter.ai/api/v1",
-        imageModel: "openai/gpt-image-2"
+        apiBaseUrl: "https://api.example.com/v1",
+        imageModel: "gpt-image-2"
       });
       const service = new ImageEditService(rootDir, { concurrency: 1 });
-      const request = createRequest();
-      await expect(
-        service.createTask({
-          ...request,
-          fidelityMode: "strict_mask",
-          maskImage: {
-            mimeType: "image/png",
-            dataUrl: dataUrl(1915, 821),
-            itemCount: 2,
-            width: 1915,
-            height: 821,
-            createdAt: "2026-06-25T00:00:00.000Z"
-          }
-        })
-      ).rejects.toThrow(/OpenRouter .*不支持 alpha mask/);
-      expect(fetchMock).not.toHaveBeenCalled();
+      const task = await service.createTask(createOriginRegenerationRequest(false));
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && !["queued", "running"].includes(item.status))
+      );
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe("https://api.example.com/v1/images/generations");
+      expect(init.body).toEqual(expect.any(String));
+      const payload = JSON.parse(String(init.body)) as Record<string, unknown>;
+      expect(payload.prompt).toContain("第一次生图的原始融合提示词");
+      expect(JSON.stringify(payload)).not.toContain("data:image");
+      const finished = (await service.getTasks()).find((item) => item.id === task.id);
+      expect(finished?.diagnostics?.regenerationInputStrategy).toBe("text_only");
+      expect(finished?.diagnostics?.originReferenceCount).toBe(0);
     } finally {
       vi.unstubAllGlobals();
       await rm(rootDir, { recursive: true, force: true });
     }
   });
 
-  it("routes OpenRouter image edits through /images with fidelity warning", async () => {
-    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-openrouter-route-"));
+  it("forces Responses origin regeneration to generate with only original references", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-origin-responses-route-"));
+    const outputBase64 = pngBytes(864, 1536).toString("base64");
     const fetchMock = vi.fn(() =>
       Promise.resolve(
         new Response(
-          JSON.stringify({
-            data: [{ b64_json: pngBytes(1915, 821).toString("base64") }]
-          }),
+          `data: ${JSON.stringify({
+            type: "response.output_item.done",
+            item: { type: "image_generation_call", result: outputBase64 }
+          })}\ndata: [DONE]`,
           { status: 200 }
         )
       )
     );
     vi.stubGlobal("fetch", fetchMock);
+    try {
+      await writeGenerationConfig(rootDir, {
+        providerType: "openai_compatible",
+        apiMode: "responses",
+        apiBaseUrl: "https://api.example.com/v1",
+        imageModel: "gpt-image-2"
+      });
+      const service = new ImageEditService(rootDir, { concurrency: 1 });
+      const task = await service.createTask(createOriginRegenerationRequest());
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && !["queued", "running"].includes(item.status))
+      );
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe("https://api.example.com/v1/responses");
+      const payload = JSON.parse(String(init.body)) as {
+        tools: Array<Record<string, unknown>>;
+        input: Array<{ content: Array<Record<string, unknown>> }>;
+      };
+      expect(payload.tools[0]).toMatchObject({ action: "generate" });
+      const inputImages = payload.input[0].content.filter((item) => item.type === "input_image");
+      expect(inputImages).toHaveLength(1);
+      expect(inputImages[0]).toMatchObject({ image_url: dataUrl(64, 64) });
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
 
+  it("routes OpenRouter origin regeneration with only original references and no edit inputs", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-origin-openrouter-route-"));
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ data: [{ b64_json: pngBytes(864, 1536).toString("base64") }] }), {
+          status: 200
+        })
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
     try {
       await writeGenerationConfig(rootDir, {
         providerType: "openrouter",
@@ -566,28 +731,23 @@ describe("ImageEditService model routing", () => {
         imageModel: "openai/gpt-image-2"
       });
       const service = new ImageEditService(rootDir, { concurrency: 1 });
-      const task = await service.createTask(createRequestWithLocalMask());
-      await waitFor(async () => (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded"));
-      const [finished] = (await service.getTasks()).filter((item) => item.id === task.id);
-
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const task = await service.createTask(createOriginRegenerationRequest());
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && !["queued", "running"].includes(item.status))
+      );
       const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(url).toBe("https://openrouter.ai/api/v1/images");
-      const payload = JSON.parse(String(init.body)) as Record<string, unknown>;
-      expect(payload.model).toBe("openai/gpt-image-2");
-      expect(payload.size).toBe("1915x821");
-      expect(payload.output_format).toBe("png");
-      expect(payload.output_compression).toBeUndefined();
-      expect(JSON.stringify(payload)).not.toContain("mask");
-      expect(payload.input_references).toEqual([
-        expect.objectContaining({ type: "image_url" }),
-        expect.objectContaining({ type: "image_url" })
-      ]);
-      expect(finished.localProtectionMaskImage?.dataUrl).toMatch(/^data:image\/png;base64,/);
-      expect(finished.diagnostics?.localMaskSubmittedToBackend).toBe(false);
-      expect(finished.diagnostics?.strictMaskSubmitted).toBe(false);
-      expect(finished.backend?.fidelityNote).toContain("不承诺严格源图保真");
-      expect(finished.outputs[0].warnings?.join(" ")).toContain("不承诺严格源图保真");
+      const payload = JSON.parse(String(init.body)) as {
+        input_references?: Array<{ image_url?: { url?: string } }>;
+        [key: string]: unknown;
+      };
+      expect(payload.input_references).toEqual([{ type: "image_url", image_url: { url: dataUrl(64, 64) } }]);
+      expect(JSON.stringify(payload)).not.toContain(dataUrl(1915, 821));
+      expect(JSON.stringify(payload)).not.toMatch(/mask|input_fidelity/);
+      const finished = (await service.getTasks()).find((item) => item.id === task.id);
+      expect(finished?.fidelityMode).toBe("origin_regenerate");
+      expect(finished?.outputs[0].protectedVariant).toBeUndefined();
+      expect(finished?.outputs[0].compositeAudit).toBeUndefined();
     } finally {
       vi.unstubAllGlobals();
       await rm(rootDir, { recursive: true, force: true });

@@ -44,7 +44,6 @@ import {
   normalizeGenerationSizeSettings,
   resolveGenerationSize
 } from "./shared/generation-size";
-import { composePixelProtectedRgba } from "./shared/pixel-protection";
 import { createLocalSourceCapture } from "./shared/schema";
 import type {
   FusePromptControls,
@@ -64,15 +63,12 @@ import type {
   GenerationTaskVisibility,
   HistoryItem,
   ImageEditAnnotationItem,
+  ImageEditAnnotationResolution,
   ImageEditAnnotationImage,
   ImageEditCreateRequest,
-  ImageEditFidelityMode,
-  ImageEditLocalProtectionMaskImage,
-  ImageEditMaskStats,
-  ImageEditMaskImage,
   ImageEditOutput,
-  ImageEditOutputVariant,
   ImageEditRequestSettings,
+  ImageEditRegenerationContext,
   ImageEditSourceImage,
   ImageEditSourceKind,
   ImageEditTask,
@@ -250,18 +246,6 @@ type ImageEditAnnotation = {
   end?: { x: number; y: number };
 };
 
-type ImageEditMaskPurpose = "strict_backend" | "local_protection";
-
-type RenderedImageEditMask = {
-  dataUrl: string;
-  stats: ImageEditMaskStats;
-};
-
-type ImageEditMaskCapability = {
-  supportsMaskEdit: boolean;
-  reason?: string;
-};
-
 const clampValue = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max);
 
 const imageEditToolLabelMap: Record<ImageEditTool, string> = {
@@ -372,6 +356,26 @@ const createThumbnail = (dataUrl: string, maxSize = 360): Promise<string> =>
     minQuality: 0.5
   });
 
+const MAX_IMAGE_EDIT_SOURCE_BYTES = 32 * 1024 * 1024;
+const MAX_IMAGE_EDIT_SOURCE_PIXELS = 12_000_000;
+
+const imageDataUrlByteLength = (dataUrl: string): number => {
+  const payload = dataUrl.match(/^data:image\/[a-z0-9.+-]+;base64,([a-z0-9+/=\s]+)$/i)?.[1]?.replace(/\s/g, "");
+  if (!payload) throw new Error("改图源图必须是有效的 base64 图片数据。");
+  const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((payload.length * 3) / 4) - padding);
+};
+
+const assertImageEditSourceLimits = (dataUrl: string, width?: number, height?: number) => {
+  const byteLength = imageDataUrlByteLength(dataUrl);
+  if (byteLength > MAX_IMAGE_EDIT_SOURCE_BYTES) {
+    throw new Error("改图源图原始数据超过 32MB，为避免静默压缩或内存风险，本次已拒绝导入。");
+  }
+  if (width && height && width * height > MAX_IMAGE_EDIT_SOURCE_PIXELS) {
+    throw new Error("改图源图解码像素超过 1200 万，为避免静默缩小，本次已拒绝导入。");
+  }
+};
+
 type EraseStroke = {
   brushSizeRatio: number;
   points: Array<{ x: number; y: number }>;
@@ -453,19 +457,105 @@ const imageEditAnnotationAnchor = (annotation: ImageEditAnnotation): { x: number
 };
 
 const imageEditAnnotationPositionHint = (annotation: ImageEditAnnotation): string | undefined => {
+  const percent = (point: { x: number; y: number }) =>
+    `${Math.round(point.x * 100)}% x ${Math.round(point.y * 100)}%`;
+  if (annotation.tool === "box" && annotation.start && annotation.end) {
+    const leftTop = {
+      x: Math.min(annotation.start.x, annotation.end.x),
+      y: Math.min(annotation.start.y, annotation.end.y)
+    };
+    const rightBottom = {
+      x: Math.max(annotation.start.x, annotation.end.x),
+      y: Math.max(annotation.start.y, annotation.end.y)
+    };
+    return `框选左上角 ${percent(leftTop)}，右下角 ${percent(rightBottom)}`;
+  }
+  if (annotation.tool === "arrow" && annotation.start && annotation.end) {
+    return `箭头起点 ${percent(annotation.start)}，终点 ${percent(annotation.end)}`;
+  }
+  if (annotation.tool === "brush" && annotation.points?.length) {
+    const xs = annotation.points.map((point) => point.x);
+    const ys = annotation.points.map((point) => point.y);
+    return `笔迹包围框左上角 ${percent({ x: Math.min(...xs), y: Math.min(...ys) })}，右下角 ${percent({
+      x: Math.max(...xs),
+      y: Math.max(...ys)
+    })}`;
+  }
+  if (annotation.tool === "text" && annotation.start) return `文字锚点 ${percent(annotation.start)}`;
   const anchor = imageEditAnnotationAnchor(annotation);
-  if (!anchor) return undefined;
-  return `位于画面约 ${Math.round(anchor.x * 100)}% x ${Math.round(anchor.y * 100)}%`;
+  return anchor ? `锚点 ${percent(anchor)}` : undefined;
 };
 
 const buildImageEditAnnotationItems = (annotations: ImageEditAnnotation[]): ImageEditAnnotationItem[] =>
-  annotations.map((annotation, index) => ({
-    index: index + 1,
-    label: `标注 ${index + 1}`,
-    tool: annotation.tool,
-    note: annotation.note?.trim() || "按总体改图说明处理此处。",
-    positionHint: imageEditAnnotationPositionHint(annotation)
-  }));
+  annotations.map((annotation, index) => {
+    const lineWidth = 0.012;
+    const geometry = (() => {
+      if (annotation.tool === "box" && annotation.start && annotation.end) {
+        const left = Math.min(annotation.start.x, annotation.end.x);
+        const right = Math.max(annotation.start.x, annotation.end.x);
+        const top = Math.min(annotation.start.y, annotation.end.y);
+        const bottom = Math.max(annotation.start.y, annotation.end.y);
+        return {
+          tool: "box" as const,
+          left,
+          top,
+          right,
+          bottom,
+          centerX: (left + right) / 2,
+          centerY: (top + bottom) / 2,
+          width: right - left,
+          height: bottom - top
+        };
+      }
+      if (annotation.tool === "arrow" && annotation.start && annotation.end) {
+        return {
+          tool: "arrow" as const,
+          startX: annotation.start.x,
+          startY: annotation.start.y,
+          endX: annotation.end.x,
+          endY: annotation.end.y
+        };
+      }
+      if (annotation.tool === "brush" && annotation.points?.length) {
+        const xs = annotation.points.map((point) => point.x);
+        const ys = annotation.points.map((point) => point.y);
+        const centerX = xs.reduce((sum, value) => sum + value, 0) / xs.length;
+        const centerY = ys.reduce((sum, value) => sum + value, 0) / ys.length;
+        const pathLength = annotation.points.slice(1).reduce((sum, point, pointIndex) => {
+          const previous = annotation.points?.[pointIndex] || point;
+          return sum + Math.hypot(point.x - previous.x, point.y - previous.y);
+        }, 0);
+        return {
+          tool: "brush" as const,
+          left: Math.max(0, Math.min(...xs) - lineWidth / 2),
+          top: Math.max(0, Math.min(...ys) - lineWidth / 2),
+          right: Math.min(1, Math.max(...xs) + lineWidth / 2),
+          bottom: Math.min(1, Math.max(...ys) + lineWidth / 2),
+          centerX,
+          centerY,
+          coverageRatio: Math.min(1, pathLength * lineWidth + Math.PI * (lineWidth / 2) ** 2),
+          effectiveLineWidth: lineWidth
+        };
+      }
+      if (annotation.tool === "text" && annotation.start) {
+        return {
+          tool: "text" as const,
+          anchorX: annotation.start.x,
+          anchorY: annotation.start.y,
+          text: annotation.note?.trim() || annotation.text?.trim() || "修改这里"
+        };
+      }
+      return undefined;
+    })();
+    return {
+      index: index + 1,
+      label: `标注 ${index + 1}`,
+      tool: annotation.tool,
+      note: annotation.note?.trim() || "按总体改图说明处理此处。",
+      positionHint: imageEditAnnotationPositionHint(annotation),
+      geometry
+    };
+  });
 
 const drawImageEditAnnotationLabel = (
   context: CanvasRenderingContext2D,
@@ -499,21 +589,44 @@ const drawImageEditAnnotations = (
   annotations: ImageEditAnnotation[],
   width: number,
   height: number,
-  options: { textMode?: "number_only" | "full_note" } = {}
+  options: { textMode?: "number_only" | "full_note"; monochromeLocator?: boolean } = {}
 ) => {
   context.lineCap = "round";
   context.lineJoin = "round";
   annotations.forEach((annotation, annotationIndex) => {
     const anchor = imageEditAnnotationAnchor(annotation);
-    context.strokeStyle = annotation.color;
-    context.fillStyle = annotation.color;
-    context.lineWidth = Math.max(4, Math.round(Math.min(width, height) * 0.012));
+    const locator = options.monochromeLocator === true;
+    const baseLineWidth = locator
+      ? clampValue(Math.round(Math.min(width, height) * 0.004), 2, 8)
+      : Math.max(4, Math.round(Math.min(width, height) * 0.012));
+    const strokePath = () => {
+      if (locator) {
+        context.strokeStyle = "rgba(255, 255, 255, 0.96)";
+        context.lineWidth = baseLineWidth + Math.max(2, Math.round(baseLineWidth * 0.7));
+        context.stroke();
+        context.strokeStyle = "#111827";
+        context.lineWidth = baseLineWidth;
+        context.stroke();
+        return;
+      }
+      context.strokeStyle = annotation.color;
+      context.lineWidth = baseLineWidth;
+      context.stroke();
+    };
+    context.strokeStyle = locator ? "#111827" : annotation.color;
+    context.fillStyle = locator ? "#111827" : annotation.color;
+    context.lineWidth = baseLineWidth;
     if (annotation.tool === "brush" && annotation.points?.length) {
       if (annotation.points.length === 1) {
         const [point] = annotation.points;
         context.beginPath();
-        context.arc(point.x * width, point.y * height, context.lineWidth * 0.85, 0, Math.PI * 2);
+        context.arc(point.x * width, point.y * height, baseLineWidth * 0.85, 0, Math.PI * 2);
         context.fill();
+        if (locator) {
+          context.strokeStyle = "#ffffff";
+          context.lineWidth = Math.max(2, baseLineWidth * 0.6);
+          context.stroke();
+        }
         if (anchor) drawImageEditAnnotationLabel(context, annotationIndex, anchor, width, height);
         return;
       }
@@ -524,7 +637,7 @@ const drawImageEditAnnotations = (
         if (index === 0) context.moveTo(x, y);
         else context.lineTo(x, y);
       });
-      context.stroke();
+      strokePath();
       if (anchor) drawImageEditAnnotationLabel(context, annotationIndex, anchor, width, height);
       return;
     }
@@ -534,6 +647,13 @@ const drawImageEditAnnotations = (
       const endX = annotation.end.x * width;
       const endY = annotation.end.y * height;
       if (annotation.tool === "box") {
+        if (locator) {
+          context.strokeStyle = "rgba(255, 255, 255, 0.96)";
+          context.lineWidth = baseLineWidth + Math.max(2, Math.round(baseLineWidth * 0.7));
+          context.strokeRect(startX, startY, endX - startX, endY - startY);
+          context.strokeStyle = "#111827";
+          context.lineWidth = baseLineWidth;
+        }
         context.strokeRect(startX, startY, endX - startX, endY - startY);
         if (anchor) drawImageEditAnnotationLabel(context, annotationIndex, anchor, width, height);
         return;
@@ -541,15 +661,13 @@ const drawImageEditAnnotations = (
       context.beginPath();
       context.moveTo(startX, startY);
       context.lineTo(endX, endY);
-      context.stroke();
       const angle = Math.atan2(endY - startY, endX - startX);
       const headLength = Math.max(18, Math.min(width, height) * 0.035);
-      context.beginPath();
       context.moveTo(endX, endY);
       context.lineTo(endX - headLength * Math.cos(angle - Math.PI / 6), endY - headLength * Math.sin(angle - Math.PI / 6));
       context.moveTo(endX, endY);
       context.lineTo(endX - headLength * Math.cos(angle + Math.PI / 6), endY - headLength * Math.sin(angle + Math.PI / 6));
-      context.stroke();
+      strokePath();
       if (anchor) drawImageEditAnnotationLabel(context, annotationIndex, anchor, width, height);
       return;
     }
@@ -585,231 +703,14 @@ const renderImageEditAnnotationImage = async (
   canvas.height = Math.max(1, Math.round(image.height * scale));
   const context = canvas.getContext("2d");
   if (!context) throw new Error("无法渲染改图标注。");
-  context.fillStyle = "#ffffff";
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.save();
-  context.globalAlpha = 0.18;
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  context.restore();
-  drawImageEditAnnotations(context, annotations, canvas.width, canvas.height, { textMode: "number_only" });
-  return canvas.toDataURL("image/png");
-};
-
-const renderPngImageDataUrl = async (sourceDataUrl: string): Promise<string> => {
-  if (getMimeTypeFromDataUrl(sourceDataUrl) === "image/png") return sourceDataUrl;
-  const image = await loadImageElement(sourceDataUrl);
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, image.naturalWidth || image.width);
-  canvas.height = Math.max(1, image.naturalHeight || image.height);
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("无法把源图转换为 PNG。");
-  context.fillStyle = "#ffffff";
-  context.fillRect(0, 0, canvas.width, canvas.height);
-  context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL("image/png");
-};
-
-const renderImageEditMaskImage = async (
-  sourceDataUrl: string,
-  annotations: ImageEditAnnotation[],
-  purpose: ImageEditMaskPurpose = "strict_backend"
-): Promise<RenderedImageEditMask> => {
-  const image = await loadImageElement(sourceDataUrl);
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, image.naturalWidth || image.width);
-  canvas.height = Math.max(1, image.naturalHeight || image.height);
-  const context = canvas.getContext("2d");
-  if (!context) throw new Error("无法生成改图 mask。");
-
-  const shortSide = Math.max(1, Math.min(canvas.width, canvas.height));
-  const maskGeometry =
-    purpose === "local_protection"
-      ? {
-          feather: clampValue(Math.round(shortSide * 0.006), 4, 12),
-          boxExpand: clampValue(Math.round(shortSide * 0.025), 6, 40),
-          brushWidth: clampValue(Math.round(shortSide * 0.018), 8, 28),
-          anchorRadius: clampValue(Math.round(shortSide * 0.035), 10, 60)
-        }
-      : {
-          feather: clampValue(Math.round(shortSide * 0.02), 16, 48),
-          boxExpand: clampValue(Math.round(shortSide * 0.06), 24, 160),
-          brushWidth: clampValue(Math.round(shortSide * 0.03), 16, 64),
-          anchorRadius: clampValue(Math.round(shortSide * 0.08), 24, 160)
-        };
-
-  context.clearRect(0, 0, canvas.width, canvas.height);
-  // Alpha polarity is fixed: alpha=255 keeps source pixels, alpha=0 allows model output pixels.
-  context.fillStyle = "rgba(255, 255, 255, 1)";
-  context.fillRect(0, 0, canvas.width, canvas.height);
-
-  const eraseWithFeather = (draw: () => void) => {
-    context.save();
-    context.globalCompositeOperation = "destination-out";
-    context.fillStyle = "rgba(0, 0, 0, 1)";
-    context.strokeStyle = "rgba(0, 0, 0, 1)";
-    context.lineCap = "round";
-    context.lineJoin = "round";
-    context.shadowColor = "rgba(0, 0, 0, 0.9)";
-    context.shadowBlur = maskGeometry.feather;
-    draw();
-    context.restore();
-  };
-
-  annotations.forEach((annotation) => {
-    if (annotation.tool === "box" && annotation.start && annotation.end) {
-      const startX = annotation.start.x * canvas.width;
-      const startY = annotation.start.y * canvas.height;
-      const endX = annotation.end.x * canvas.width;
-      const endY = annotation.end.y * canvas.height;
-      const x = clampValue(Math.min(startX, endX) - maskGeometry.boxExpand, 0, canvas.width);
-      const y = clampValue(Math.min(startY, endY) - maskGeometry.boxExpand, 0, canvas.height);
-      const width = clampValue(Math.abs(endX - startX) + maskGeometry.boxExpand * 2, 1, canvas.width - x);
-      const height = clampValue(Math.abs(endY - startY) + maskGeometry.boxExpand * 2, 1, canvas.height - y);
-      eraseWithFeather(() => context.fillRect(x, y, width, height));
-      return;
-    }
-
-    if (annotation.tool === "brush" && annotation.points?.length) {
-      eraseWithFeather(() => {
-        context.lineWidth = maskGeometry.brushWidth;
-        if (annotation.points?.length === 1) {
-          const [point] = annotation.points;
-          context.beginPath();
-          context.arc(point.x * canvas.width, point.y * canvas.height, maskGeometry.brushWidth / 2, 0, Math.PI * 2);
-          context.fill();
-          return;
-        }
-        context.beginPath();
-        annotation.points?.forEach((point, index) => {
-          const x = point.x * canvas.width;
-          const y = point.y * canvas.height;
-          if (index === 0) context.moveTo(x, y);
-          else context.lineTo(x, y);
-        });
-        context.stroke();
-      });
-      return;
-    }
-
-    if (annotation.tool === "arrow") {
-      const anchor = annotation.end || annotation.start;
-      if (!anchor) return;
-      eraseWithFeather(() => {
-        context.beginPath();
-        context.ellipse(
-          anchor.x * canvas.width,
-          anchor.y * canvas.height,
-          maskGeometry.anchorRadius,
-          maskGeometry.anchorRadius * 0.75,
-          0,
-          0,
-          Math.PI * 2
-        );
-        context.fill();
-      });
-      return;
-    }
-
-    if (annotation.tool === "text" && annotation.start) {
-      const x = annotation.start.x * canvas.width;
-      const y = annotation.start.y * canvas.height;
-      eraseWithFeather(() => {
-        context.beginPath();
-        context.ellipse(x, y, maskGeometry.anchorRadius * 1.15, maskGeometry.anchorRadius * 0.8, 0, 0, Math.PI * 2);
-        context.fill();
-      });
-    }
+  drawImageEditAnnotations(context, annotations, canvas.width, canvas.height, {
+    textMode: "number_only",
+    monochromeLocator: true
   });
-
-  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-  let transparentPixels = 0;
-  let minX = canvas.width;
-  let minY = canvas.height;
-  let maxX = -1;
-  let maxY = -1;
-  for (let y = 0; y < canvas.height; y += 1) {
-    for (let x = 0; x < canvas.width; x += 1) {
-      const alpha = imageData.data[(y * canvas.width + x) * 4 + 3];
-      if (alpha < 250) {
-        transparentPixels += 1;
-        minX = Math.min(minX, x);
-        minY = Math.min(minY, y);
-        maxX = Math.max(maxX, x);
-        maxY = Math.max(maxY, y);
-      }
-    }
-  }
-  const transparentRatio = transparentPixels / Math.max(1, canvas.width * canvas.height);
-  const bboxWidth = maxX >= minX ? maxX - minX + 1 : 0;
-  const bboxHeight = maxY >= minY ? maxY - minY + 1 : 0;
-  const warnings: string[] = [];
-  if (purpose === "local_protection" && transparentRatio > 0.25) {
-    warnings.push("编辑区域较大，旁路生成可能重绘未标注皮肤。");
-  }
-  if (purpose === "local_protection" && Math.max(bboxWidth, bboxHeight) / shortSide > 0.35) {
-    warnings.push("单处或合并标注范围偏大，建议缩小标注或用框选精确圈定。");
-  }
-  return {
-    dataUrl: canvas.toDataURL("image/png"),
-    stats: {
-      width: canvas.width,
-      height: canvas.height,
-      transparentRatio,
-      bbox: bboxWidth && bboxHeight ? `${minX},${minY},${bboxWidth}x${bboxHeight}` : undefined,
-      itemCount: annotations.length,
-      warnings
-    }
-  };
+  return canvas.toDataURL("image/png");
 };
 
-const renderPixelProtectedImage = async (
-  sourceDataUrl: string,
-  maskDataUrl: string,
-  outputDataUrl: string
-): Promise<{ dataUrl?: string; width?: number; height?: number; reason?: string }> => {
-  if (!maskDataUrl) return { reason: "缺少本地保护图，未生成本地保护版。" };
-  try {
-    const [sourceImage, maskImage, outputImage] = await Promise.all([
-      loadImageElement(sourceDataUrl),
-      loadImageElement(maskDataUrl),
-      loadImageElement(outputDataUrl)
-    ]);
-    const sourceWidth = Math.max(1, sourceImage.naturalWidth || sourceImage.width);
-    const sourceHeight = Math.max(1, sourceImage.naturalHeight || sourceImage.height);
-    const maskWidth = Math.max(1, maskImage.naturalWidth || maskImage.width);
-    const maskHeight = Math.max(1, maskImage.naturalHeight || maskImage.height);
-    const outputWidth = Math.max(1, outputImage.naturalWidth || outputImage.width);
-    const outputHeight = Math.max(1, outputImage.naturalHeight || outputImage.height);
-    if (sourceWidth !== maskWidth || sourceHeight !== maskHeight || sourceWidth !== outputWidth || sourceHeight !== outputHeight) {
-      return {
-        reason:
-          "AI 输出尺寸与源图不一致，已保留 AI 原始结果，未生成本地保护版。本地保护版仅在 AI 输出与源图同尺寸时可用。"
-      };
-    }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = sourceWidth;
-    canvas.height = sourceHeight;
-    const context = canvas.getContext("2d");
-    if (!context) return { reason: "图片解码失败，未生成本地保护版。" };
-
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(sourceImage, 0, 0);
-    const sourcePixels = context.getImageData(0, 0, canvas.width, canvas.height);
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(outputImage, 0, 0);
-    const outputPixels = context.getImageData(0, 0, canvas.width, canvas.height);
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(maskImage, 0, 0);
-    const maskPixels = context.getImageData(0, 0, canvas.width, canvas.height);
-    const finalPixels = context.createImageData(canvas.width, canvas.height);
-    finalPixels.data.set(composePixelProtectedRgba(sourcePixels.data, outputPixels.data, maskPixels.data));
-    context.putImageData(finalPixels, 0, 0);
-    return { dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height };
-  } catch {
-    return { reason: "图片解码失败，未生成本地保护版。" };
-  }
-};
 
 const drawReferenceEdit = async (
   canvas: HTMLCanvasElement,
@@ -1102,35 +1003,6 @@ const generationBackendError = (config: GenerationConfig): string => {
   return "请先填写生图 API Key。";
 };
 
-const imageEditMaskCapabilityForConfig = (config: GenerationConfig): ImageEditMaskCapability => {
-  if (config.authSource === "codex_oauth") {
-    return {
-      supportsMaskEdit: false,
-      reason: "Codex OAuth 当前走 Responses image_generation，不支持 mask 严格编辑。"
-    };
-  }
-  if (config.providerType === "openrouter") {
-    return {
-      supportsMaskEdit: false,
-      reason: "OpenRouter /images 是参考生成接口，不支持 mask 严格编辑。"
-    };
-  }
-  if (config.apiMode !== "images") {
-    return {
-      supportsMaskEdit: false,
-      reason: "OpenAI-compatible Responses 当前不支持本方案的 mask 严格编辑。"
-    };
-  }
-  return { supportsMaskEdit: true };
-};
-
-const strictMaskUnavailableMessage = (capability: ImageEditMaskCapability): string =>
-  capability.supportsMaskEdit
-    ? ""
-    : `当前后端不支持 mask 严格编辑，请切换到 OpenAI-compatible Images 后端，或继续使用参考生成模式。${
-        capability.reason ? `（${capability.reason}）` : ""
-      }`;
-
 const formatGenerationProviderType = (providerType: GenerationProviderType): string =>
   providerType === "openrouter" ? "OpenRouter" : "OpenAI-compatible";
 
@@ -1153,7 +1025,7 @@ export function App(): JSX.Element {
   const strictGeneralizationRef = useRef(true);
   const analyzeCanceledRef = useRef(false);
   const fuseCanceledRef = useRef(false);
-  const imageEditProtectedVariantRequestsRef = useRef(new Set<string>());
+  const imageEditResolutionVersionRef = useRef(0);
   const [config, setConfig] = useState<ModelConfig>(defaultConfig);
   const [draftConfig, setDraftConfig] = useState<ConfigDraft>(defaultDraftConfig);
   const [generationConfig, setGenerationConfig] = useState<GenerationConfig>(defaultGenerationConfig);
@@ -1202,16 +1074,16 @@ export function App(): JSX.Element {
   const [generationCopied, setGenerationCopied] = useState("");
   const [imageEditSource, setImageEditSource] = useState<ImageEditSourceImage | null>(null);
   const [imageEditAnnotations, setImageEditAnnotations] = useState<ImageEditAnnotation[]>([]);
-  const [imageEditFidelityMode, setImageEditFidelityMode] = useState<ImageEditFidelityMode>("reference");
-  const [imageEditPixelProtectionEnabled, setImageEditPixelProtectionEnabled] = useState(true);
-  const [imageEditLocalMaskPreview, setImageEditLocalMaskPreview] = useState<RenderedImageEditMask | null>(null);
-  const [isRenderingImageEditLocalMask, setIsRenderingImageEditLocalMask] = useState(false);
+  const [imageEditRegenerationContext, setImageEditRegenerationContext] =
+    useState<ImageEditRegenerationContext | null>(null);
+  const [imageEditAnnotationResolution, setImageEditAnnotationResolution] =
+    useState<ImageEditAnnotationResolution | null>(null);
+  const [isResolvingImageEditAnnotations, setIsResolvingImageEditAnnotations] = useState(false);
   const [imageEditInstruction, setImageEditInstruction] = useState("");
   const [imageEditSettings, setImageEditSettings] = useState<ImageEditRequestSettings>(defaultImageEditSettings);
   const [imageEditTasks, setImageEditTasks] = useState<ImageEditTask[]>([]);
   const [selectedImageEditTaskId, setSelectedImageEditTaskId] = useState("");
   const [collapsedImageEditTaskIds, setCollapsedImageEditTaskIds] = useState<string[]>([]);
-  const [imageEditOutputVariantView, setImageEditOutputVariantView] = useState<Record<string, "raw" | "pixel_protected">>({});
   const [isImageEditDragging, setIsImageEditDragging] = useState(false);
   const [isCreatingImageEdit, setIsCreatingImageEdit] = useState(false);
   const [imageEditError, setImageEditError] = useState("");
@@ -1224,10 +1096,6 @@ export function App(): JSX.Element {
   const usesInsecureGenerationBaseUrl =
     generationDraft.authSource === "api" && generationDraft.apiBaseUrl.trim().toLowerCase().startsWith("http://");
   const generationBackendReady = hasGenerationBackend(generationConfig);
-  const imageEditMaskCapability = useMemo(
-    () => imageEditMaskCapabilityForConfig(generationConfig),
-    [generationConfig]
-  );
   const editingGenerationReference = generationReferenceImages.find((image) => image.id === editingGenerationReferenceId);
   const hasActiveGenerationTasks = useMemo(
     () => generationTasks.some((task) => task.status === "queued" || task.status === "running"),
@@ -1259,27 +1127,14 @@ export function App(): JSX.Element {
   );
 
   useEffect(() => {
-    let canceled = false;
-    if (!imageEditSource || !imageEditAnnotations.length || imageEditFidelityMode !== "reference") {
-      setImageEditLocalMaskPreview(null);
-      setIsRenderingImageEditLocalMask(false);
-      return;
-    }
-    setIsRenderingImageEditLocalMask(true);
-    void renderImageEditMaskImage(imageEditSource.dataUrl, imageEditAnnotations, "local_protection")
-      .then((mask) => {
-        if (!canceled) setImageEditLocalMaskPreview(mask);
-      })
-      .catch(() => {
-        if (!canceled) setImageEditLocalMaskPreview(null);
-      })
-      .finally(() => {
-        if (!canceled) setIsRenderingImageEditLocalMask(false);
-      });
-    return () => {
-      canceled = true;
-    };
-  }, [imageEditAnnotations, imageEditFidelityMode, imageEditSource]);
+    imageEditResolutionVersionRef.current += 1;
+    setImageEditAnnotationResolution(null);
+  }, [
+    imageEditSource?.id,
+    imageEditAnnotations,
+    imageEditInstruction,
+    imageEditRegenerationContext?.basePrompt
+  ]);
 
   const resetFusionState = useCallback((closeModal = false) => {
     setSubjectImage(null);
@@ -1411,98 +1266,22 @@ export function App(): JSX.Element {
     return () => window.clearInterval(timer);
   }, [hasActiveImageEditTasks]);
 
-  useEffect(() => {
-    const candidates = imageEditTasks.flatMap((task) => {
-      if (task.status === "queued" || task.status === "running") return [];
-      if ((task.fidelityMode || "reference") !== "reference") return [];
-      if (task.pixelProtectionEnabled === false) return [];
-      if (!task.sourceImage.dataUrl || !task.localProtectionMaskImage?.dataUrl) return [];
-      return task.outputs
-        .filter((output) => output.dataUrl && !output.protectedVariant && !output.protectedVariantUnavailableReason)
-        .map((output) => ({ task, output }));
-    });
-    candidates.forEach(({ task, output }) => {
-      const requestKey = `${task.id}:${output.id}`;
-      if (imageEditProtectedVariantRequestsRef.current.has(requestKey)) return;
-      imageEditProtectedVariantRequestsRef.current.add(requestKey);
-      void (async () => {
-        const result = await renderPixelProtectedImage(
-          task.sourceImage.dataUrl,
-          task.localProtectionMaskImage?.dataUrl || "",
-          output.dataUrl
-        );
-        if (!result.dataUrl) {
-          setImageEditTasks((current) =>
-            current.map((currentTask) =>
-              currentTask.id === task.id
-                ? {
-                    ...currentTask,
-                    outputs: currentTask.outputs.map((currentOutput) =>
-                      currentOutput.id === output.id
-                        ? {
-                            ...currentOutput,
-                            protectedVariantUnavailableReason:
-                              result.reason ||
-                              "本地保护版仅在 AI 输出与源图同尺寸时可用；已保留 AI 原始结果。"
-                          }
-                        : currentOutput
-                    )
-                  }
-                : currentTask
-            )
-          );
-          return;
-        }
-        const updatedTask = await window.styleExtractor.saveImageEditProtectedVariant({
-          taskId: task.id,
-          outputId: output.id,
-          dataUrl: result.dataUrl,
-          mimeType: "image/png",
-          width: result.width,
-          height: result.height,
-          warnings: [
-            "本地保护版是软件后处理结果，不是 AI 原始结果。",
-            ...(task.localProtectionMaskImage?.stats?.warnings || [])
-          ]
-        });
-        setImageEditTasks((current) => current.map((currentTask) => (currentTask.id === updatedTask.id ? updatedTask : currentTask)));
-      })().catch((variantError) => {
-        setImageEditTasks((current) =>
-          current.map((currentTask) =>
-            currentTask.id === task.id
-              ? {
-                  ...currentTask,
-                  outputs: currentTask.outputs.map((currentOutput) =>
-                    currentOutput.id === output.id
-                      ? {
-                          ...currentOutput,
-                          protectedVariantUnavailableReason:
-                            variantError instanceof Error ? variantError.message : "图片解码失败，未生成本地保护版。"
-                        }
-                      : currentOutput
-                  )
-                }
-              : currentTask
-          )
-        );
-      });
-    });
-  }, [imageEditTasks]);
-
   const loadImageEditSource = useCallback(
     async (
       imageState: ImageState,
       sourceKind: ImageEditSourceKind,
-      pointer?: Partial<ImageEditSourceImage["sourcePointer"]>
+      pointer?: Partial<ImageEditSourceImage["sourcePointer"]>,
+      regenerationContext?: ImageEditRegenerationContext
     ) => {
+      assertImageEditSourceLimits(imageState.dataUrl);
       const dimensions = await imageDimensionsFromDataUrl(imageState.dataUrl);
-      const modelDataUrl = await createModelImage(imageState.dataUrl);
+      assertImageEditSourceLimits(imageState.dataUrl, dimensions.width, dimensions.height);
       const sourceImage: ImageEditSourceImage = {
         id: crypto.randomUUID(),
         name: imageState.fileName,
-        mimeType: getMimeTypeFromDataUrl(modelDataUrl, imageState.mimeType),
-        dataUrl: modelDataUrl,
-        thumbnailDataUrl: imageState.thumbnailDataUrl || (await createThumbnail(modelDataUrl)),
+        mimeType: getMimeTypeFromDataUrl(imageState.dataUrl, imageState.mimeType),
+        dataUrl: imageState.dataUrl,
+        thumbnailDataUrl: imageState.thumbnailDataUrl || (await createThumbnail(imageState.dataUrl)),
         width: dimensions.width,
         height: dimensions.height,
         createdAt: new Date().toISOString(),
@@ -1514,6 +1293,16 @@ export function App(): JSX.Element {
       };
       setImageEditSource(sourceImage);
       setImageEditAnnotations([]);
+      setImageEditRegenerationContext(
+        regenerationContext || {
+          basePrompt: "",
+          sourceLabel: "手动导入源图",
+          importedAt: new Date().toISOString(),
+          inputStrategy: "text_only",
+          originalReferences: []
+        }
+      );
+      setImageEditAnnotationResolution(null);
       setImageEditSettings(imageEditSettingsForDimensions(dimensions.width, dimensions.height, generationConfigRef.current));
       setImageEditError("");
     },
@@ -1882,6 +1671,46 @@ export function App(): JSX.Element {
     }
   };
 
+  const resolveImageEditAnnotations = async () => {
+    if (!imageEditSource || !imageEditRegenerationContext?.basePrompt.trim()) {
+      setImageEditError("请先导入源图并填写重生成基础提示词。");
+      return;
+    }
+    try {
+      const resolutionVersion = imageEditResolutionVersionRef.current;
+      setIsResolvingImageEditAnnotations(true);
+      setImageEditError("");
+      setStatus("正在解析编号修改清单...");
+      const annotationItems = buildImageEditAnnotationItems(imageEditAnnotations);
+      const annotationImageDataUrl = await renderImageEditAnnotationImage(
+        imageEditSource.dataUrl,
+        imageEditAnnotations
+      );
+      const response = await window.styleExtractor.resolveImageEditAnnotations({
+        sourceImageDataUrl: imageEditSource.dataUrl,
+        annotationImageDataUrl,
+        annotationItems,
+        instruction: imageEditInstruction,
+        basePrompt: imageEditRegenerationContext.basePrompt
+      });
+      if (imageEditResolutionVersionRef.current !== resolutionVersion) {
+        setStatus("源图、标注、说明或基础提示词已变化，旧解析结果已丢弃。");
+        return;
+      }
+      setImageEditAnnotationResolution(response.resolution);
+      setStatus(
+        response.resolution.source === "manual_fallback"
+          ? "视觉解析不可用，已生成手动确认清单。"
+          : "修改清单已解析，请逐项检查并确认。"
+      );
+    } catch (resolveError) {
+      setImageEditError(resolveError instanceof Error ? resolveError.message : String(resolveError));
+      setStatus("");
+    } finally {
+      setIsResolvingImageEditAnnotations(false);
+    }
+  };
+
   const createImageEditTask = async () => {
     if (!imageEditSource) {
       setImageEditError("请先导入一张改图源图。");
@@ -1893,8 +1722,16 @@ export function App(): JSX.Element {
       setImageEditError("请填写总体改图说明，或至少为一处标注填写修改要求。");
       return;
     }
-    if (imageEditFidelityMode === "strict_mask" && !imageEditAnnotations.length) {
-      setImageEditError("严格保真模式至少需要 1 个编号标注，用于生成 alpha mask。");
+    if (!imageEditAnnotations.length) {
+      setImageEditError("至少需要 1 个带明确要求的编号标注。");
+      return;
+    }
+    if (!imageEditRegenerationContext?.basePrompt.trim()) {
+      setImageEditError("缺少第一次生图的基础提示词；手动导入时请填写完整基础提示词。");
+      return;
+    }
+    if (imageEditAnnotationResolution?.status !== "confirmed") {
+      setImageEditError("请先解析并确认修改清单，再生成修订版。");
       return;
     }
     let activeGenerationConfig = generationConfigRef.current;
@@ -1905,28 +1742,13 @@ export function App(): JSX.Element {
         return;
       }
     }
-    const maskCapability = imageEditMaskCapabilityForConfig(activeGenerationConfig);
-    if (imageEditFidelityMode === "strict_mask" && !maskCapability.supportsMaskEdit) {
-      setImageEditError(strictMaskUnavailableMessage(maskCapability));
-      return;
-    }
     try {
       setIsCreatingImageEdit(true);
       setImageEditError("");
       setStatus("正在提交改图任务...");
-      const shouldUseStrictMask = imageEditFidelityMode === "strict_mask";
-      const sourceDataUrl = shouldUseStrictMask ? await renderPngImageDataUrl(imageEditSource.dataUrl) : imageEditSource.dataUrl;
+      const sourceDataUrl = imageEditSource.dataUrl;
       const sourceDimensions = await imageDimensionsFromDataUrl(sourceDataUrl);
-      const sourceForRequest: ImageEditSourceImage = shouldUseStrictMask
-        ? {
-            ...imageEditSource,
-            mimeType: "image/png",
-            dataUrl: sourceDataUrl,
-            thumbnailDataUrl: imageEditSource.thumbnailDataUrl || (await createThumbnail(sourceDataUrl)),
-            width: sourceDimensions.width,
-            height: sourceDimensions.height
-          }
-        : imageEditSource;
+      assertImageEditSourceLimits(sourceDataUrl, sourceDimensions.width, sourceDimensions.height);
       const annotationDataUrl = await renderImageEditAnnotationImage(sourceDataUrl, imageEditAnnotations);
       const annotationImage: ImageEditAnnotationImage = {
         mimeType: "image/png",
@@ -1935,57 +1757,19 @@ export function App(): JSX.Element {
         itemCount: imageEditAnnotations.length,
         createdAt: new Date().toISOString()
       };
-      const strictMask = shouldUseStrictMask
-        ? await renderImageEditMaskImage(sourceDataUrl, imageEditAnnotations, "strict_backend")
-        : null;
-      const localProtectionMask =
-        !shouldUseStrictMask && imageEditAnnotations.length
-          ? await renderImageEditMaskImage(sourceDataUrl, imageEditAnnotations, "local_protection")
-          : null;
-      const maskImage: ImageEditMaskImage | undefined = shouldUseStrictMask
-        ? {
-            mimeType: "image/png",
-            dataUrl: strictMask?.dataUrl || "",
-            itemCount: imageEditAnnotations.length,
-            width: sourceDimensions.width,
-            height: sourceDimensions.height,
-            createdAt: new Date().toISOString()
-          }
-        : undefined;
-      const localProtectionMaskImage: ImageEditLocalProtectionMaskImage | undefined = localProtectionMask
-        ? {
-            purpose: "local_protection",
-            mimeType: "image/png",
-            dataUrl: localProtectionMask.dataUrl,
-            itemCount: imageEditAnnotations.length,
-            width: sourceDimensions.width,
-            height: sourceDimensions.height,
-            stats: localProtectionMask.stats,
-            createdAt: new Date().toISOString()
-          }
-        : undefined;
       const normalizedSize = normalizeGenerationSizeSettings(imageEditSettings);
-      const shouldRequestSourceSizeForLocalProtection =
-        !shouldUseStrictMask &&
-        imageEditPixelProtectionEnabled &&
-        Boolean(localProtectionMaskImage) &&
-        Boolean(sourceDimensions.width && sourceDimensions.height);
-      const requestSize = shouldRequestSourceSizeForLocalProtection
-        ? `${sourceDimensions.width}x${sourceDimensions.height}`
-        : normalizedSize.size;
       const request: ImageEditCreateRequest = {
-        sourceImage: sourceForRequest,
+        sourceImage: imageEditSource,
         annotationImage,
-        maskImage,
-        localProtectionMaskImage,
         annotationItems,
-        fidelityMode: imageEditFidelityMode,
-        pixelProtectionEnabled: imageEditPixelProtectionEnabled,
+        annotationResolution: imageEditAnnotationResolution || undefined,
+        regenerationContext:
+          imageEditRegenerationContext?.basePrompt.trim() ? imageEditRegenerationContext : undefined,
+        fidelityMode: "origin_regenerate",
         instruction: imageEditInstruction,
         settings: {
           ...imageEditSettings,
           ...normalizedSize,
-          size: requestSize,
           apiMode:
             activeGenerationConfig.authSource === "codex_oauth"
               ? "responses"
@@ -2277,6 +2061,15 @@ export function App(): JSX.Element {
         {
           generationTaskId: task.id,
           generationOutputId: output.id
+        },
+        {
+          basePrompt: task.prompt,
+          generationTaskId: task.id,
+          generationOutputId: output.id,
+          sourceLabel: task.promptSource.label,
+          importedAt: new Date().toISOString(),
+          inputStrategy: task.referenceImages.length ? "original_references" : "text_only",
+          originalReferences: task.referenceImages.map((reference) => ({ ...reference }))
         }
       );
       setImageEditInstruction("");
@@ -2383,7 +2176,14 @@ export function App(): JSX.Element {
         {
           imageEditTaskId: task.id,
           imageEditOutputId: output.id
-        }
+        },
+        task.regenerationContext
+          ? {
+              ...task.regenerationContext,
+              importedAt: new Date().toISOString(),
+              originalReferences: task.regenerationContext.originalReferences.map((reference) => ({ ...reference }))
+            }
+          : undefined
       );
       setImageEditInstruction("");
       setActiveView("edit");
@@ -2420,7 +2220,8 @@ export function App(): JSX.Element {
         const task = imageEditTasks.find((item) => item.id === current.taskId);
         if (!task?.outputs.length) return current;
         const nextIndex = (current.outputIndex + direction + task.outputs.length) % task.outputs.length;
-        return buildImageEditComparePreview(task, task.outputs[nextIndex], nextIndex) || current;
+        const nextOutput = task.outputs[nextIndex];
+        return buildImageEditComparePreview(task, nextOutput, nextIndex) || current;
       }
       const generationTask = generationTasks.find((item) => item.id === current.taskId);
       if (!generationTask?.outputs.length) return current;
@@ -2686,7 +2487,8 @@ export function App(): JSX.Element {
     setGenerationSettings(defaultGenerationSettings);
     setImageEditSource(null);
     setImageEditAnnotations([]);
-    setImageEditFidelityMode("reference");
+    setImageEditRegenerationContext(null);
+    setImageEditAnnotationResolution(null);
     setImageEditInstruction("");
     setImageEditSettings(defaultImageEditSettings);
     setImageEditTasks([]);
@@ -3083,17 +2885,15 @@ export function App(): JSX.Element {
           backendActionLabel={generationBackendActionLabel(generationConfig)}
           backendReady={generationBackendReady}
           error={imageEditError}
-          fidelityMode={imageEditFidelityMode}
           instruction={imageEditInstruction}
           isCreating={isCreatingImageEdit}
+          isResolvingAnnotations={isResolvingImageEditAnnotations}
           isDragging={isImageEditDragging}
-          isRenderingLocalMask={isRenderingImageEditLocalMask}
-          localMaskPreview={imageEditLocalMaskPreview}
-          maskCapability={imageEditMaskCapability}
           onCancelTask={cancelImageEditTask}
           onClearAnnotations={() => setImageEditAnnotations([])}
           onClearTasks={clearImageEditTasks}
           onCreateTask={createImageEditTask}
+          onResolveAnnotations={resolveImageEditAnnotations}
           onDeleteTask={deleteImageEditTask}
           onDownloadOutput={saveImageEditOutputs}
           onContinueFromOutput={continueImageEditFromOutput}
@@ -3102,12 +2902,11 @@ export function App(): JSX.Element {
           onOpenConfig={() => void openGenerationConfig()}
           onPickSource={() => imageEditSourceInputRef.current?.click()}
           onRetryTask={retryImageEditTask}
-          onSetOutputVariantView={setImageEditOutputVariantView}
           onToggleTaskCollapsed={toggleImageEditTaskCollapsed}
-          onSetFidelityMode={setImageEditFidelityMode}
+          onSetAnnotationResolution={setImageEditAnnotationResolution}
           onSetAnnotations={setImageEditAnnotations}
           onSetInstruction={setImageEditInstruction}
-          onSetPixelProtectionEnabled={setImageEditPixelProtectionEnabled}
+          onSetRegenerationContext={setImageEditRegenerationContext}
           onSetSettings={setImageEditSettings}
           onSourceDrop={(event) => {
             event.preventDefault();
@@ -3124,8 +2923,8 @@ export function App(): JSX.Element {
           settings={imageEditSettings}
           source={imageEditSource}
           collapsedTaskIds={collapsedImageEditTaskIds}
-          outputVariantView={imageEditOutputVariantView}
-          pixelProtectionEnabled={imageEditPixelProtectionEnabled}
+          regenerationContext={imageEditRegenerationContext}
+          annotationResolution={imageEditAnnotationResolution}
           tasks={imageEditTasks}
         />
       )}
@@ -4607,17 +4406,15 @@ function ImageEditWorkspace({
   backendReady,
   collapsedTaskIds,
   error,
-  fidelityMode,
   instruction,
   isCreating,
+  isResolvingAnnotations,
   isDragging,
-  isRenderingLocalMask,
-  localMaskPreview,
-  maskCapability,
   onCancelTask,
   onClearAnnotations,
   onClearTasks,
   onCreateTask,
+  onResolveAnnotations,
   onDeleteTask,
   onDownloadOutput,
   onContinueFromOutput,
@@ -4626,12 +4423,11 @@ function ImageEditWorkspace({
   onOpenOutputPreview,
   onPickSource,
   onRetryTask,
-  onSetOutputVariantView,
   onToggleTaskCollapsed,
-  onSetFidelityMode,
+  onSetAnnotationResolution,
   onSetAnnotations,
   onSetInstruction,
-  onSetPixelProtectionEnabled,
+  onSetRegenerationContext,
   onSetSettings,
   onSourceDragLeave,
   onSourceDragOver,
@@ -4640,8 +4436,8 @@ function ImageEditWorkspace({
   selectedTaskId,
   settings,
   source,
-  outputVariantView,
-  pixelProtectionEnabled,
+  regenerationContext,
+  annotationResolution,
   tasks
 }: {
   annotations: ImageEditAnnotation[];
@@ -4649,17 +4445,15 @@ function ImageEditWorkspace({
   backendReady: boolean;
   collapsedTaskIds: string[];
   error: string;
-  fidelityMode: ImageEditFidelityMode;
   instruction: string;
   isCreating: boolean;
+  isResolvingAnnotations: boolean;
   isDragging: boolean;
-  isRenderingLocalMask: boolean;
-  localMaskPreview: RenderedImageEditMask | null;
-  maskCapability: ImageEditMaskCapability;
   onCancelTask: (id: string) => void;
   onClearAnnotations: () => void;
   onClearTasks: () => void;
   onCreateTask: () => void;
+  onResolveAnnotations: () => void;
   onDeleteTask: (id: string) => void;
   onDownloadOutput: (task: ImageEditTask, outputs: ImageEditOutput[]) => void;
   onContinueFromOutput: (task: ImageEditTask, output: ImageEditOutput, index: number) => void;
@@ -4668,12 +4462,11 @@ function ImageEditWorkspace({
   onOpenOutputPreview: (task: ImageEditTask, output: ImageEditOutput, index: number) => void;
   onPickSource: () => void;
   onRetryTask: (task: ImageEditTask) => void;
-  onSetOutputVariantView: Dispatch<SetStateAction<Record<string, "raw" | "pixel_protected">>>;
   onToggleTaskCollapsed: (taskId: string) => void;
-  onSetFidelityMode: (mode: ImageEditFidelityMode) => void;
+  onSetAnnotationResolution: Dispatch<SetStateAction<ImageEditAnnotationResolution | null>>;
   onSetAnnotations: Dispatch<SetStateAction<ImageEditAnnotation[]>>;
   onSetInstruction: (value: string) => void;
-  onSetPixelProtectionEnabled: (value: boolean) => void;
+  onSetRegenerationContext: Dispatch<SetStateAction<ImageEditRegenerationContext | null>>;
   onSetSettings: Dispatch<SetStateAction<ImageEditRequestSettings>>;
   onSourceDragLeave: () => void;
   onSourceDragOver: (event: DragEvent<HTMLDivElement>) => void;
@@ -4682,8 +4475,8 @@ function ImageEditWorkspace({
   selectedTaskId: string;
   settings: ImageEditRequestSettings;
   source: ImageEditSourceImage | null;
-  outputVariantView: Record<string, "raw" | "pixel_protected">;
-  pixelProtectionEnabled: boolean;
+  regenerationContext: ImageEditRegenerationContext | null;
+  annotationResolution: ImageEditAnnotationResolution | null;
   tasks: ImageEditTask[];
 }): JSX.Element {
   const [activeTool, setActiveTool] = useState<ImageEditTool>("brush");
@@ -4696,32 +4489,13 @@ function ImageEditWorkspace({
     [showHiddenTasks, tasks]
   );
   const hasLocalEditNotes = annotations.some((annotation) => annotation.note?.trim());
-  const strictMaskUnavailable = strictMaskUnavailableMessage(maskCapability);
   const sourceExactSize = source?.width && source.height ? `${source.width}x${source.height}` : "";
-  const usesLocalProtectionRequestSize =
-    fidelityMode === "reference" && pixelProtectionEnabled && annotations.length > 0 && Boolean(sourceExactSize);
-  const effectiveRequestSize = usesLocalProtectionRequestSize ? sourceExactSize : settings.size;
   const canCreateTask = Boolean(
     source &&
       (instruction.trim() || hasLocalEditNotes) &&
-      (fidelityMode !== "strict_mask" || (annotations.length > 0 && maskCapability.supportsMaskEdit))
+      annotations.length > 0 &&
+      annotationResolution?.status === "confirmed"
   );
-  const localMaskPercent = Math.round((localMaskPreview?.stats.transparentRatio || 0) * 1000) / 10;
-  const outputViewFor = (output: ImageEditOutput): "raw" | "pixel_protected" =>
-    outputVariantView[output.id] === "pixel_protected" && output.protectedVariant ? "pixel_protected" : "raw";
-  const outputForCurrentView = (output: ImageEditOutput): ImageEditOutput => {
-    if (outputViewFor(output) !== "pixel_protected" || !output.protectedVariant) return output;
-    const variant = output.protectedVariant;
-    return {
-      ...output,
-      dataUrl: variant.dataUrl,
-      mimeType: variant.mimeType,
-      actualWidth: variant.width || output.actualWidth,
-      actualHeight: variant.height || output.actualHeight,
-      actualSize: variant.width && variant.height ? `${variant.width}x${variant.height}` : output.actualSize,
-      warnings: [...(output.warnings || []), ...(variant.warnings || [])]
-    };
-  };
   const updateAnnotationNote = (id: string, note: string) => {
     onSetAnnotations((current) =>
       current.map((annotation) => (annotation.id === id ? { ...annotation, note, text: annotation.tool === "text" ? note : annotation.text } : annotation))
@@ -4729,6 +4503,37 @@ function ImageEditWorkspace({
   };
   const deleteAnnotation = (id: string) => {
     onSetAnnotations((current) => current.filter((annotation) => annotation.id !== id));
+  };
+  const updateResolvedAnnotation = (
+    index: number,
+    update: Partial<ImageEditAnnotationResolution["items"][number]>
+  ) => {
+    onSetAnnotationResolution((current) =>
+      current
+        ? {
+            ...current,
+            status: "needs_review",
+            confirmedAt: undefined,
+            items: current.items.map((item) =>
+              item.index === index ? { ...item, ...update, userConfirmed: update.userConfirmed ?? false } : item
+            )
+          }
+        : current
+    );
+  };
+  const confirmResolvedAnnotations = () => {
+    onSetAnnotationResolution((current) => {
+      if (!current) return current;
+      const incomplete = current.items.some(
+        (item) =>
+          !item.userConfirmed ||
+          !item.targetObject.trim() ||
+          !item.requestedChange.trim() ||
+          Boolean(item.originalText?.trim()) !== Boolean(item.replacementText?.trim())
+      );
+      if (incomplete) return current;
+      return { ...current, status: "confirmed", confirmedAt: new Date().toISOString() };
+    });
   };
 
   return (
@@ -4757,7 +4562,7 @@ function ImageEditWorkspace({
               <span>
                 <strong>{source.name}</strong>
                 <small>
-                  {sourceExactSize || "源图尺寸待识别"} · 请求 {effectiveRequestSize}
+                  {sourceExactSize || "源图尺寸待识别"} · 输出 {settings.size}
                 </small>
               </span>
               <button className="secondary-button" onClick={onPickSource} type="button">
@@ -4857,87 +4662,170 @@ function ImageEditWorkspace({
           </section>
         )}
 
-        <section className="image-edit-fidelity-panel">
-          <div className="image-edit-annotation-list-header">
-            <strong>改图模式</strong>
-            <small>旁路参考适合多候选筛选；严格保真只适合支持 mask 的 Images 后端。</small>
-          </div>
-          <div className="fusion-mode-tabs image-edit-fidelity-tabs" aria-label="改图模式">
-            <button
-              className={fidelityMode === "reference" ? "active" : ""}
-              onClick={() => onSetFidelityMode("reference")}
-              type="button"
-            >
-              旁路参考生成
-            </button>
-            <button
-              className={fidelityMode === "strict_mask" ? "active" : ""}
-              disabled={!maskCapability.supportsMaskEdit}
-              onClick={() => onSetFidelityMode("strict_mask")}
-              title={maskCapability.supportsMaskEdit ? "严格保真模式" : strictMaskUnavailable}
-              type="button"
-            >
-              严格保真模式
-            </button>
-          </div>
-          <p className={fidelityMode === "strict_mask" ? "image-edit-fidelity-note strict" : "image-edit-fidelity-note"}>
-            {fidelityMode === "strict_mask"
-              ? "严格模式会提交 PNG 源图 + 同尺寸 alpha mask + 编号清单；定位图仅保留为任务预览，不作为模型图像输入。"
-              : "旁路参考会提交源图 + 低遮挡编号定位图，生成新的修订图并在任务卡中并排展示；OpenRouter /images 属于参考生图，不承诺严格源图保真。"}
-          </p>
-          {!maskCapability.supportsMaskEdit && (
-            <p className="image-edit-fidelity-warning">
-              <AlertCircle size={15} />
-              <span>{strictMaskUnavailable}</span>
-            </p>
-          )}
-          {fidelityMode === "strict_mask" && !annotations.length && (
-            <p className="image-edit-fidelity-warning">
-              <AlertCircle size={15} />
-              <span>严格保真模式至少需要 1 个编号标注，用于生成 alpha mask。</span>
-            </p>
-          )}
-          {fidelityMode === "reference" && (
-            <section className="image-edit-local-mask-panel">
-              <div className="image-edit-local-mask-header">
-                <div>
-                  <strong>本地保护范围预览</strong>
-                  <small>这张保护图和源图同尺寸；透明小区域允许修改，其余区域用于本地保留。OpenRouter 不接收这张保护图。</small>
-                </div>
-                <label className="image-edit-pixel-toggle">
-                  <input
-                    checked={pixelProtectionEnabled}
-                    onChange={(event) => onSetPixelProtectionEnabled(event.target.checked)}
-                    type="checkbox"
-                  />
-                  生成本地保护版
-                </label>
-              </div>
-              <p className="image-edit-fidelity-warning strong">
-                <AlertCircle size={15} />
-                <span>
-                  添加标注后，本地保护会按源图尺寸请求输出；如果后端仍返回不同尺寸，就只显示 AI 原始结果。
-                </span>
-              </p>
-              {isRenderingLocalMask ? (
-                <p className="image-edit-mask-empty">正在生成本地保护范围预览...</p>
-              ) : localMaskPreview ? (
-                <div className="image-edit-mask-preview">
-                  <img alt="本地保护范围预览" src={localMaskPreview.dataUrl} />
-                  <div>
-                    <span>编辑区域占比：{localMaskPercent}%</span>
-                    <span>保护图尺寸：{localMaskPreview.stats.width || "-"}x{localMaskPreview.stats.height || "-"}</span>
-                    {localMaskPreview.stats.bbox && <span>编辑范围：{localMaskPreview.stats.bbox}</span>}
-                    {localMaskPreview.stats.warnings?.map((warning) => (
-                      <em key={warning}>{warning}</em>
-                    ))}
-                  </div>
+        <section className="image-edit-regeneration-panel">
+          <details className="image-edit-origin-details" open={!regenerationContext?.basePrompt.trim()}>
+            <summary>
+              <strong>生成依据</strong>
+              <span>
+                {regenerationContext?.sourceLabel || "手动导入"} · 原始参考图 {regenerationContext?.originalReferences.length || 0}
+              </span>
+            </summary>
+              <label className="generation-prompt-field image-edit-instruction">
+                <span>原始生图提示词</span>
+                <textarea
+                  onChange={(event) =>
+                    onSetRegenerationContext((current) => ({
+                      ...(current || {
+                        sourceLabel: "手动导入源图",
+                        importedAt: new Date().toISOString(),
+                        inputStrategy: "text_only",
+                        originalReferences: []
+                      }),
+                      basePrompt: event.target.value
+                    }))
+                  }
+                  placeholder="从生图输出进入时自动使用第一次生图的原始提示词；手动导入时必须填写完整基础提示词。"
+                  value={regenerationContext?.basePrompt || ""}
+                />
+              </label>
+              {(regenerationContext?.originalReferences.length || 0) > 0 ? (
+                <div className="image-edit-origin-reference-list">
+                  {regenerationContext?.originalReferences.map((reference) => (
+                    <figure key={reference.id}>
+                      <img alt="原始主体参考图" src={reference.thumbnailDataUrl || reference.dataUrl} />
+                      <figcaption>{reference.name}</figcaption>
+                    </figure>
+                  ))}
                 </div>
               ) : (
-                <p className="image-edit-mask-empty">添加标注后会显示本地保护范围。</p>
+                <p className="image-edit-fidelity-warning strong">
+                  <AlertCircle size={15} />
+                  <span>没有原始参考图，将使用纯文字重生成。</span>
+                </p>
               )}
-            </section>
-          )}
+          </details>
+              <button
+                className="secondary-button"
+                disabled={
+                  isResolvingAnnotations ||
+                  Boolean(annotationResolution) ||
+                  !source ||
+                  !annotations.length ||
+                  !regenerationContext?.basePrompt.trim() ||
+                  annotations.some((annotation) => !annotation.note?.trim())
+                }
+                onClick={onResolveAnnotations}
+                type="button"
+              >
+                {isResolvingAnnotations ? <Loader2 className="spin" size={17} /> : <Sparkles size={17} />}
+                {annotationResolution ? "当前标注版本已解析" : "解析修改清单"}
+              </button>
+              {annotationResolution && (
+                <section className="image-edit-resolution-list">
+                  <div className="image-edit-annotation-list-header">
+                    <strong>修改清单确认</strong>
+                    <small>
+                      {annotationResolution.source === "manual_fallback" ? "手动清单" : `视觉解析 · ${annotationResolution.modelName || "当前模型"}`}
+                    </small>
+                  </div>
+                  {annotationResolution.items.map((item) => (
+                    <div className="image-edit-resolution-item" key={item.index}>
+                      <div className="image-edit-resolution-heading">
+                        <strong>局部修订 {item.index}</strong>
+                        <span className={item.confidence < 0.8 || item.ambiguity ? "needs-review" : ""}>
+                          置信度 {Math.round(item.confidence * 100)}%
+                        </span>
+                      </div>
+                      <label>
+                        修改对象
+                        <input
+                          onChange={(event) => updateResolvedAnnotation(item.index, { targetObject: event.target.value })}
+                          value={item.targetObject}
+                        />
+                      </label>
+                      <label>
+                        目标修改
+                        <textarea
+                          onChange={(event) => updateResolvedAnnotation(item.index, { requestedChange: event.target.value })}
+                          value={item.requestedChange}
+                        />
+                      </label>
+                      <label>
+                        必须保留项（每行一项）
+                        <textarea
+                          onChange={(event) =>
+                            updateResolvedAnnotation(item.index, {
+                              preserve: event.target.value.split("\n").map((value) => value.trim()).filter(Boolean)
+                            })
+                          }
+                          value={item.preserve.join("\n")}
+                        />
+                      </label>
+                      <details className="image-edit-resolution-details">
+                        <summary>定位与文字（按需检查）</summary>
+                        <label>
+                          当前状态
+                          <textarea
+                            onChange={(event) => updateResolvedAnnotation(item.index, { currentState: event.target.value })}
+                            value={item.currentState}
+                          />
+                        </label>
+                        <label>
+                          空间锚点（每行一项）
+                          <textarea
+                            onChange={(event) =>
+                              updateResolvedAnnotation(item.index, {
+                                spatialAnchors: event.target.value.split("\n").map((value) => value.trim()).filter(Boolean)
+                              })
+                            }
+                            value={item.spatialAnchors.join("\n")}
+                          />
+                        </label>
+                        <div className="image-edit-resolution-text-row">
+                          <label>
+                            原文字
+                            <input
+                              onChange={(event) => updateResolvedAnnotation(item.index, { originalText: event.target.value })}
+                              value={item.originalText || ""}
+                            />
+                          </label>
+                          <label>
+                            新文字
+                            <input
+                              onChange={(event) => updateResolvedAnnotation(item.index, { replacementText: event.target.value })}
+                              value={item.replacementText || ""}
+                            />
+                          </label>
+                        </div>
+                      </details>
+                      {item.ambiguity && <p className="generation-task-error">{item.ambiguity}</p>}
+                      <label className="image-edit-pixel-toggle">
+                        <input
+                          checked={item.userConfirmed}
+                          onChange={(event) => updateResolvedAnnotation(item.index, { userConfirmed: event.target.checked })}
+                          type="checkbox"
+                        />
+                        我已检查此编号的对象、修改和保留项
+                      </label>
+                    </div>
+                  ))}
+                  <button
+                    className="secondary-button"
+                    disabled={annotationResolution.items.some(
+                      (item) =>
+                        !item.userConfirmed ||
+                        !item.targetObject.trim() ||
+                        !item.requestedChange.trim() ||
+                        Boolean(item.originalText?.trim()) !== Boolean(item.replacementText?.trim())
+                    )}
+                    onClick={confirmResolvedAnnotations}
+                    type="button"
+                  >
+                    <Check size={17} />
+                    {annotationResolution.status === "confirmed" ? "修改清单已确认" : "确认修改清单"}
+                  </button>
+                </section>
+              )}
         </section>
 
         <label className="generation-prompt-field image-edit-instruction">
@@ -5066,14 +4954,9 @@ function ImageEditWorkspace({
               type="number"
               value={settings.n}
             />
-            <small>1-4 张旁路输出</small>
+            <small>1-4 张候选图</small>
           </label>
         </div>
-        <p className="image-edit-settings-note">
-          {usesLocalProtectionRequestSize
-            ? `本地保护开启时会按源图尺寸请求：${sourceExactSize}；如果后端返回其他尺寸，只显示 AI 原始结果。`
-            : "候选图会作为新的修订图并排保留，便于筛选和继续改图；质量参数会随请求提交，不同供应商可能忽略、降级或拒绝不支持的质量/格式参数。"}
-        </p>
 
         {error && (
           <div className="inline-error">
@@ -5087,11 +4970,11 @@ function ImageEditWorkspace({
             className="primary-button"
             disabled={isCreating || !canCreateTask}
             onClick={onCreateTask}
-            title={backendReady ? "开始改图" : "点击后会重新检查生图后端配置"}
+            title={backendReady ? "生成修订版" : "点击后会重新检查生图后端配置"}
             type="button"
           >
             {isCreating ? <Loader2 className="spin" size={18} /> : <PenLine size={18} />}
-            开始改图
+            生成修订版
           </button>
         </div>
       </section>
@@ -5130,6 +5013,14 @@ function ImageEditWorkspace({
           <div className="generation-task-list">
             {visibleTasks.map((task) => {
               const isTaskActive = task.status === "queued" || task.status === "running";
+              const isLegacyTask = task.fidelityMode !== "origin_regenerate";
+              const obsoleteInfoPattern = /Source-Locked|本地保护|严格 mask|参考生图|像素级保真|尺寸门禁拒绝：canonical source/i;
+              const visibleTaskError = isLegacyTask
+                ? ""
+                : (task.error || "")
+                    .split(/(?<=。)\s*/)
+                    .filter((message) => message && !obsoleteInfoPattern.test(message))
+                    .join(" ");
               const visibility = imageEditTaskVisibility(task);
               const isTaskCollapsed = collapsedTaskIds.includes(task.id);
               return (
@@ -5175,7 +5066,7 @@ function ImageEditWorkspace({
                             取消
                           </button>
                         )}
-                        {!isTaskActive && (
+                        {!isTaskActive && !isLegacyTask && (
                           <button className="secondary-button" onClick={() => onRetryTask(task)} type="button">
                             <RotateCcw size={16} />
                             重试
@@ -5195,130 +5086,71 @@ function ImageEditWorkspace({
                         {task.outputs.length > 1 && (
                           <button className="secondary-button" onClick={() => onDownloadOutput(task, task.outputs)} type="button">
                             <Download size={16} />
-                            下载全部
+                            批量下载（{task.outputs.length}）
                           </button>
                         )}
                       </div>
                       <div className="generation-task-size-summary">
                         <span>目标尺寸：{task.settings.size}</span>
-                        <span>{(task.fidelityMode || "reference") === "strict_mask" ? "严格 mask 保真" : "参考生成"}</span>
                         <span>
                           候选图：{task.outputs.length ? `${task.outputs.length}/${task.settings.n}` : `${task.settings.n} 张`}
                         </span>
-                        {task.backend?.supportsMaskEdit === false && task.backend.maskEditUnavailableReason && (
-                          <span>{task.backend.maskEditUnavailableReason}</span>
-                        )}
-                        {task.backend?.providerType === "openrouter" && <span>{task.backend.fidelityNote}</span>}
-                        {task.diagnostics && (
-                          <span>
-                            {task.diagnostics.strictMaskSubmitted ? "精确遮罩已提交" : "保护图仅本地使用"}
-                          </span>
-                        )}
-                        {task.diagnostics?.localMask && (
-                          <span>
-                            本地编辑区：
-                            {Math.round((task.diagnostics.localMask.transparentRatio || 0) * 1000) / 10}%
-                          </span>
-                        )}
+                        {isLegacyTask && <span>旧任务只读</span>}
                       </div>
-                      {task.error && (
+                      {visibleTaskError && (
                         <p className="generation-task-error">
                           <AlertCircle size={15} />
-                          {task.error}
+                          {visibleTaskError}
                         </p>
                       )}
-                      <p className="generation-task-prompt">{task.finalPrompt}</p>
+                      {!isLegacyTask && (
+                        <details className="image-edit-task-prompt-details">
+                          <summary>查看本次提示词</summary>
+                          <p className="generation-task-prompt">{task.finalPrompt}</p>
+                        </details>
+                      )}
                       {task.outputs.length > 0 && (
-	                        <div className="generation-output-grid">
-	                          {task.outputs.map((output, index) => {
-	                            const outputView = outputViewFor(output);
-	                            const displayedOutput = outputForCurrentView(output);
-	                            return (
-	                              <figure className="generation-output" key={output.id}>
-	                                <div className="image-edit-output-version-tabs" aria-label="改图输出版本">
-	                                  <button
-	                                    className={outputView === "raw" ? "active" : ""}
-	                                    onClick={() =>
-	                                      onSetOutputVariantView((current) => ({
-	                                        ...current,
-	                                        [output.id]: "raw"
-	                                      }))
-	                                    }
-	                                    type="button"
-	                                  >
-	                                    AI 原始结果
-	                                  </button>
-	                                  <button
-	                                    className={outputView === "pixel_protected" ? "active" : ""}
-	                                    disabled={!output.protectedVariant}
-	                                    onClick={() =>
-	                                      onSetOutputVariantView((current) => ({
-	                                        ...current,
-	                                        [output.id]: "pixel_protected"
-	                                      }))
-	                                    }
-	                                    type="button"
-	                                  >
-	                                    本地保护版
-	                                  </button>
-	                                </div>
-	                                <button
-	                                  className="generation-output-preview"
-	                                  onClick={() => onOpenOutputPreview(task, displayedOutput, task.outputs.findIndex((item) => item.id === output.id))}
-	                                  title="查看改图输出大图"
-	                                  type="button"
-	                                >
-	                                  <img alt="改图输出" src={displayedOutput.dataUrl} />
-	                                  <span className="preview-corner-icon" aria-hidden="true">
-	                                    <Maximize2 size={18} />
-	                                  </span>
-	                                </button>
-	                                <div className={output.error ? "generation-output-meta has-error" : "generation-output-meta"}>
-	                                  <span>候选 {index + 1}/{task.outputs.length}</span>
-	                                  <span>请求 {output.requestedSize || task.settings.size}</span>
-	                                  <span>实际 {output.actualSize || "未识别"}</span>
-	                                </div>
-	                                {output.warnings?.map((warning) => (
-	                                  <p className="generation-output-error" key={warning}>{warning}</p>
-	                                ))}
-	                                {outputView === "pixel_protected" && output.protectedVariant?.warnings?.map((warning) => (
-	                                  <p className="generation-output-error" key={warning}>{warning}</p>
-	                                ))}
-	                                {!output.protectedVariant && (
-	                                  <p className="generation-output-error">
-	                                    {output.protectedVariantUnavailableReason ||
-	                                      "本地保护版仅在 AI 输出与源图同尺寸时可用；当前仅保留 AI 原始结果。"}
-	                                  </p>
-	                                )}
-	                                <figcaption>
-	                                  <button className="secondary-button" onClick={() => onOpenCompare(task, displayedOutput)} type="button">
-	                                    <Maximize2 size={16} />
-	                                    左右对比
-	                                  </button>
-	                                  <button className="secondary-button" onClick={() => onDownloadOutput(task, [displayedOutput])} type="button">
-	                                    <Download size={16} />
-	                                    下载
-	                                  </button>
-	                                  <button
-	                                    className="secondary-button"
-	                                    onClick={() => onContinueFromOutput(task, displayedOutput, task.outputs.findIndex((item) => item.id === output.id))}
-	                                    type="button"
-	                                    title={
-	                                      outputView === "pixel_protected"
-	                                        ? "保护版再次继续改图可能累积边缘接缝或色调断层。"
-	                                        : "推荐使用 AI 原始结果继续改图。"
-	                                    }
-	                                  >
-	                                    <PenLine size={16} />
-	                                    {outputView === "pixel_protected" ? "继续改图（可能有接缝）" : "继续改图"}
-	                                  </button>
-	                                </figcaption>
-	                                {outputView === "pixel_protected" && (
-	                                  <p className="image-edit-protected-note">保护版再次继续改图可能累积边缘接缝或色调断层。</p>
-	                                )}
-	                              </figure>
-	                            );
-	                          })}
+                        <div className="generation-output-grid">
+                          {task.outputs.map((output, index) => (
+                            <figure className="generation-output" key={output.id}>
+                              <button
+                                className="generation-output-preview"
+                                onClick={() => onOpenOutputPreview(task, output, index)}
+                                title="查看改图输出大图"
+                                type="button"
+                              >
+                                <img alt="改图输出" src={output.dataUrl} />
+                                <span className="preview-corner-icon" aria-hidden="true">
+                                  <Maximize2 size={18} />
+                                </span>
+                              </button>
+                              <div className={output.error ? "generation-output-meta has-error" : "generation-output-meta"}>
+                                <span>候选 {index + 1}/{task.outputs.length}</span>
+                                <span>{output.actualSize || output.requestedSize || task.settings.size}</span>
+                              </div>
+                              {output.warnings?.filter((warning) => !obsoleteInfoPattern.test(warning)).map((warning) => (
+                                <p className="generation-output-error" key={warning}>{warning}</p>
+                              ))}
+                              <figcaption>
+                                <button className="secondary-button" onClick={() => onOpenCompare(task, output)} type="button">
+                                  <Maximize2 size={16} />
+                                  左右对比
+                                </button>
+                                <button className="secondary-button" onClick={() => onDownloadOutput(task, [output])} type="button">
+                                  <Download size={16} />
+                                  下载
+                                </button>
+                                <button
+                                  className="secondary-button"
+                                  onClick={() => onContinueFromOutput(task, output, index)}
+                                  type="button"
+                                >
+                                  <PenLine size={16} />
+                                  继续改图
+                                </button>
+                              </figcaption>
+                            </figure>
+                          ))}
                         </div>
                       )}
                     </>

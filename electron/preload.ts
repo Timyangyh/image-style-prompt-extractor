@@ -9,8 +9,8 @@ import type {
   GenerationTaskVisibilityUpdate,
   HistoryItem,
   ImageEditCreateRequest,
+  ImageEditAnnotationResolveRequest,
   ImageEditOutputsSaveRequest,
-  ImageEditProtectedVariantSaveRequest,
   ImageEditTaskVisibilityUpdate,
   ModelConfigUpdate,
   StyleAnalysis
@@ -47,9 +47,9 @@ contextBridge.exposeInMainWorld("styleExtractor", {
   clearGenerationTasks: () => ipcRenderer.invoke("generation:tasks:clear"),
   saveGenerationOutputs: (request: GenerationOutputsSaveRequest) => ipcRenderer.invoke("generation:outputs:save", request),
   getImageEditTasks: () => ipcRenderer.invoke("imageEdit:tasks:get"),
+  resolveImageEditAnnotations: (request: ImageEditAnnotationResolveRequest) =>
+    ipcRenderer.invoke("imageEdit:annotations:resolve", request),
   createImageEditTask: (request: ImageEditCreateRequest) => ipcRenderer.invoke("imageEdit:task:create", request),
-  saveImageEditProtectedVariant: (request: ImageEditProtectedVariantSaveRequest) =>
-    ipcRenderer.invoke("imageEdit:output:protected-variant:save", request),
   cancelImageEditTask: (id: string) => ipcRenderer.invoke("imageEdit:task:cancel", id),
   retryImageEditTask: (id: string) => ipcRenderer.invoke("imageEdit:task:retry", id),
   restoreImageEditTask: (id: string) => ipcRenderer.invoke("imageEdit:task:restore", id),

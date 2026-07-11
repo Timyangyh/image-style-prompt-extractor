@@ -8,15 +8,21 @@ import type {
   FusePromptResponse,
   HistoryItem,
   GenerationOutputsSaveRequest,
+  ImageEditAnnotationResolveRequest,
+  ImageEditAnnotationResolveResponse,
   ImageEditOutputsSaveRequest,
-  ImageEditProtectedVariantSaveRequest,
   ModelConfig,
   ModelConfigUpdate,
   StyleAnalysis
 } from "../src/shared/types";
+import {
+  manualImageEditAnnotationResolution,
+  normalizeOriginAnnotationItems,
+  parseImageEditAnnotationResolution
+} from "../src/shared/image-edit-regeneration";
 import { normalizeFusedPromptResult, normalizeStyleAnalysis } from "../src/shared/schema";
 import { GenerationService } from "./generation";
-import { ImageEditService } from "./image-edit";
+import { ImageEditService, imageEditAnnotationContentHash } from "./image-edit";
 import {
   dataUrlToGenerationOutputBuffer,
   generationOutputExtension,
@@ -81,6 +87,8 @@ let analyzeAbortController: AbortController | null = null;
 let fuseAbortController: AbortController | null = null;
 let generationService: GenerationService | null = null;
 let imageEditService: ImageEditService | null = null;
+const imageEditAnnotationResolutionCache = new Map<string, ImageEditAnnotationResolveResponse>();
+const imageEditAnnotationResolutionsInFlight = new Set<string>();
 
 const publicConfig = (config: EffectiveModelConfig): ModelConfig => ({
   apiBaseUrl: config.apiBaseUrl,
@@ -354,8 +362,115 @@ const postFusePromptRequest = async (
   return completionTextFromResponse(text);
 };
 
+const resolveImageEditAnnotations = async (
+  request: ImageEditAnnotationResolveRequest
+): Promise<ImageEditAnnotationResolveResponse> => {
+  if (!request.sourceImageDataUrl.startsWith("data:image/")) throw new Error("待修改生成图数据格式无效。");
+  if (!request.annotationImageDataUrl.startsWith("data:image/")) throw new Error("编号定位图数据格式无效。");
+  const annotationItems = normalizeOriginAnnotationItems(request.annotationItems);
+  const basePrompt = request.basePrompt.trim();
+  if (!basePrompt) throw new Error("请先填写重生成基础提示词。");
+  const contentHash = imageEditAnnotationContentHash(
+    request.sourceImageDataUrl,
+    annotationItems,
+    request.instruction,
+    basePrompt
+  );
+  const createdAt = new Date().toISOString();
+  const cached = imageEditAnnotationResolutionCache.get(contentHash);
+  if (cached) return cached;
+  if (imageEditAnnotationResolutionsInFlight.has(contentHash)) {
+    throw new Error("同一标注版本正在解析，请等待当前解析完成。");
+  }
+  imageEditAnnotationResolutionsInFlight.add(contentHash);
+  const cacheResponse = (response: ImageEditAnnotationResolveResponse): ImageEditAnnotationResolveResponse => {
+    imageEditAnnotationResolutionCache.set(contentHash, response);
+    return response;
+  };
+  const fallback = (reason: string): ImageEditAnnotationResolveResponse => ({
+    fallbackReason: reason,
+    resolution: manualImageEditAnnotationResolution(annotationItems, { contentHash, createdAt }, reason)
+  });
+  try {
+    const config = await getEffectiveConfig();
+    if (!config.apiKey.trim()) {
+      return cacheResponse(fallback("视觉分析模型尚未配置，请手动补齐修改对象、目标修改和保留项后逐项确认。"));
+    }
+
+    const systemPrompt = [
+      "你是改图标注语义解析器。你只负责理解用户已经画出的编号标注，不生成图片，也不扩写修改目标。",
+      "必须返回一个 JSON 对象，唯一顶层字段是 items。items 数量、index 和请求编号必须完全一致，不能缺号、重号或新增编号。",
+      "每项字段固定为 index、target_object、current_state、requested_change、preserve、spatial_anchors、original_text、replacement_text、confidence、ambiguity。",
+      "target_object 与 requested_change 必须非空。只根据待修改图、黑白编号定位图、结构化几何和用户原始说明识别对象；不得新增用户未要求的事实、品牌、文字、人物或修改目标。",
+      "涉及文字替换时，original_text 和 replacement_text 必须拆分；replacement_text 只能逐字来自用户说明，无法确认则留空并在 ambiguity 说明。",
+      "对象不明确、文字不可辨认或置信度低于 0.80 时必须填写 ambiguity，不能猜测。所有说明使用中文。"
+    ].join("\n");
+    const userText = [
+      `原始生图基础提示词：\n${basePrompt}`,
+      `本轮总体说明：\n${request.instruction.trim() || "无"}`,
+      `编号、用户局部说明和结构化几何：\n${JSON.stringify(annotationItems, null, 2)}`,
+      "第一张图片是待修改生成图，只用于理解当前画面；第二张图片是低遮挡黑白编号定位图，只用于确认编号位置。"
+    ].join("\n\n");
+
+    try {
+      return await withAbortableRequest("annotation", async (signal) => {
+        const post = async (includeResponseFormat: boolean): Promise<string> => {
+          const response = await fetch(chatCompletionsEndpoint(config.apiBaseUrl), {
+            method: "POST",
+            signal,
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${config.apiKey.trim()}`
+            },
+            body: JSON.stringify({
+              model: config.modelName,
+              temperature: 0.1,
+              ...(includeResponseFormat ? { response_format: { type: "json_object" } } : {}),
+              messages: [
+                { role: "system", content: systemPrompt },
+                {
+                  role: "user",
+                  content: [
+                    { type: "text", text: userText },
+                    { type: "image_url", image_url: { url: request.sourceImageDataUrl } },
+                    { type: "image_url", image_url: { url: request.annotationImageDataUrl } }
+                  ]
+                }
+              ]
+            })
+          });
+          const responseText = await response.text();
+          if (!response.ok) throw new ModelHttpError(response.status, responseText);
+          return completionTextFromResponse(responseText);
+        };
+        let rawText: string;
+        try {
+          rawText = await post(true);
+        } catch (error) {
+          if (!shouldRetryWithoutResponseFormat(error, true)) throw error;
+          rawText = await post(false);
+        }
+        const parsed = parseExtractedJson(rawText, "改图标注解析结果");
+        return cacheResponse({
+          resolution: parseImageEditAnnotationResolution(parsed, annotationItems, {
+            contentHash,
+            source: "vision_model",
+            modelName: config.modelName,
+            createdAt
+          })
+        });
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return cacheResponse(fallback(`视觉解析不可用：${reason} 请手动补齐并确认修改清单。`));
+    }
+  } finally {
+    imageEditAnnotationResolutionsInFlight.delete(contentHash);
+  }
+};
+
 const withAbortableRequest = async <T>(
-  kind: "analyze" | "fuse",
+  kind: "analyze" | "fuse" | "annotation",
   task: (signal: AbortSignal) => Promise<T>
 ): Promise<T> => {
   const controller = new AbortController();
@@ -579,10 +694,10 @@ app.whenReady().then(async () => {
     saveGenerationOutputs(request)
   );
   ipcMain.handle("imageEdit:tasks:get", async () => imageEditService?.getTasks());
-  ipcMain.handle("imageEdit:task:create", async (_event, request) => imageEditService?.createTask(request));
-  ipcMain.handle("imageEdit:output:protected-variant:save", async (_event, request: ImageEditProtectedVariantSaveRequest) =>
-    imageEditService?.saveProtectedVariant(request)
+  ipcMain.handle("imageEdit:annotations:resolve", async (_event, request: ImageEditAnnotationResolveRequest) =>
+    resolveImageEditAnnotations(request)
   );
+  ipcMain.handle("imageEdit:task:create", async (_event, request) => imageEditService?.createTask(request));
   ipcMain.handle("imageEdit:task:cancel", async (_event, id: string) => imageEditService?.cancelTask(id));
   ipcMain.handle("imageEdit:task:retry", async (_event, id: string) => imageEditService?.retryTask(id));
   ipcMain.handle("imageEdit:task:restore", async (_event, id: string) => imageEditService?.restoreTask(id));
