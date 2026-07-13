@@ -18,6 +18,12 @@ const text = (value: unknown, maxLength = 800): string =>
 const textList = (value: unknown): string[] =>
   Array.isArray(value) ? value.map((item) => text(item, 500)).filter(Boolean).slice(0, 20) : [];
 
+export const imageEditLineItemsFromInput = (value: string): string[] =>
+  value.replace(/\r\n?/g, "\n").split("\n");
+
+export const normalizeImageEditLineItems = (value: string[]): string[] =>
+  value.map((item) => item.trim()).filter(Boolean);
+
 export const normalizeImageEditAnnotationGeometry = (
   geometry: ImageEditAnnotationGeometry
 ): ImageEditAnnotationGeometry => {
@@ -219,6 +225,10 @@ export const buildOriginRegenerationPrompt = (
   const sections = items.map((annotation) => {
     const item = resolvedByIndex.get(annotation.index);
     if (!item) throw new Error(`确认清单缺少局部修订 ${annotation.index}。`);
+    const textReplacement =
+      item.originalText && item.replacementText
+        ? `文字替换：把原文字“${item.originalText}”替换为“${item.replacementText}”，画面中只保留新文字，新文字必须逐字准确。`
+        : "";
     const lines = [
       `局部修订 ${annotation.index}：`,
       `目标区域为${describeImageEditGeometry(annotation.geometry as ImageEditAnnotationGeometry)}。`,
@@ -226,8 +236,7 @@ export const buildOriginRegenerationPrompt = (
       item.spatialAnchors.length ? `空间锚点：${item.spatialAnchors.join("；")}。` : "",
       item.currentState ? `当前状态为${item.currentState}。` : "",
       `${item.requestedChange}。`,
-      item.originalText ? `原文字必须识别为“${item.originalText}”。` : "",
-      item.replacementText ? `新文字必须逐字使用“${item.replacementText}”。` : "",
+      textReplacement,
       item.preserve.length ? `必须保留：${item.preserve.join("；")}。` : ""
     ].filter(Boolean);
     return lines.join("\n");

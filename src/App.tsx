@@ -44,6 +44,10 @@ import {
   normalizeGenerationSizeSettings,
   resolveGenerationSize
 } from "./shared/generation-size";
+import {
+  imageEditLineItemsFromInput,
+  normalizeImageEditLineItems
+} from "./shared/image-edit-regeneration";
 import { createLocalSourceCapture } from "./shared/schema";
 import type {
   FusePromptControls,
@@ -2107,6 +2111,15 @@ export function App(): JSX.Element {
     );
   };
 
+  const setImageEditTasksCollapsed = (taskIds: string[], collapsed: boolean) => {
+    const targetIds = new Set(taskIds);
+    setCollapsedImageEditTaskIds((current) =>
+      collapsed
+        ? Array.from(new Set([...current, ...taskIds]))
+        : current.filter((taskId) => !targetIds.has(taskId))
+    );
+  };
+
   const buildGenerationComparePreview = (
     task: GenerationTask,
     output: GenerationOutput,
@@ -2902,6 +2915,7 @@ export function App(): JSX.Element {
           onOpenConfig={() => void openGenerationConfig()}
           onPickSource={() => imageEditSourceInputRef.current?.click()}
           onRetryTask={retryImageEditTask}
+          onSetTasksCollapsed={setImageEditTasksCollapsed}
           onToggleTaskCollapsed={toggleImageEditTaskCollapsed}
           onSetAnnotationResolution={setImageEditAnnotationResolution}
           onSetAnnotations={setImageEditAnnotations}
@@ -4423,6 +4437,7 @@ function ImageEditWorkspace({
   onOpenOutputPreview,
   onPickSource,
   onRetryTask,
+  onSetTasksCollapsed,
   onToggleTaskCollapsed,
   onSetAnnotationResolution,
   onSetAnnotations,
@@ -4462,6 +4477,7 @@ function ImageEditWorkspace({
   onOpenOutputPreview: (task: ImageEditTask, output: ImageEditOutput, index: number) => void;
   onPickSource: () => void;
   onRetryTask: (task: ImageEditTask) => void;
+  onSetTasksCollapsed: (taskIds: string[], collapsed: boolean) => void;
   onToggleTaskCollapsed: (taskId: string) => void;
   onSetAnnotationResolution: Dispatch<SetStateAction<ImageEditAnnotationResolution | null>>;
   onSetAnnotations: Dispatch<SetStateAction<ImageEditAnnotation[]>>;
@@ -4488,6 +4504,15 @@ function ImageEditWorkspace({
     () => tasks.filter((task) => (showHiddenTasks ? imageEditTaskVisibility(task) !== "active" : imageEditTaskVisibility(task) === "active")),
     [showHiddenTasks, tasks]
   );
+  const completedVisibleTaskIds = useMemo(
+    () =>
+      visibleTasks
+        .filter((task) => task.status === "succeeded" || task.status === "partial_failed")
+        .map((task) => task.id),
+    [visibleTasks]
+  );
+  const areCompletedTasksCollapsed =
+    completedVisibleTaskIds.length > 0 && completedVisibleTaskIds.every((taskId) => collapsedTaskIds.includes(taskId));
   const hasLocalEditNotes = annotations.some((annotation) => annotation.note?.trim());
   const sourceExactSize = source?.width && source.height ? `${source.width}x${source.height}` : "";
   const canCreateTask = Boolean(
@@ -4524,15 +4549,20 @@ function ImageEditWorkspace({
   const confirmResolvedAnnotations = () => {
     onSetAnnotationResolution((current) => {
       if (!current) return current;
-      const incomplete = current.items.some(
+      const normalizedItems = current.items.map((item) => ({
+        ...item,
+        preserve: normalizeImageEditLineItems(item.preserve),
+        spatialAnchors: normalizeImageEditLineItems(item.spatialAnchors)
+      }));
+      const incomplete = normalizedItems.some(
         (item) =>
           !item.userConfirmed ||
           !item.targetObject.trim() ||
           !item.requestedChange.trim() ||
           Boolean(item.originalText?.trim()) !== Boolean(item.replacementText?.trim())
       );
-      if (incomplete) return current;
-      return { ...current, status: "confirmed", confirmedAt: new Date().toISOString() };
+      if (incomplete) return { ...current, items: normalizedItems };
+      return { ...current, items: normalizedItems, status: "confirmed", confirmedAt: new Date().toISOString() };
     });
   };
 
@@ -4755,7 +4785,7 @@ function ImageEditWorkspace({
                         <textarea
                           onChange={(event) =>
                             updateResolvedAnnotation(item.index, {
-                              preserve: event.target.value.split("\n").map((value) => value.trim()).filter(Boolean)
+                              preserve: imageEditLineItemsFromInput(event.target.value)
                             })
                           }
                           value={item.preserve.join("\n")}
@@ -4771,11 +4801,11 @@ function ImageEditWorkspace({
                           />
                         </label>
                         <label>
-                          空间锚点（每行一项）
+                          空间锚点（选填，每行一项）
                           <textarea
                             onChange={(event) =>
                               updateResolvedAnnotation(item.index, {
-                                spatialAnchors: event.target.value.split("\n").map((value) => value.trim()).filter(Boolean)
+                                spatialAnchors: imageEditLineItemsFromInput(event.target.value)
                               })
                             }
                             value={item.spatialAnchors.join("\n")}
@@ -4783,14 +4813,14 @@ function ImageEditWorkspace({
                         </label>
                         <div className="image-edit-resolution-text-row">
                           <label>
-                            原文字
+                            原文字（换字时填写）
                             <input
                               onChange={(event) => updateResolvedAnnotation(item.index, { originalText: event.target.value })}
                               value={item.originalText || ""}
                             />
                           </label>
                           <label>
-                            新文字
+                            新文字（换字时填写）
                             <input
                               onChange={(event) => updateResolvedAnnotation(item.index, { replacementText: event.target.value })}
                               value={item.replacementText || ""}
@@ -4987,6 +5017,16 @@ function ImageEditWorkspace({
           </div>
           {tasks.length > 0 && (
             <div className="generation-results-actions">
+              {completedVisibleTaskIds.length > 0 && (
+                <button
+                  className="secondary-button"
+                  onClick={() => onSetTasksCollapsed(completedVisibleTaskIds, !areCompletedTasksCollapsed)}
+                  type="button"
+                >
+                  {areCompletedTasksCollapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+                  {areCompletedTasksCollapsed ? "展开已完成" : "收起已完成"}
+                </button>
+              )}
               {(hiddenTaskCount > 0 || showHiddenTasks) && (
                 <button className="secondary-button" onClick={() => setShowHiddenTasks((current) => !current)} type="button">
                   {showHiddenTasks ? <Check size={16} /> : <X size={16} />}

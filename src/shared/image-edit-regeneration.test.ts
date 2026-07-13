@@ -3,7 +3,9 @@ import {
   assertConfirmedAnnotationResolution,
   buildOriginRegenerationPrompt,
   describeImageEditGeometry,
+  imageEditLineItemsFromInput,
   normalizeImageEditAnnotationGeometry,
+  normalizeImageEditLineItems,
   parseImageEditAnnotationResolution
 } from "./image-edit-regeneration";
 import type {
@@ -147,6 +149,15 @@ describe("origin regeneration annotation geometry", () => {
 });
 
 describe("origin regeneration annotation resolution", () => {
+  it("keeps the trailing line break while editing and cleans line items before confirmation", () => {
+    expect(imageEditLineItemsFromInput("保持人物\n")).toEqual(["保持人物", ""]);
+    expect(imageEditLineItemsFromInput("保持人物\r\n保持构图")).toEqual(["保持人物", "保持构图"]);
+    expect(normalizeImageEditLineItems([" 保持人物 ", "", " 保持构图 "])).toEqual([
+      "保持人物",
+      "保持构图"
+    ]);
+  });
+
   it("rejects missing, duplicate and extra indexes", () => {
     const base = {
       contentHash: "hash",
@@ -198,7 +209,8 @@ describe("origin regeneration prompt compiler", () => {
     expect(prompt.match(/局部修订 2：/g)).toHaveLength(1);
     expect(prompt).toContain("画布横向 85.1%-97.2%、纵向 1.2%-21.9%");
     expect(prompt).toContain("空间锚点：位于右侧人物头顶上方");
-    expect(prompt).toContain("新文字必须逐字使用“新品上市”");
+    expect(prompt).toContain("把原文字“旧品推荐”替换为“新品上市”，画面中只保留新文字");
+    expect(prompt).not.toContain("原文字必须识别为");
     expect(prompt).toContain("输出规格：864x1536 像素，比例 9:16，格式 PNG");
     expect(prompt).not.toMatch(/看标注图|按红框|修改这里/);
   });
