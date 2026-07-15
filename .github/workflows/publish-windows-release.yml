@@ -1,0 +1,97 @@
+name: Publish Windows Release Assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag, for example v1.1.3
+        required: true
+        type: string
+      run_id:
+        description: Successful main Windows workflow run ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_RUN_ID: ${{ inputs.run_id }}
+
+    steps:
+      - name: Verify tag, draft release, and source run
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+
+          run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID")"
+          run_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          [[ "$(jq -r '.status' <<<"$run_json")" == "completed" ]]
+          [[ "$(jq -r '.conclusion' <<<"$run_json")" == "success" ]]
+          [[ "$(jq -r '.event' <<<"$run_json")" == "push" ]]
+          [[ "$(jq -r '.head_branch' <<<"$run_json")" == "main" ]]
+
+          tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+          tag_type="$(jq -r '.object.type' <<<"$tag_ref")"
+          tag_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
+          if [[ "$tag_type" == "tag" ]]; then
+            tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.object.sha')"
+          fi
+          [[ "$tag_sha" == "$run_sha" ]]
+
+          release_json="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease)"
+          [[ "$(jq -r '.isDraft' <<<"$release_json")" == "true" ]]
+          [[ "$(jq -r '.isPrerelease' <<<"$release_json")" == "true" ]]
+
+          echo "SOURCE_SHA=$run_sha" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=windows-x64-$run_sha" >> "$GITHUB_ENV"
+
+      - name: Download verified Windows CI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" \
+            --dir "$RUNNER_TEMP/windows-release-assets"
+
+      - name: Verify release asset names and SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/windows-release-assets"
+          version="${RELEASE_TAG#v}"
+          installer="image-style-prompt-extractor-win-setup-$version-x64.exe"
+          portable="image-style-prompt-extractor-win-portable-$version-x64.zip"
+
+          [[ "$(find "$assets" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "3" ]]
+          test -f "$assets/$installer"
+          test -f "$assets/$portable"
+          test -f "$assets/SHA256SUMS.txt"
+          (cd "$assets" && sed 's/\r$//' SHA256SUMS.txt | sha256sum --check -)
+
+      - name: Upload assets to draft pre-release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            "$RUNNER_TEMP/windows-release-assets/"* \
+            --repo "$GITHUB_REPOSITORY"
+
+          {
+            echo "### Windows release assets uploaded"
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Source run: \`$SOURCE_RUN_ID\`"
+            echo "- Source commit: \`$SOURCE_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
