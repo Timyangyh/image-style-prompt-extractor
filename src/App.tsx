@@ -48,6 +48,7 @@ import {
   imageEditLineItemsFromInput,
   normalizeImageEditLineItems
 } from "./shared/image-edit-regeneration";
+import { clipboardPasteShortcut, isWindowsPlatform, localDataScopeLabel } from "./shared/platform";
 import { createLocalSourceCapture } from "./shared/schema";
 import type {
   FusePromptControls,
@@ -90,6 +91,10 @@ const defaultConfig: ModelConfig = {
   saveApiKey: false,
   hasApiKey: false
 };
+
+const pasteShortcut = clipboardPasteShortcut(navigator.platform);
+const isWindows = isWindowsPlatform(navigator.platform);
+const localDataScope = localDataScopeLabel(navigator.platform);
 
 const defaultGenerationProvider: GenerationProviderConfig = {
   id: "default-api-provider",
@@ -342,6 +347,14 @@ const createModelImage = (dataUrl: string): Promise<string> =>
     maxBytes: 2 * 1024 * 1024,
     initialQuality: 0.86,
     minQuality: 0.62
+  });
+
+const createImageEditAnnotationModelImage = (dataUrl: string): Promise<string> =>
+  createCompressedImage(dataUrl, {
+    maxSize: 1536,
+    maxBytes: 1280 * 1024,
+    initialQuality: 0.84,
+    minQuality: 0.58
   });
 
 const createHistoryImage = (dataUrl: string): Promise<string> =>
@@ -1690,9 +1703,16 @@ export function App(): JSX.Element {
         imageEditSource.dataUrl,
         imageEditAnnotations
       );
+      setStatus("正在压缩源图和编号定位图...");
+      const [sourceImageDataUrl, modelAnnotationImageDataUrl] = await Promise.all([
+        createImageEditAnnotationModelImage(imageEditSource.dataUrl),
+        createImageEditAnnotationModelImage(annotationImageDataUrl)
+      ]);
+      setStatus("正在解析编号修改清单...");
       const response = await window.styleExtractor.resolveImageEditAnnotations({
         sourceImageDataUrl: imageEditSource.dataUrl,
-        annotationImageDataUrl,
+        sourceImageModelDataUrl: sourceImageDataUrl,
+        annotationImageDataUrl: modelAnnotationImageDataUrl,
         annotationItems,
         instruction: imageEditInstruction,
         basePrompt: imageEditRegenerationContext.basePrompt
@@ -2481,7 +2501,8 @@ export function App(): JSX.Element {
   };
 
   const clearAllLocalData = async () => {
-    if (!window.confirm("确定抹除模型配置、API Key、图片分析历史、生图任务和改图任务吗？这个操作不可恢复。")) return;
+    const windowsDataNotice = isWindows ? "、Cookie、Local Storage 和 Electron 运行时缓存" : "";
+    if (!window.confirm(`确定抹除模型配置、API Key、图片分析历史、生图任务、改图任务${windowsDataNotice}吗？这个操作不可恢复。`)) return;
     const cleared = await window.styleExtractor.clearAllLocalData();
     setConfig(cleared);
     setDraftConfig({ ...cleared, apiKey: "" });
@@ -2506,7 +2527,11 @@ export function App(): JSX.Element {
     setImageEditSettings(defaultImageEditSettings);
     setImageEditTasks([]);
     resetFusionState(true);
-    setStatus("本机模型配置、API Key、图片历史记录、生图任务和改图任务已全部抹除。");
+    setStatus(
+      isWindows
+        ? "本机模型配置、API Key、图片历史记录、生图任务、改图任务和 Windows 运行时浏览数据已全部抹除。"
+        : "本机模型配置、API Key、图片历史记录、生图任务和改图任务已全部抹除。"
+    );
     setShowConfig(false);
   };
 
@@ -2587,7 +2612,7 @@ export function App(): JSX.Element {
               <div className="empty-upload">
                 <ImagePlus size={44} />
                 <strong>上传图片或粘贴截图</strong>
-                <span>支持拖拽、选择文件、Cmd + V</span>
+                <span>支持拖拽、选择文件、{pasteShortcut}</span>
               </div>
             )}
           </div>
@@ -3074,7 +3099,7 @@ export function App(): JSX.Element {
                 <div className="empty-upload">
                   <ImagePlus size={38} />
                   <strong>{fuseMode === "information_layout" ? "上传产品信息图（可选）" : "上传主体参考图"}</strong>
-                  <span>{fuseMode === "information_layout" ? "可只输入文字，也支持图片补充" : "支持拖拽、选择文件、Cmd + V"}</span>
+                  <span>{fuseMode === "information_layout" ? "可只输入文字，也支持图片补充" : `支持拖拽、选择文件、${pasteShortcut}`}</span>
                 </div>
               )}
             </div>
@@ -3620,7 +3645,7 @@ export function App(): JSX.Element {
             </label>
             <div className="danger-zone">
               <strong>本机数据清理</strong>
-              <p>这些操作只影响当前 Mac 的应用数据，不会删除项目源码或已导出的 JSON 文件。</p>
+              <p>这些操作只影响{localDataScope}的应用数据，不会删除项目源码或已导出的 JSON 文件。</p>
               <div className="danger-actions">
                 <button className="danger-button" onClick={clearModelConfig} type="button">
                   <Trash2 size={17} />
@@ -4604,7 +4629,7 @@ function ImageEditWorkspace({
             <button className="image-edit-empty-source" onClick={onPickSource} type="button">
               <ImagePlus size={42} />
               <strong>导入改图源图</strong>
-              <span>支持选择、拖拽、Cmd + V</span>
+              <span>支持选择、拖拽、{pasteShortcut}</span>
             </button>
           )}
         </div>

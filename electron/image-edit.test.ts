@@ -242,7 +242,7 @@ const writeGenerationConfig = async (
   );
 };
 
-const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 5000): Promise<void> => {
+const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> => {
   const startedAt = Date.now();
   while (!(await predicate())) {
     if (Date.now() - startedAt > timeoutMs) throw new Error("Timed out waiting for image edit state.");
@@ -281,6 +281,46 @@ describe("image edit size helpers", () => {
 });
 
 describe("ImageEditService task storage", () => {
+  it("preserves the existing macOS empty task-file structure during full cleanup", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-mac-clear-all-"));
+    try {
+      const service = new ImageEditService(rootDir);
+      await service.clearAll("darwin");
+      expect(JSON.parse(await readFile(join(rootDir, "image-edit", "tasks.json"), "utf8"))).toEqual([]);
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an aborted Windows edit recreate cleared task data", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-clear-running-"));
+    let runnerStarted = false;
+    const service = new ImageEditService(rootDir, {
+      concurrency: 1,
+      runner: (_task, signal) =>
+        new Promise((_resolve, reject) => {
+          runnerStarted = true;
+          signal.addEventListener(
+            "abort",
+            () => reject(signal.reason instanceof Error ? signal.reason : new Error("Request aborted.")),
+            { once: true }
+          );
+        })
+    });
+    try {
+      await service.createTask(createRequest(dataUrl(64, 64)));
+      await waitFor(() => runnerStarted);
+
+      await service.clearAll("win32");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      await expect(service.getTasks()).resolves.toEqual([]);
+      await expect(readFile(join(rootDir, "image-edit", "tasks.json"), "utf8")).rejects.toThrow();
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("preserves canonical PNG, JPEG and WebP bytes while overriding renderer metadata from bytes", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "image-edit-canonical-formats-"));
     try {
@@ -321,7 +361,7 @@ describe("ImageEditService task storage", () => {
     } finally {
       await rm(rootDir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it("keeps a decodable transparent 4K source and rejects sources above 12 million pixels", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "image-edit-canonical-4k-"));
@@ -441,7 +481,7 @@ describe("ImageEditService task storage", () => {
     } finally {
       await rm(rootDir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   it("cancels queued tasks and preserves independent clear boundaries", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "image-edit-cancel-"));

@@ -55,7 +55,7 @@ const createGenerationRequest = (prompt: string) => ({
   settings: { ...settings, n: 1 }
 });
 
-const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 1200): Promise<void> => {
+const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> => {
   const startedAt = Date.now();
   while (!(await predicate())) {
     if (Date.now() - startedAt > timeoutMs) throw new Error("Timed out waiting for generation state.");
@@ -341,6 +341,78 @@ describe("codex oauth auth parsing", () => {
 });
 
 describe("generation config defaults", () => {
+  it("removes the complete generation data domain during privacy cleanup", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-clear-all-"));
+    try {
+      const service = new GenerationService(rootDir);
+      await service.saveConfig({
+        authSource: "api",
+        providerType: "openai_compatible",
+        apiBaseUrl: "https://api.example.com/v1",
+        apiKey: "runtime-only-key",
+        apiMode: "images",
+        imageModel: "gpt-image-2",
+        mainModel: "gpt-5.5",
+        saveApiKey: false,
+        imagesConcurrency: 1
+      });
+      await mkdir(join(rootDir, "generation", "assets"), { recursive: true });
+      await writeFile(join(rootDir, "generation", "assets", "private-image.png"), "private-image");
+
+      await service.clearAll("win32");
+
+      await expect(readFile(join(rootDir, "generation", "config.json"), "utf8")).rejects.toThrow();
+      await expect(readFile(join(rootDir, "generation", "assets", "private-image.png"), "utf8")).rejects.toThrow();
+      await expect(service.getConfig()).resolves.toMatchObject({ hasApiKey: false });
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an aborted Windows generation recreate cleared task data", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-clear-running-"));
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) {
+          reject(new Error("Expected an abort signal."));
+          return;
+        }
+        signal.addEventListener(
+          "abort",
+          () => reject(signal.reason instanceof Error ? signal.reason : new Error("Request aborted.")),
+          { once: true }
+        );
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const service = new GenerationService(rootDir);
+      await service.saveConfig({
+        authSource: "api",
+        providerType: "openai_compatible",
+        apiBaseUrl: "https://api.example.com/v1",
+        apiKey: "runtime-only-key",
+        apiMode: "images",
+        imageModel: "gpt-image-2",
+        mainModel: "gpt-5.5",
+        saveApiKey: false,
+        imagesConcurrency: 1
+      });
+      await service.createTask(createGenerationRequest("Windows 在途清理测试"));
+      await waitFor(() => fetchMock.mock.calls.length === 1);
+
+      await service.clearAll("win32");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      await expect(service.getTasks()).resolves.toEqual([]);
+      await expect(readFile(join(rootDir, "generation", "tasks.json"), "utf8")).rejects.toThrow();
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("migrates the legacy default main model to gpt-5.5", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "generation-config-"));
     try {
@@ -944,9 +1016,13 @@ describe("generation output save helpers", () => {
   });
 
   it("deduplicates generated image paths without overwriting existing files", () => {
-    const existing = new Set(["/tmp/generated.png", "/tmp/generated (2).png"]);
-    expect(uniqueGenerationOutputPath("/tmp", "generated.png", (path) => existing.has(path))).toBe(
-      "/tmp/generated (3).png"
+    const directoryPath = join(tmpdir(), "generation-output-test");
+    const existing = new Set([
+      join(directoryPath, "generated.png"),
+      join(directoryPath, "generated (2).png")
+    ]);
+    expect(uniqueGenerationOutputPath(directoryPath, "generated.png", (path) => existing.has(path))).toBe(
+      join(directoryPath, "generated (3).png")
     );
   });
 });

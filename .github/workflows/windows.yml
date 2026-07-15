@@ -1,0 +1,60 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-build-package:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CSC_LINK: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.WINDOWS_CSC_LINK || '' }}
+      CSC_KEY_PASSWORD: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.WINDOWS_CSC_KEY_PASSWORD || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Production build
+        run: npm run build
+
+      - name: Windows Electron E2E
+        run: npm run test:e2e:win
+
+      - name: Build portable ZIP and NSIS installer
+        run: npm run dist:win
+
+      - name: Verify architecture, version, signatures and checksums
+        shell: pwsh
+        run: |
+          $requireSignature = -not [string]::IsNullOrWhiteSpace($env:CSC_LINK)
+          ./scripts/verify-windows-artifacts.ps1 -RequireSignature:$requireSignature
+
+      - name: Upload verified Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            release/image-style-prompt-extractor-win-portable-*-x64.zip
+            release/image-style-prompt-extractor-win-setup-*-x64.exe
+            release/SHA256SUMS.txt

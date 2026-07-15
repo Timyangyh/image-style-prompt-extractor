@@ -441,6 +441,7 @@ export interface ImageEditAnnotationResolution {
 
 export interface ImageEditAnnotationResolveRequest {
   sourceImageDataUrl: string;
+  sourceImageModelDataUrl?: string;
   annotationImageDataUrl: string;
   annotationItems: ImageEditAnnotationItem[];
   instruction: string;

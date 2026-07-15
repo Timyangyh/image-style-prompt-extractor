@@ -7,8 +7,11 @@ import {
   chatCompletionsEndpoint,
   completionTextFromResponse,
   extractJsonText,
+  modelRequestTimeoutMessage,
+  modelRequestTimeoutMs,
   normalizeHistory,
   readJsonFile,
+  shouldCacheImageEditAnnotationResolution,
   shouldRetryWithoutResponseFormat,
   writeJsonFile
 } from "./main-utils";
@@ -52,6 +55,37 @@ describe("main process model utilities", () => {
     expect(shouldRetryWithoutResponseFormat(new Error("response_format is unsupported"), true)).toBe(true);
     expect(shouldRetryWithoutResponseFormat(new ModelHttpError(400, "bad request"), false)).toBe(false);
   });
+
+  it("uses a shorter bounded timeout for interactive annotation parsing", () => {
+    expect(modelRequestTimeoutMs("annotation")).toBe(120_000);
+    expect(modelRequestTimeoutMs("analyze")).toBe(300_000);
+    expect(modelRequestTimeoutMessage("annotation")).toContain("标注解析请求超过 120 秒");
+  });
+
+  it("does not cache manual annotation fallbacks", () => {
+    expect(
+      shouldCacheImageEditAnnotationResolution({
+        resolution: {
+          contentHash: "manual",
+          status: "needs_review",
+          source: "manual_fallback",
+          createdAt: "2026-07-15T00:00:00.000Z",
+          items: []
+        }
+      })
+    ).toBe(false);
+    expect(
+      shouldCacheImageEditAnnotationResolution({
+        resolution: {
+          contentHash: "vision",
+          status: "needs_review",
+          source: "vision_model",
+          createdAt: "2026-07-15T00:00:00.000Z",
+          items: []
+        }
+      })
+    ).toBe(true);
+  });
 });
 
 describe("main process history and JSON file utilities", () => {
@@ -82,6 +116,25 @@ describe("main process history and JSON file utilities", () => {
     try {
       await writeJsonFile(path, { ok: true });
       expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ ok: true });
+      await writeJsonFile(path, { ok: false, revision: 2 });
+      expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ ok: false, revision: 2 });
+      expect((await readdir(dir)).filter((file) => file.includes(".tmp"))).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes concurrent Windows replacements without leaving backup files", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "image-style-json-win-"));
+    const path = join(dir, "tasks.json");
+    try {
+      await Promise.all(
+        Array.from({ length: 12 }, (_item, revision) => writeJsonFile(path, { revision }, "win32"))
+      );
+      const stored = JSON.parse(await readFile(path, "utf8"));
+      expect(stored.revision).toBeGreaterThanOrEqual(0);
+      expect(stored.revision).toBeLessThan(12);
+      expect((await readdir(dir)).filter((file) => file.includes(".tmp"))).toEqual([]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

@@ -23,6 +23,7 @@ import {
   resolveGenerationSize
 } from "../src/shared/generation-size";
 import { CodexAuthState, getCodexAuthStatus, loadCodexAuthState, refreshCodexAuthState } from "./codex-auth";
+import { buildCodexHeaders } from "./codex-request";
 import { ModelHttpError, readJsonFile, writeJsonFile } from "./main-utils";
 
 interface EffectiveGenerationConfig {
@@ -108,8 +109,6 @@ const defaultConfig: EffectiveGenerationConfig = {
 const GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_STORED_TASKS = 80;
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
-const CODEX_USER_AGENT = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) Codex Desktop";
-const CODEX_ORIGINATOR = "codex-tui";
 
 const clamp = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max);
 
@@ -949,21 +948,6 @@ const requestOpenRouterImages = async (
   );
 };
 
-const codexHeaders = (authState: CodexAuthState): Record<string, string> => {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${authState.accessToken}`,
-    Accept: "text/event-stream",
-    Connection: "Keep-Alive",
-    Originator: CODEX_ORIGINATOR,
-    "User-Agent": CODEX_USER_AGENT,
-    Session_id: randomUUID(),
-    "X-Client-Request-Id": randomUUID()
-  };
-  if (authState.accountId) headers["Chatgpt-Account-Id"] = authState.accountId;
-  return headers;
-};
-
 const requestCodexResponses = async (
   payload: Record<string, unknown>,
   authState: CodexAuthState,
@@ -973,7 +957,7 @@ const requestCodexResponses = async (
     const response = await fetch(CODEX_RESPONSES_URL, {
       method: "POST",
       signal,
-      headers: codexHeaders(state),
+      headers: buildCodexHeaders(state),
       body: JSON.stringify(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)))
     });
     return {
@@ -1223,6 +1207,9 @@ const summarizeOutputProblems = (
 export class GenerationService {
   private runtimeConfig: EffectiveGenerationConfig | null = null;
   private abortControllers = new Map<string, AbortController>();
+  private activeTaskRuns = new Set<Promise<void>>();
+  private dataEpoch = 0;
+  private isClearingAll = false;
   private isQueuePumpActive = false;
   private taskMutationQueue: Promise<unknown> = Promise.resolve();
 
@@ -1416,7 +1403,7 @@ export class GenerationService {
     return publicConfig(this.runtimeConfig);
   }
 
-  async clearAll(): Promise<void> {
+  async clearAll(platform: NodeJS.Platform = process.platform): Promise<void> {
     const provider = createDefaultProvider();
     this.runtimeConfig = configWithActiveProvider({
       authSource: defaultConfig.authSource,
@@ -1424,7 +1411,24 @@ export class GenerationService {
       providers: [provider],
       imagesConcurrency: defaultConfig.imagesConcurrency
     });
-    await rm(join(this.rootDir, "generation"), { recursive: true, force: true });
+    if (platform !== "win32") {
+      await rm(join(this.rootDir, "generation"), { recursive: true, force: true });
+      return;
+    }
+
+    this.isClearingAll = true;
+    this.dataEpoch += 1;
+    try {
+      for (const controller of this.abortControllers.values()) {
+        controller.abort(new Error("已抹除全部本机数据。"));
+      }
+      await Promise.allSettled([...this.activeTaskRuns]);
+      await this.taskMutationQueue;
+      this.abortControllers.clear();
+      await rm(join(this.rootDir, "generation"), { recursive: true, force: true });
+    } finally {
+      this.isClearingAll = false;
+    }
   }
 
   async getTasks(): Promise<GenerationTask[]> {
@@ -1528,14 +1532,16 @@ export class GenerationService {
   }
 
   private scheduleQueueProcessing(): void {
+    if (this.isClearingAll) return;
     void this.processQueue().catch(() => undefined);
   }
 
   private async processQueue(): Promise<void> {
-    if (this.isQueuePumpActive) return;
+    if (this.isQueuePumpActive || this.isClearingAll) return;
     this.isQueuePumpActive = true;
     try {
       while (true) {
+        if (this.isClearingAll) return;
         const config = await this.getEffectiveConfig();
         const availableSlots = clamp(config.imagesConcurrency, 1, 16) - this.abortControllers.size;
         if (availableSlots <= 0) return;
@@ -1552,15 +1558,20 @@ export class GenerationService {
     } finally {
       this.isQueuePumpActive = false;
       const tasks = await this.readTasks().catch(() => []);
-      if (tasks.some((task) => task.status === "queued") && this.abortControllers.size < (await this.getEffectiveConfig()).imagesConcurrency) {
+      if (
+        !this.isClearingAll &&
+        tasks.some((task) => task.status === "queued") &&
+        this.abortControllers.size < (await this.getEffectiveConfig()).imagesConcurrency
+      ) {
         this.scheduleQueueProcessing();
       }
     }
   }
 
   private async startQueuedTask(task: GenerationTask, config: EffectiveGenerationConfig): Promise<void> {
+    const dataEpoch = this.dataEpoch;
     const latestTask = (await this.readTasks()).find((item) => item.id === task.id);
-    if (!latestTask || latestTask.status !== "queued") return;
+    if (this.isClearingAll || dataEpoch !== this.dataEpoch || !latestTask || latestTask.status !== "queued") return;
     const now = new Date().toISOString();
     const runningTask: GenerationTask = {
       ...latestTask,
@@ -1576,7 +1587,9 @@ export class GenerationService {
     this.abortControllers.set(runningTask.id, controller);
     await this.upsertTask(runningTask);
 
-    void this.runQueuedTask(runningTask, config, controller, timeout);
+    const taskRun = this.runQueuedTask(runningTask, config, controller, timeout);
+    this.activeTaskRuns.add(taskRun);
+    void taskRun.finally(() => this.activeTaskRuns.delete(taskRun)).catch(() => undefined);
   }
 
   private async runQueuedTask(

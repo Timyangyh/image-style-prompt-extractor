@@ -2,7 +2,26 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { normalizeFusedPromptResult, normalizeStyleAnalysis } from "../src/shared/schema";
-import type { HistoryItem } from "../src/shared/types";
+import type { HistoryItem, ImageEditAnnotationResolveResponse } from "../src/shared/types";
+
+export type ModelRequestKind = "analyze" | "fuse" | "annotation";
+
+const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 300_000;
+const ANNOTATION_REQUEST_TIMEOUT_MS = 120_000;
+
+export const modelRequestTimeoutMs = (kind: ModelRequestKind): number =>
+  kind === "annotation" ? ANNOTATION_REQUEST_TIMEOUT_MS : DEFAULT_MODEL_REQUEST_TIMEOUT_MS;
+
+export const modelRequestTimeoutMessage = (kind: ModelRequestKind): string => {
+  const seconds = modelRequestTimeoutMs(kind) / 1000;
+  return kind === "annotation"
+    ? `标注解析请求超过 ${seconds} 秒未响应，请检查 Base URL、模型状态或稍后重试。`
+    : `模型请求超过 ${seconds} 秒未响应，请检查 Base URL、模型状态或稍后重试。`;
+};
+
+export const shouldCacheImageEditAnnotationResolution = (
+  response: ImageEditAnnotationResolveResponse
+): boolean => response.resolution.source === "vision_model";
 
 export class ModelHttpError extends Error {
   status: number;
@@ -48,20 +67,64 @@ export const readJsonFile = async <T>(path: string, fallback: T): Promise<T> => 
   }
 };
 
-export const writeJsonFile = async (path: string, value: unknown): Promise<void> => {
+const windowsJsonWriteQueues = new Map<string, Promise<void>>();
+
+const writeJsonFileOnce = async (
+  path: string,
+  value: unknown,
+  platform: NodeJS.Platform
+): Promise<void> => {
   await mkdir(dirname(path), { recursive: true });
   const tempPath = join(
     dirname(path),
     `.${basename(path)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
   );
+  const backupPath = `${tempPath}.backup`;
 
   try {
     await writeFile(tempPath, JSON.stringify(value, null, 2), "utf8");
-    await rename(tempPath, path);
+    if (platform !== "win32" || !existsSync(path)) {
+      await rename(tempPath, path);
+      return;
+    }
+
+    // Windows rename cannot replace an existing destination. Keep the last
+    // valid file available for rollback while installing the new one.
+    await rename(path, backupPath);
+    try {
+      await rename(tempPath, path);
+    } catch (error) {
+      await rename(backupPath, path).catch(() => undefined);
+      throw error;
+    }
+    await rm(backupPath, { force: true });
   } catch (error) {
     await rm(tempPath, { force: true }).catch(() => undefined);
+    if (!existsSync(path) && existsSync(backupPath)) {
+      await rename(backupPath, path).catch(() => undefined);
+    }
     throw error;
   }
+};
+
+export const writeJsonFile = async (
+  path: string,
+  value: unknown,
+  platform: NodeJS.Platform = process.platform
+): Promise<void> => {
+  if (platform !== "win32") {
+    await writeJsonFileOnce(path, value, platform);
+    return;
+  }
+
+  const queueKey = path.toLowerCase();
+  const previous = windowsJsonWriteQueues.get(queueKey) || Promise.resolve();
+  const current = previous.catch(() => undefined).then(() => writeJsonFileOnce(path, value, platform));
+  const tracked = current.finally(() => {
+    if (windowsJsonWriteQueues.get(queueKey) === tracked) windowsJsonWriteQueues.delete(queueKey);
+  });
+  windowsJsonWriteQueues.set(queueKey, tracked);
+  await tracked;
 };
 
 const asRecord = (value: unknown): Record<string, unknown> | null =>

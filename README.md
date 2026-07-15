@@ -6,7 +6,21 @@
 
 如果需要分析网页或应用界面，可以先截图，然后直接粘贴或上传到应用中分析。项目不包含 Chrome 浏览器插件或自动网页采集服务。
 
-## 当前版本：v1.1.1
+## 当前版本：v1.1.3
+
+- 改图标注解析会先压缩待修改图和编号定位图，再发送给视觉模型，避免高分辨率 PNG 双图请求长时间无响应。
+- 标注解析单独使用 120 秒超时和受限输出长度；失败生成的手工清单不再占用成功缓存，可以直接重试。
+- 标注解析成功缓存会区分 API Base URL 和模型名称，切换视觉模型后不会错误复用旧模型结果。
+
+### v1.1.2
+
+- 新增 Windows x64 中文 NSIS 安装器，同时保留便携 ZIP；安装器支持按用户安装、选择安装位置、开始菜单快捷方式和标准卸载入口。
+- Windows 下的粘贴提示改为 `Ctrl + V`，应用菜单改为中文，Codex 请求会报告真实 Windows/x64 客户端信息。
+- “抹除全部本机数据”在 Windows 下新增 Cookie、Local Storage、HTTP/代码缓存、认证缓存和主机解析缓存清理。
+- 新增 Windows 原生 CI、Electron 桌面端 E2E、PE 架构与版本检查、SHA-256 清单生成和可选 Authenticode 强制验签。
+- macOS 现有功能、界面结构、菜单和本机清理行为保持不变。
+
+### v1.1.1
 
 - 改图任务区支持一键收起或展开当前列表中的已完成任务，同时保留单张任务卡的独立控制。
 - 修改清单中的“必须保留项”和“空间锚点”支持按回车逐行填写，确认时会自动清理空行。
@@ -64,7 +78,8 @@
 从 [Releases](https://github.com/Timyangyh/image-style-prompt-extractor/releases) 下载对应系统的包：
 
 - M 系列 Mac：`image-style-prompt-extractor-mac-arm64.zip`
-- Windows 10 / 11 x64：`image-style-prompt-extractor-win-x64.zip`
+- Windows 10 / 11 x64 安装版：`image-style-prompt-extractor-win-setup-<version>-x64.exe`
+- Windows 10 / 11 x64 便携版：`image-style-prompt-extractor-win-portable-<version>-x64.zip`
 
 Mac 使用方式：
 
@@ -81,13 +96,20 @@ codesign --force --deep --sign - "$APP"
 open "$APP"
 ```
 
-Windows 使用方式：
+Windows 安装版使用方式（推荐）：
 
-1. 解压 `image-style-prompt-extractor-win-x64.zip`。
+1. 下载 `image-style-prompt-extractor-win-setup-<version>-x64.exe`。
+2. 启动安装器，按需选择仅为当前用户安装和安装位置。
+3. 从开始菜单或桌面快捷方式打开“图片复刻大师”。
+4. 首次使用在“模型配置”里填写图片分析模型的 API Base URL、Model Name 和 API Key。
+
+Windows 便携版使用方式：
+
+1. 解压 `image-style-prompt-extractor-win-portable-<version>-x64.zip`。
 2. 打开解压后的 `image-style-prompt-extractor.exe`。
 3. 首次使用在“模型配置”里填写图片分析模型的 API Base URL、Model Name 和 API Key。
 
-Windows 包当前未做商业代码签名，请先解压再运行，不要直接在压缩包预览窗口里打开 exe。首次运行时可能遇到几种系统安全提示：
+Windows 包当前未做商业代码签名。下载后可使用 Release 附带的 `SHA256SUMS.txt` 核对文件；便携版请先解压再运行，不要直接在压缩包预览窗口里打开 exe。首次运行时可能遇到几种系统安全提示：
 
 - 如果出现 Microsoft Defender SmartScreen 的“Windows 已保护你的电脑”蓝色弹窗，确认来源是本仓库 Release 后，可以点击“更多信息”，再选择“仍要运行”。
 - 如果没有出现弹窗、双击后没有反应，或没有“仍要运行”按钮，请右键点击 `image-style-prompt-extractor.exe`，打开“属性”，在“常规”页查看是否有“解除锁定 / Unblock”选项；如果有，勾选后点击“应用”，再重新运行。

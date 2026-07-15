@@ -37,6 +37,7 @@ import {
   resolveGenerationSize
 } from "../src/shared/generation-size";
 import { CodexAuthState, getCodexAuthStatus, loadCodexAuthState, refreshCodexAuthState } from "./codex-auth";
+import { buildCodexHeaders } from "./codex-request";
 import {
   buildCodexResponsesPayload,
   buildImagesGenerationPayload,
@@ -137,8 +138,6 @@ const DEFAULT_MAIN_MODEL = "gpt-5.5";
 const DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_OPENROUTER_IMAGE_MODEL = "openai/gpt-image-2";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
-const CODEX_USER_AGENT = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) Codex Desktop";
-const CODEX_ORIGINATOR = "codex-tui";
 const MAX_IMAGE_EDIT_SOURCE_BYTES = 32 * 1024 * 1024;
 const MAX_IMAGE_EDIT_SOURCE_PIXELS = 12_000_000;
 
@@ -505,21 +504,6 @@ const requestEditForm = async (
   return text;
 };
 
-const codexHeaders = (authState: CodexAuthState): Record<string, string> => {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${authState.accessToken}`,
-    Accept: "text/event-stream",
-    Connection: "Keep-Alive",
-    Originator: CODEX_ORIGINATOR,
-    "User-Agent": CODEX_USER_AGENT,
-    Session_id: randomUUID(),
-    "X-Client-Request-Id": randomUUID()
-  };
-  if (authState.accountId) headers["Chatgpt-Account-Id"] = authState.accountId;
-  return headers;
-};
-
 const requestCodexResponses = async (
   payload: Record<string, unknown>,
   authState: CodexAuthState,
@@ -529,7 +513,7 @@ const requestCodexResponses = async (
     const response = await fetch(CODEX_RESPONSES_URL, {
       method: "POST",
       signal,
-      headers: codexHeaders(state),
+      headers: buildCodexHeaders(state),
       body: JSON.stringify(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)))
     });
     return {
@@ -732,6 +716,9 @@ export class ImageEditService {
   private readonly runner: ImageEditTaskRunner;
   private readonly usesInjectedRunner: boolean;
   private abortControllers = new Map<string, AbortController>();
+  private activeTaskRuns = new Set<Promise<void>>();
+  private dataEpoch = 0;
+  private isClearingAll = false;
   private isQueuePumpActive = false;
   private taskMutationQueue: Promise<unknown> = Promise.resolve();
 
@@ -1137,8 +1124,24 @@ export class ImageEditService {
     await this.writeTasks([]);
   }
 
-  async clearAll(): Promise<void> {
-    await this.clearTasks();
+  async clearAll(platform: NodeJS.Platform = process.platform): Promise<void> {
+    if (platform !== "win32") {
+      await this.clearTasks();
+      return;
+    }
+    this.isClearingAll = true;
+    this.dataEpoch += 1;
+    try {
+      for (const controller of this.abortControllers.values()) {
+        controller.abort(new Error("已抹除全部本机数据。"));
+      }
+      await Promise.allSettled([...this.activeTaskRuns]);
+      await this.taskMutationQueue;
+      this.abortControllers.clear();
+      await rm(this.imageEditDir(), { recursive: true, force: true });
+    } finally {
+      this.isClearingAll = false;
+    }
   }
 
   async saveOutputs(_request: ImageEditOutputsSaveRequest): Promise<never> {
@@ -1146,14 +1149,16 @@ export class ImageEditService {
   }
 
   private scheduleQueueProcessing(): void {
+    if (this.isClearingAll) return;
     void this.processQueue().catch(() => undefined);
   }
 
   private async processQueue(): Promise<void> {
-    if (this.isQueuePumpActive) return;
+    if (this.isQueuePumpActive || this.isClearingAll) return;
     this.isQueuePumpActive = true;
     try {
       while (true) {
+        if (this.isClearingAll) return;
         const availableSlots = this.concurrency - this.abortControllers.size;
         if (availableSlots <= 0) return;
         const tasks = await this.reconcileStaleRunningTasks(await this.readTasks());
@@ -1169,15 +1174,20 @@ export class ImageEditService {
     } finally {
       this.isQueuePumpActive = false;
       const tasks = await this.readTasks().catch(() => []);
-      if (tasks.some((task) => task.status === "queued") && this.abortControllers.size < this.concurrency) {
+      if (
+        !this.isClearingAll &&
+        tasks.some((task) => task.status === "queued") &&
+        this.abortControllers.size < this.concurrency
+      ) {
         this.scheduleQueueProcessing();
       }
     }
   }
 
   private async startQueuedTask(task: StoredImageEditTask): Promise<void> {
+    const dataEpoch = this.dataEpoch;
     const latestTask = (await this.readTasks()).find((item) => item.id === task.id);
-    if (!latestTask || latestTask.status !== "queued") return;
+    if (this.isClearingAll || dataEpoch !== this.dataEpoch || !latestTask || latestTask.status !== "queued") return;
     const now = new Date().toISOString();
     const runningTask: StoredImageEditTask = {
       ...latestTask,
@@ -1193,7 +1203,9 @@ export class ImageEditService {
     this.abortControllers.set(runningTask.id, controller);
     await this.writeStoredTask(runningTask);
 
-    void this.runQueuedTask(runningTask, controller, timeout);
+    const taskRun = this.runQueuedTask(runningTask, controller, timeout);
+    this.activeTaskRuns.add(taskRun);
+    void taskRun.finally(() => this.activeTaskRuns.delete(taskRun)).catch(() => undefined);
   }
 
   private async runQueuedTask(

@@ -1,5 +1,5 @@
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from "electron";
-import { join } from "node:path";
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell } from "electron";
+import { join, resolve } from "node:path";
 import { writeFile } from "node:fs/promises";
 import type {
   AnalyzeImageRequest,
@@ -23,6 +23,8 @@ import {
 import { normalizeFusedPromptResult, normalizeStyleAnalysis } from "../src/shared/schema";
 import { GenerationService } from "./generation";
 import { ImageEditService, imageEditAnnotationContentHash } from "./image-edit";
+import { clearWindowsSessionData } from "./session-cleanup";
+import { windowsApplicationMenuTemplate } from "./windows-menu";
 import {
   dataUrlToGenerationOutputBuffer,
   generationOutputExtension,
@@ -37,10 +39,13 @@ import {
   extractJsonText,
   getHistoryEntryId,
   isAbortError,
+  modelRequestTimeoutMessage,
+  modelRequestTimeoutMs,
   normalizeHistory,
   normalizeHistoryItemForStorage,
   parseExtractedJson,
   readJsonFile,
+  shouldCacheImageEditAnnotationResolution,
   shouldRetryFusedPrompt,
   shouldRetryWithoutResponseFormat,
   writeJsonFile
@@ -75,7 +80,10 @@ const defaultEffectiveConfig: EffectiveModelConfig = {
   saveApiKey: false
 };
 
-const REQUEST_TIMEOUT_MS = 300_000;
+const WINDOWS_DATA_CLEAR_ERROR_MESSAGE = "已抹除全部本机数据。";
+
+const e2eUserDataDir = process.env.IMAGE_STYLE_E2E_USER_DATA_DIR?.trim();
+if (!app.isPackaged && e2eUserDataDir) app.setPath("userData", resolve(e2eUserDataDir));
 
 const userDataDir = () => app.getPath("userData");
 const configPath = () => join(userDataDir(), "config.json");
@@ -85,6 +93,8 @@ let mainWindow: BrowserWindow | null = null;
 let runtimeConfig: EffectiveModelConfig | null = null;
 let analyzeAbortController: AbortController | null = null;
 let fuseAbortController: AbortController | null = null;
+let localDataEpoch = 0;
+const annotationAbortControllers = new Set<AbortController>();
 let generationService: GenerationService | null = null;
 let imageEditService: ImageEditService | null = null;
 const imageEditAnnotationResolutionCache = new Map<string, ImageEditAnnotationResolveResponse>();
@@ -179,11 +189,21 @@ const clearConfig = async (): Promise<ModelConfig> => {
 };
 
 const clearAllLocalData = async (): Promise<ModelConfig> => {
+  if (process.platform === "win32") {
+    localDataEpoch += 1;
+    const reason = new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
+    analyzeAbortController?.abort(reason);
+    fuseAbortController?.abort(reason);
+    for (const controller of annotationAbortControllers) controller.abort(reason);
+    imageEditAnnotationResolutionCache.clear();
+    imageEditAnnotationResolutionsInFlight.clear();
+  }
   runtimeConfig = { ...defaultEffectiveConfig };
   await writeStoredConfig(runtimeConfig);
   await writeJsonFile(historyPath(), []);
   await generationService?.clearAll();
   await imageEditService?.clearAll();
+  await clearWindowsSessionData(session.defaultSession);
   return publicConfig(runtimeConfig);
 };
 
@@ -366,6 +386,9 @@ const resolveImageEditAnnotations = async (
   request: ImageEditAnnotationResolveRequest
 ): Promise<ImageEditAnnotationResolveResponse> => {
   if (!request.sourceImageDataUrl.startsWith("data:image/")) throw new Error("待修改生成图数据格式无效。");
+  if (request.sourceImageModelDataUrl && !request.sourceImageModelDataUrl.startsWith("data:image/")) {
+    throw new Error("模型用待修改图数据格式无效。");
+  }
   if (!request.annotationImageDataUrl.startsWith("data:image/")) throw new Error("编号定位图数据格式无效。");
   const annotationItems = normalizeOriginAnnotationItems(request.annotationItems);
   const basePrompt = request.basePrompt.trim();
@@ -376,27 +399,29 @@ const resolveImageEditAnnotations = async (
     request.instruction,
     basePrompt
   );
+  const requestDataEpoch = localDataEpoch;
   const createdAt = new Date().toISOString();
-  const cached = imageEditAnnotationResolutionCache.get(contentHash);
-  if (cached) return cached;
-  if (imageEditAnnotationResolutionsInFlight.has(contentHash)) {
-    throw new Error("同一标注版本正在解析，请等待当前解析完成。");
-  }
-  imageEditAnnotationResolutionsInFlight.add(contentHash);
-  const cacheResponse = (response: ImageEditAnnotationResolveResponse): ImageEditAnnotationResolveResponse => {
-    imageEditAnnotationResolutionCache.set(contentHash, response);
+  const finalizeResponse = (response: ImageEditAnnotationResolveResponse): ImageEditAnnotationResolveResponse => {
+    if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
     return response;
   };
   const fallback = (reason: string): ImageEditAnnotationResolveResponse => ({
     fallbackReason: reason,
     resolution: manualImageEditAnnotationResolution(annotationItems, { contentHash, createdAt }, reason)
   });
-  try {
-    const config = await getEffectiveConfig();
-    if (!config.apiKey.trim()) {
-      return cacheResponse(fallback("视觉分析模型尚未配置，请手动补齐修改对象、目标修改和保留项后逐项确认。"));
-    }
+  const config = await getEffectiveConfig();
+  if (!config.apiKey.trim()) {
+    return finalizeResponse(fallback("视觉分析模型尚未配置，请手动补齐修改对象、目标修改和保留项后逐项确认。"));
+  }
+  const cacheKey = [contentHash, config.apiBaseUrl.trim(), config.modelName.trim()].join("\n");
+  const cached = imageEditAnnotationResolutionCache.get(cacheKey);
+  if (cached) return finalizeResponse(cached);
+  if (imageEditAnnotationResolutionsInFlight.has(cacheKey)) {
+    throw new Error("同一标注版本正在解析，请等待当前解析完成。");
+  }
+  imageEditAnnotationResolutionsInFlight.add(cacheKey);
 
+  try {
     const systemPrompt = [
       "你是改图标注语义解析器。你只负责理解用户已经画出的编号标注，不生成图片，也不扩写修改目标。",
       "必须返回一个 JSON 对象，唯一顶层字段是 items。items 数量、index 和请求编号必须完全一致，不能缺号、重号或新增编号。",
@@ -414,6 +439,7 @@ const resolveImageEditAnnotations = async (
 
     try {
       return await withAbortableRequest("annotation", async (signal) => {
+        if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
         const post = async (includeResponseFormat: boolean): Promise<string> => {
           const response = await fetch(chatCompletionsEndpoint(config.apiBaseUrl), {
             method: "POST",
@@ -425,6 +451,7 @@ const resolveImageEditAnnotations = async (
             body: JSON.stringify({
               model: config.modelName,
               temperature: 0.1,
+              max_tokens: 4096,
               ...(includeResponseFormat ? { response_format: { type: "json_object" } } : {}),
               messages: [
                 { role: "system", content: systemPrompt },
@@ -432,7 +459,10 @@ const resolveImageEditAnnotations = async (
                   role: "user",
                   content: [
                     { type: "text", text: userText },
-                    { type: "image_url", image_url: { url: request.sourceImageDataUrl } },
+                    {
+                      type: "image_url",
+                      image_url: { url: request.sourceImageModelDataUrl || request.sourceImageDataUrl }
+                    },
                     { type: "image_url", image_url: { url: request.annotationImageDataUrl } }
                   ]
                 }
@@ -451,7 +481,7 @@ const resolveImageEditAnnotations = async (
           rawText = await post(false);
         }
         const parsed = parseExtractedJson(rawText, "改图标注解析结果");
-        return cacheResponse({
+        const response = finalizeResponse({
           resolution: parseImageEditAnnotationResolution(parsed, annotationItems, {
             contentHash,
             source: "vision_model",
@@ -459,13 +489,23 @@ const resolveImageEditAnnotations = async (
             createdAt
           })
         });
+        if (shouldCacheImageEditAnnotationResolution(response)) {
+          imageEditAnnotationResolutionCache.set(cacheKey, response);
+        }
+        return response;
       });
     } catch (error) {
+      if (
+        requestDataEpoch !== localDataEpoch ||
+        (error instanceof Error && error.message === WINDOWS_DATA_CLEAR_ERROR_MESSAGE)
+      ) {
+        throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
+      }
       const reason = error instanceof Error ? error.message : String(error);
-      return cacheResponse(fallback(`视觉解析不可用：${reason} 请手动补齐并确认修改清单。`));
+      return finalizeResponse(fallback(`视觉解析不可用：${reason} 请手动补齐并确认修改清单。`));
     }
   } finally {
-    imageEditAnnotationResolutionsInFlight.delete(contentHash);
+    imageEditAnnotationResolutionsInFlight.delete(cacheKey);
   }
 };
 
@@ -476,10 +516,11 @@ const withAbortableRequest = async <T>(
   const controller = new AbortController();
   if (kind === "analyze") analyzeAbortController = controller;
   if (kind === "fuse") fuseAbortController = controller;
+  if (kind === "annotation") annotationAbortControllers.add(controller);
 
   const timeout = setTimeout(() => {
-    controller.abort(new Error("模型请求超过 300 秒未响应，请检查 Base URL、模型状态或稍后重试。"));
-  }, REQUEST_TIMEOUT_MS);
+    controller.abort(new Error(modelRequestTimeoutMessage(kind)));
+  }, modelRequestTimeoutMs(kind));
 
   try {
     return await task(controller.signal);
@@ -494,10 +535,12 @@ const withAbortableRequest = async <T>(
     clearTimeout(timeout);
     if (kind === "analyze" && analyzeAbortController === controller) analyzeAbortController = null;
     if (kind === "fuse" && fuseAbortController === controller) fuseAbortController = null;
+    if (kind === "annotation") annotationAbortControllers.delete(controller);
   }
 };
 
 const analyzeImage = async (request: AnalyzeImageRequest): Promise<AnalyzeImageResponse> => {
+  const requestDataEpoch = localDataEpoch;
   const config = await getEffectiveConfig();
   if (!config.apiKey.trim()) {
     throw new Error("请先填写模型 API Key。");
@@ -507,6 +550,7 @@ const analyzeImage = async (request: AnalyzeImageRequest): Promise<AnalyzeImageR
   }
 
   return withAbortableRequest("analyze", async (signal) => {
+  if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
   let rawText = "";
   try {
     rawText = await postVisionRequest(request, config, true, "", signal);
@@ -536,6 +580,7 @@ const analyzeImage = async (request: AnalyzeImageRequest): Promise<AnalyzeImageR
 };
 
 const fusePrompt = async (request: FusePromptRequest): Promise<FusePromptResponse> => {
+  const requestDataEpoch = localDataEpoch;
   const config = await getEffectiveConfig();
   if (!config.apiKey.trim()) {
     throw new Error("请先填写模型 API Key。");
@@ -561,6 +606,7 @@ const fusePrompt = async (request: FusePromptRequest): Promise<FusePromptRespons
   const userText = textInjectionActive ? request.editedTextMarkdown : undefined;
 
   return withAbortableRequest("fuse", async (signal) => {
+  if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
   let rawText = "";
   try {
     rawText = await postFusePromptRequest(request, config, true, "", signal);
@@ -639,6 +685,9 @@ const createWindow = (): void => {
 };
 
 app.whenReady().then(async () => {
+  if (process.platform === "win32") {
+    Menu.setApplicationMenu(Menu.buildFromTemplate(windowsApplicationMenuTemplate(!app.isPackaged)));
+  }
   generationService = new GenerationService(userDataDir());
   imageEditService = new ImageEditService(userDataDir());
   ipcMain.handle("config:get", getConfig);
