@@ -15,7 +15,7 @@
     "verify:release": "bash scripts/verify-public-release.sh",
     "start": "electron-vite preview",
     "dist:mac": "npm run build && electron-builder --mac",
-    "dist:win": "npm run build && electron-builder --win --x64",
+    "dist:win": "npm run build && electron-builder --win --x64 --publish never",
     "pack": "npm run build && electron-builder --dir"
   },
   "dependencies": {
