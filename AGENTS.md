@@ -55,7 +55,7 @@ npm run pack
 ## 发布原则
 
 - `main` 是公开仓库唯一发布基线，本机 `main` 应跟踪 `origin/main`。
-- 不使用 `git push --force`，不把内部开发台账、计划文档或私人分支历史合入公开 `main`。
+- 不使用 `git push --force`；公开 `main` 只保留发布所需的源码、测试和文档。
 - 每次只暂存本轮必要源码、测试、锁文件和公开文档；提交前查看 `git status --short --ignored` 和 staged diff。
 - 安装包只作为 GitHub Release 资产上传，不提交到 Git 树。
 - 发布新安装包时使用递增版本和新 tag，不覆盖已经发布的历史版本。
