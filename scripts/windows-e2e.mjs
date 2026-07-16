@@ -36,7 +36,8 @@ const annotationServer = createServer(async (request, response) => {
   annotationRequests.push({
     imageLengths: imageUrls.map((url) => url.length),
     containsIdentityImage: imageUrls.includes(sourceIdentityDataUrl),
-    maxTokens: body.max_tokens
+    maxTokens: body.max_tokens,
+    systemPrompt: body.messages?.find((message) => message?.role === "system")?.content || ""
   });
 
   response.setHeader("Content-Type", "application/json");
@@ -54,11 +55,13 @@ const annotationServer = createServer(async (request, response) => {
               items: [
                 {
                   index: 1,
-                  target_object: "公开测试图标",
-                  current_state: "图标位于标注区域内",
-                  requested_change: "替换为另一枚公开测试图标",
+                  target_object: "左侧对话气泡",
+                  current_state: "气泡内文字为深度思考",
+                  requested_change: "删除该对话气泡及其内部文字",
                   preserve: ["保持背景与构图"],
                   spatial_anchors: ["编号 1 所在区域"],
+                  original_text: "深度思考",
+                  replacement_text: "",
                   confidence: 0.95,
                   ambiguity: ""
                 }
@@ -77,6 +80,33 @@ await new Promise((resolveListening, rejectListening) => {
 const annotationServerAddress = annotationServer.address();
 assert(annotationServerAddress && typeof annotationServerAddress !== "string");
 const annotationApiBaseUrl = `http://127.0.0.1:${annotationServerAddress.port}/v1`;
+
+let markImageEditRequest;
+const imageEditRequestSeen = new Promise((resolveImageEditRequest) => {
+  markImageEditRequest = resolveImageEditRequest;
+});
+const imageEditRequests = [];
+const imageEditServer = createServer(async (request, response) => {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  imageEditRequests.push({
+    path: request.url,
+    model: body.model,
+    prompt: body.prompt,
+    referenceCount: Array.isArray(body.input_references) ? body.input_references.length : 0
+  });
+  markImageEditRequest();
+  response.setHeader("Content-Type", "application/json");
+  response.end(JSON.stringify({ data: [{ b64_json: imageBytes.toString("base64") }] }));
+});
+await new Promise((resolveListening, rejectListening) => {
+  imageEditServer.once("error", rejectListening);
+  imageEditServer.listen(0, "127.0.0.1", resolveListening);
+});
+const imageEditServerAddress = imageEditServer.address();
+assert(imageEditServerAddress && typeof imageEditServerAddress !== "string");
+const imageEditApiBaseUrl = `http://127.0.0.1:${imageEditServerAddress.port}/v1`;
 
 let markPendingRequest;
 const pendingRequestSeen = new Promise((resolvePendingRequest) => {
@@ -307,9 +337,69 @@ try {
   assert.deepEqual(annotationRequests[0].imageLengths, [imageDataUrl.length, imageDataUrl.length]);
   assert.equal(annotationRequests[0].containsIdentityImage, false);
   assert.equal(annotationRequests[0].maxTokens, 4096);
+  assert.match(annotationRequests[0].systemPrompt, /纯删除文字或删除包含文字的对象/);
+  assert.equal(resolvedAnnotations.resolution.items[0].originalText, undefined);
+  assert.equal(resolvedAnnotations.resolution.items[0].replacementText, undefined);
 
   await page.evaluate((request) => window.styleExtractor.resolveImageEditAnnotations(request), annotationRequest);
   assert.equal(annotationRequests.length, 1, "成功的标注解析应复用内存缓存");
+
+  await page.evaluate(async ({ apiBaseUrl, secret }) => {
+    const current = await window.styleExtractor.getGenerationConfig();
+    await window.styleExtractor.saveGenerationConfig({
+      authSource: "api",
+      activeProviderId: current.activeProviderId,
+      providerName: "Windows E2E",
+      providerType: "openrouter",
+      apiBaseUrl,
+      apiKey: secret,
+      apiMode: "images",
+      imageModel: "openai/gpt-image-2",
+      mainModel: "gpt-5.5",
+      saveApiKey: true,
+      imagesConcurrency: 1
+    });
+  }, { apiBaseUrl: imageEditApiBaseUrl, secret: generationSecret });
+  await page.getByRole("button", { name: "改图工作台" }).click();
+  await page.locator('input[type="file"]').last().setInputFiles(sourceImagePath);
+  await page.locator('img[alt="改图源图"]').waitFor();
+  await page.getByLabel("原始生图提示词").fill("保持公开测试图的基础构图。");
+  await page.getByRole("button", { name: "框选", exact: true }).click();
+  await page.getByLabel("当前标注要求").fill("删除左侧对话气泡及其内部文字");
+  const editStage = page.locator(".image-edit-stage");
+  await editStage.scrollIntoViewIfNeeded();
+  await editStage.click({ position: { x: 120, y: 120 } });
+  await page.getByText("标注 1 · 框选").waitFor();
+  await page.getByRole("button", { name: "解析修改清单", exact: true }).click();
+  const confirmChecklist = page.getByRole("button", { name: "确认修改清单", exact: true });
+  await confirmChecklist.waitFor();
+  assert.equal(await page.getByLabel("原文字（换字时填写）").inputValue(), "");
+  assert.equal(await page.getByLabel("新文字（换字时填写）").inputValue(), "");
+  await page.getByRole("checkbox", { name: "我已检查此编号的对象、修改和保留项" }).check();
+  assert.equal(await confirmChecklist.isEnabled(), true, "Windows 纯删除文字不应禁用确认修改清单");
+  await confirmChecklist.click();
+  await page.getByRole("button", { name: "修改清单已确认", exact: true }).waitFor();
+  await page.getByRole("button", { name: "生成修订版", exact: true }).click();
+  await Promise.race([
+    imageEditRequestSeen,
+    new Promise((_resolve, reject) => setTimeout(() => reject(new Error("Timed out waiting for image-edit API request.")), 10_000))
+  ]);
+  assert.equal(imageEditRequests.length, 1);
+  assert.equal(imageEditRequests[0].path, "/v1/images");
+  assert.equal(imageEditRequests[0].model, "openai/gpt-image-2");
+  assert.match(imageEditRequests[0].prompt, /删除该对话气泡及其内部文字/);
+  assert.equal(imageEditRequests[0].referenceCount, 0);
+
+  const taskDeadline = Date.now() + 10_000;
+  let completedEditTask;
+  while (Date.now() < taskDeadline) {
+    const tasks = await page.evaluate(() => window.styleExtractor.getImageEditTasks());
+    completedEditTask = tasks.find((task) => task.status === "succeeded");
+    if (completedEditTask) break;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  assert(completedEditTask, "Windows 改图任务应在 API 返回图片后完成");
+  assert.equal(completedEditTask.outputs.length, 1);
 
   annotationServerMode = "fail";
   const failingAnnotationRequest = {
@@ -327,7 +417,7 @@ try {
   );
   assert.equal(firstFallback.resolution.source, "manual_fallback");
   assert.equal(secondFallback.resolution.source, "manual_fallback");
-  assert.equal(annotationRequests.length, 3, "失败回退不能被缓存，用户必须能够直接重试");
+  assert.equal(annotationRequests.length, 4, "失败回退不能被缓存，用户必须能够直接重试");
 
   await page.evaluate(async ({ apiBaseUrl, secret }) => {
     await window.styleExtractor.saveConfig({
@@ -401,7 +491,7 @@ try {
   await rm(testRoot, { recursive: true, force: true });
   await assert.rejects(access(testRoot));
 
-  console.log("Windows Electron E2E passed: navigation, Chinese path upload, encrypted config, save, restart recovery, logical browser-data clearing and physical test-root cleanup.");
+  console.log("Windows Electron E2E passed: deletion checklist confirmation, image-edit API request, encrypted config, restart recovery and cleanup.");
 } finally {
   if (electronApp) await electronApp.close().catch(() => undefined);
   const serverClosed = new Promise((resolveClose) => hangingServer.close(resolveClose));
@@ -410,5 +500,8 @@ try {
   const annotationServerClosed = new Promise((resolveClose) => annotationServer.close(resolveClose));
   annotationServer.closeAllConnections();
   await annotationServerClosed;
+  const imageEditServerClosed = new Promise((resolveClose) => imageEditServer.close(resolveClose));
+  imageEditServer.closeAllConnections();
+  await imageEditServerClosed;
   await rm(testRoot, { recursive: true, force: true });
 }
