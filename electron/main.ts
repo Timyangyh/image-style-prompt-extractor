@@ -25,6 +25,7 @@ import { GenerationService } from "./generation";
 import { ImageEditService, imageEditAnnotationContentHash } from "./image-edit";
 import { clearWindowsSessionData } from "./session-cleanup";
 import { windowsApplicationMenuTemplate } from "./windows-menu";
+import { normalizeWindowsTextRemovalResolution } from "./windows-image-edit";
 import {
   dataUrlToGenerationOutputBuffer,
   generationOutputExtension,
@@ -428,8 +429,13 @@ const resolveImageEditAnnotations = async (
       "每项字段固定为 index、target_object、current_state、requested_change、preserve、spatial_anchors、original_text、replacement_text、confidence、ambiguity。",
       "target_object 与 requested_change 必须非空。只根据待修改图、黑白编号定位图、结构化几何和用户原始说明识别对象；不得新增用户未要求的事实、品牌、文字、人物或修改目标。",
       "涉及文字替换时，original_text 和 replacement_text 必须拆分；replacement_text 只能逐字来自用户说明，无法确认则留空并在 ambiguity 说明。",
+      process.platform === "win32"
+        ? "纯删除文字或删除包含文字的对象时，不属于文字替换，original_text 和 replacement_text 必须同时留空。"
+        : "",
       "对象不明确、文字不可辨认或置信度低于 0.80 时必须填写 ambiguity，不能猜测。所有说明使用中文。"
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
     const userText = [
       `原始生图基础提示词：\n${basePrompt}`,
       `本轮总体说明：\n${request.instruction.trim() || "无"}`,
@@ -482,12 +488,14 @@ const resolveImageEditAnnotations = async (
         }
         const parsed = parseExtractedJson(rawText, "改图标注解析结果");
         const response = finalizeResponse({
-          resolution: parseImageEditAnnotationResolution(parsed, annotationItems, {
-            contentHash,
-            source: "vision_model",
-            modelName: config.modelName,
-            createdAt
-          })
+          resolution: normalizeWindowsTextRemovalResolution(
+            parseImageEditAnnotationResolution(parsed, annotationItems, {
+              contentHash,
+              source: "vision_model",
+              modelName: config.modelName,
+              createdAt
+            })
+          )
         });
         if (shouldCacheImageEditAnnotationResolution(response)) {
           imageEditAnnotationResolutionCache.set(cacheKey, response);
