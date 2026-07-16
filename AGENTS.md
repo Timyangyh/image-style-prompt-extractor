@@ -52,6 +52,13 @@ npm run pack
 
 准备公开提交时运行 `npm run verify:release`。它会检查禁止跟踪的目录、10MB 以上 Git 文件、常见密钥/本机路径，并执行单元测试和生产构建。
 
+## 提交身份隐私
+
+- 创建提交前检查 `git var GIT_AUTHOR_IDENT` 和 `git var GIT_COMMITTER_IDENT`；新建的 GitHub 公开提交只使用 GitHub `noreply` 邮箱。
+- 推送前扫描本次全部待推送提交的 author/committer 邮箱，不能只检查 `HEAD`。
+- PR 合并后、创建 tag 或发布 Release 前，重新检查远端合并提交的 author/committer 邮箱。
+- 不要把真实私人邮箱写入仓库文档、脚本、示例或检查规则。
+
 ## 发布原则
 
 - `main` 是公开仓库唯一发布基线，本机 `main` 应跟踪 `origin/main`。
