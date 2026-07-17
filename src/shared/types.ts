@@ -17,7 +17,7 @@ export interface ModelConfig {
   hasApiKey: boolean;
 }
 
-export type VisionApiMode = "chat_completions" | "responses" | "gemini";
+export type VisionApiMode = "chat_completions" | "responses" | "anthropic" | "gemini";
 
 export interface ModelConfigUpdate {
   apiBaseUrl: string;

@@ -19,7 +19,8 @@ const modelSecret = "windows-e2e-model-secret";
 const generationSecret = "windows-e2e-generation-secret";
 const browserMarker = "windows-e2e-browser-marker";
 const imageBytes = await readFile(join(rootDir, "assets", "app-icon.png"));
-const imageDataUrl = `data:image/png;base64,${imageBytes.toString("base64")}`;
+const imageBase64 = imageBytes.toString("base64");
+const imageDataUrl = `data:image/png;base64,${imageBase64}`;
 const sourceIdentityDataUrl = `data:image/png;base64,${"A".repeat(2 * 1024 * 1024)}`;
 
 let annotationServerMode = "success";
@@ -29,15 +30,25 @@ const annotationServer = createServer(async (request, response) => {
   for await (const chunk of request) chunks.push(chunk);
   const bodyText = Buffer.concat(chunks).toString("utf8");
   const body = JSON.parse(bodyText);
-  const imageUrls = (body.messages || [])
-    .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+  const contentParts = (body.messages || [])
+    .flatMap((message) => (Array.isArray(message.content) ? message.content : []));
+  const imageUrls = contentParts
     .filter((part) => part?.type === "image_url")
     .map((part) => part.image_url?.url || "");
+  const anthropicImages = contentParts
+    .filter((part) => part?.type === "image" && part.source?.type === "base64")
+    .map((part) => part.source?.data || "");
   annotationRequests.push({
-    imageLengths: imageUrls.map((url) => url.length),
-    containsIdentityImage: imageUrls.includes(sourceIdentityDataUrl),
+    path: request.url,
+    authorization: request.headers.authorization,
+    anthropicVersion: request.headers["anthropic-version"],
+    imageLengths: anthropicImages.length
+      ? anthropicImages.map((data) => data.length)
+      : imageUrls.map((url) => url.length),
+    containsIdentityImage:
+      imageUrls.includes(sourceIdentityDataUrl) || anthropicImages.includes(sourceIdentityDataUrl.split(",")[1]),
     maxTokens: body.max_tokens,
-    systemPrompt: body.messages?.find((message) => message?.role === "system")?.content || ""
+    systemPrompt: body.system || body.messages?.find((message) => message?.role === "system")?.content || ""
   });
 
   response.setHeader("Content-Type", "application/json");
@@ -46,31 +57,28 @@ const annotationServer = createServer(async (request, response) => {
     response.end(JSON.stringify({ error: { message: "forced annotation failure" } }));
     return;
   }
+  const resultText = JSON.stringify({
+    items: [
+      {
+        index: 1,
+        target_object: "左侧对话气泡",
+        current_state: "气泡内文字为深度思考",
+        requested_change: "删除该对话气泡及其内部文字",
+        preserve: ["保持背景与构图"],
+        spatial_anchors: ["编号 1 所在区域"],
+        original_text: "深度思考",
+        replacement_text: "",
+        confidence: 0.95,
+        ambiguity: ""
+      }
+    ]
+  });
   response.end(
-    JSON.stringify({
-      choices: [
-        {
-          message: {
-            content: JSON.stringify({
-              items: [
-                {
-                  index: 1,
-                  target_object: "左侧对话气泡",
-                  current_state: "气泡内文字为深度思考",
-                  requested_change: "删除该对话气泡及其内部文字",
-                  preserve: ["保持背景与构图"],
-                  spatial_anchors: ["编号 1 所在区域"],
-                  original_text: "深度思考",
-                  replacement_text: "",
-                  confidence: 0.95,
-                  ambiguity: ""
-                }
-              ]
-            })
-          }
-        }
-      ]
-    })
+    JSON.stringify(
+      body.system
+        ? { content: [{ type: "text", text: resultText }] }
+        : { choices: [{ message: { content: resultText } }] }
+    )
   );
 });
 await new Promise((resolveListening, rejectListening) => {
@@ -217,12 +225,14 @@ try {
   const modelConfig = await page.evaluate(async ({ secret }) => {
     return window.styleExtractor.saveConfig({
       apiBaseUrl: "https://api.example.invalid/v1",
+      apiMode: "anthropic",
       apiKey: secret,
       modelName: "windows-e2e-vision",
       saveApiKey: true
     });
   }, { secret: modelSecret });
   assert.equal(modelConfig.hasApiKey, true);
+  assert.equal(modelConfig.apiMode, "anthropic");
   assert.equal("apiKey" in modelConfig, false);
 
   const generationConfig = await page.evaluate(async ({ secret }) => {
@@ -282,6 +292,7 @@ try {
   assert.equal(storedModelConfig.includes(modelSecret), false);
   assert.equal(storedGenerationConfig.includes(generationSecret), false);
   assert.match(storedModelConfig, /encryptedApiKey/);
+  assert.match(storedModelConfig, /"apiMode": "anthropic"/);
   assert.match(storedGenerationConfig, /encryptedApiKey/);
 
   await seedStaleGenerationTask();
@@ -297,6 +308,7 @@ try {
   await page.evaluate(async ({ apiBaseUrl, secret }) => {
     await window.styleExtractor.saveConfig({
       apiBaseUrl,
+      apiMode: "anthropic",
       apiKey: secret,
       modelName: "windows-e2e-annotation-vision",
       saveApiKey: true
@@ -334,7 +346,10 @@ try {
   );
   assert.equal(resolvedAnnotations.resolution.source, "vision_model");
   assert.equal(annotationRequests.length, 1);
-  assert.deepEqual(annotationRequests[0].imageLengths, [imageDataUrl.length, imageDataUrl.length]);
+  assert.equal(annotationRequests[0].path, "/v1/messages");
+  assert.equal(annotationRequests[0].authorization, `Bearer ${modelSecret}`);
+  assert.equal(annotationRequests[0].anthropicVersion, "2023-06-01");
+  assert.deepEqual(annotationRequests[0].imageLengths, [imageBase64.length, imageBase64.length]);
   assert.equal(annotationRequests[0].containsIdentityImage, false);
   assert.equal(annotationRequests[0].maxTokens, 4096);
   assert.match(annotationRequests[0].systemPrompt, /纯删除文字或删除包含文字的对象/);
@@ -422,6 +437,7 @@ try {
   await page.evaluate(async ({ apiBaseUrl, secret }) => {
     await window.styleExtractor.saveConfig({
       apiBaseUrl,
+      apiMode: "chat_completions",
       apiKey: secret,
       modelName: "windows-e2e-hanging-vision",
       saveApiKey: true

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import {
   ModelHttpError,
+  anthropicMessagesEndpoint,
+  anthropicTextFromResponse,
   buildVisionModelPayload,
   chatCompletionsEndpoint,
   completionTextFromResponse,
@@ -13,6 +15,7 @@ import {
   modelRequestTimeoutMessage,
   modelRequestTimeoutMs,
   normalizeHistory,
+  normalizeVisionApiMode,
   readJsonFile,
   responsesEndpoint,
   responsesTextFromResponse,
@@ -40,6 +43,18 @@ describe("main process model utilities", () => {
     expect(responsesEndpoint("https://api.example.com/v1/chat/completions")).toBe(
       "https://api.example.com/v1/responses"
     );
+    expect(anthropicMessagesEndpoint("https://api.example.com")).toBe(
+      "https://api.example.com/v1/messages"
+    );
+    expect(anthropicMessagesEndpoint("https://api.example.com/v1")).toBe(
+      "https://api.example.com/v1/messages"
+    );
+    expect(anthropicMessagesEndpoint("https://api.example.com/v1/messages")).toBe(
+      "https://api.example.com/v1/messages"
+    );
+    expect(anthropicMessagesEndpoint("https://api.example.com/anthropic")).toBe(
+      "https://api.example.com/anthropic/v1/messages"
+    );
     expect(geminiGenerateContentEndpoint("https://api.example.com/v1beta", "gemini-2.5-flash")).toBe(
       "https://api.example.com/v1beta/models/gemini-2.5-flash:generateContent"
     );
@@ -52,7 +67,12 @@ describe("main process model utilities", () => {
     ).toBe("https://api.example.com/v1beta/models/gemini-2.5-flash:generateContent");
   });
 
-  it("builds Responses and Gemini native vision payloads without exposing keys", () => {
+  it("preserves Anthropic mode in stored configuration normalization", () => {
+    expect(normalizeVisionApiMode("anthropic")).toBe("anthropic");
+    expect(normalizeVisionApiMode(undefined)).toBe("chat_completions");
+  });
+
+  it("builds Responses, Anthropic, and Gemini native vision payloads without exposing keys", () => {
     const responsesPayload = buildVisionModelPayload({
       apiMode: "responses",
       modelName: "gpt-5.5",
@@ -103,9 +123,49 @@ describe("main process model utilities", () => {
       generationConfig: { temperature: 0.1, responseMimeType: "application/json" }
     });
     expect(JSON.stringify(geminiPayload)).not.toContain("api-key");
+
+    const anthropicPayload = buildVisionModelPayload({
+      apiMode: "anthropic",
+      modelName: "vision-model",
+      systemPrompt: "只返回 JSON",
+      userText: "分析图片",
+      imageDataUrls: ["data:image/png;base64,YWJj"],
+      includeJsonFormat: true,
+      temperature: 0.2,
+      maxOutputTokens: 4096
+    });
+    expect(anthropicPayload).toEqual({
+      model: "vision-model",
+      system: "只返回 JSON",
+      max_tokens: 4096,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "YWJj" }
+            },
+            { type: "text", text: "分析图片" }
+          ]
+        }
+      ]
+    });
+    expect(
+      buildVisionModelPayload({
+        apiMode: "anthropic",
+        modelName: "vision-model",
+        systemPrompt: "只返回 JSON",
+        userText: "分析图片",
+        imageDataUrls: [],
+        includeJsonFormat: false,
+        temperature: 0.2
+      })
+    ).toMatchObject({ max_tokens: 16384 });
   });
 
-  it("uses the correct auth header for Gemini official and compatible proxy endpoints", () => {
+  it("uses the correct auth headers for Gemini and Anthropic endpoints", () => {
     expect(
       visionRequestHeaders(
         "gemini",
@@ -120,6 +180,16 @@ describe("main process model utilities", () => {
         "https://api.example.com/v1beta/models/gemini-2.5-flash:generateContent"
       )
     ).toMatchObject({ Authorization: "Bearer proxy-key" });
+    const anthropicHeaders = visionRequestHeaders(
+      "anthropic",
+      "auth-token",
+      "https://api.example.com/v1/messages"
+    );
+    expect(anthropicHeaders).toMatchObject({
+      Authorization: "Bearer auth-token",
+      "anthropic-version": "2023-06-01"
+    });
+    expect(anthropicHeaders).not.toHaveProperty("x-api-key");
   });
 
   it("extracts JSON from fenced, explained, and pure responses", () => {
@@ -142,12 +212,20 @@ describe("main process model utilities", () => {
     );
   });
 
-  it("reads text content from Responses and Gemini native responses", () => {
+  it("reads text content from Responses, Anthropic, and Gemini native responses", () => {
     expect(
       responsesTextFromResponse(
         JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: "{\"ok\":true}" }] }] })
       )
     ).toBe("{\"ok\":true}");
+    expect(
+      anthropicTextFromResponse(
+        JSON.stringify({ content: [{ type: "text", text: "{\"ok\":true}" }] })
+      )
+    ).toBe("{\"ok\":true}");
+    expect(() =>
+      anthropicTextFromResponse(JSON.stringify({ content: [{ type: "thinking" }] }))
+    ).toThrow("Anthropic Messages 模型返回中没有可解析的文本内容");
     expect(
       geminiTextFromResponse(
         JSON.stringify({ candidates: [{ content: { parts: [{ text: "{\"ok\":true}" }] } }] })

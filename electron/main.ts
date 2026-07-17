@@ -43,6 +43,7 @@ import {
   modelRequestTimeoutMs,
   normalizeHistory,
   normalizeHistoryItemForStorage,
+  normalizeVisionApiMode,
   parseExtractedJson,
   readJsonFile,
   shouldCacheImageEditAnnotationResolution,
@@ -142,8 +143,7 @@ const readStoredConfig = async (): Promise<{
   const apiKey = decryptStoredApiKey(stored);
   const config: EffectiveModelConfig = {
     apiBaseUrl: stored.apiBaseUrl?.trim() || defaultEffectiveConfig.apiBaseUrl,
-    apiMode:
-      stored.apiMode === "responses" || stored.apiMode === "gemini" ? stored.apiMode : defaultEffectiveConfig.apiMode,
+    apiMode: normalizeVisionApiMode(stored.apiMode),
     apiKey,
     modelName: stored.modelName?.trim() || defaultEffectiveConfig.modelName,
     saveApiKey: Boolean(stored.saveApiKey)
@@ -184,7 +184,7 @@ const saveConfig = async (config: ModelConfigUpdate): Promise<ModelConfig> => {
   const existing = await getEffectiveConfig();
   const nextConfig: EffectiveModelConfig = {
     apiBaseUrl: config.apiBaseUrl.trim() || defaultConfig.apiBaseUrl,
-    apiMode: config.apiMode === "responses" || config.apiMode === "gemini" ? config.apiMode : "chat_completions",
+    apiMode: normalizeVisionApiMode(config.apiMode),
     modelName: config.modelName.trim() || defaultConfig.modelName,
     apiKey: config.apiKey.trim() || existing.apiKey,
     saveApiKey: Boolean(config.saveApiKey)

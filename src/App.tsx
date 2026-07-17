@@ -1052,6 +1052,9 @@ const generationApiModeNote = (config: GenerationConfigDraft): string => {
 
 const visionApiModeNote = (apiMode: ModelConfig["apiMode"]): string => {
   if (apiMode === "responses") return "适合明确提供 /responses 多模态识图接口的平台。";
+  if (apiMode === "anthropic") {
+    return "适合使用 ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN 的 Claude Code 中转，调用 /v1/messages。";
+  }
   if (apiMode === "gemini") {
     return "适合 Google Gemini 官方或提供 /v1beta/models/{model}:generateContent 的中转平台。";
   }
@@ -3670,15 +3673,18 @@ export function App(): JSX.Element {
                     apiMode:
                       event.target.value === "responses"
                         ? "responses"
-                        : event.target.value === "gemini"
-                          ? "gemini"
-                          : "chat_completions"
+                        : event.target.value === "anthropic"
+                          ? "anthropic"
+                          : event.target.value === "gemini"
+                            ? "gemini"
+                            : "chat_completions"
                   })
                 }
                 value={draftConfig.apiMode}
               >
                 <option value="chat_completions">Chat Completions（多数 OpenAI 兼容平台）</option>
                 <option value="responses">Responses（OpenAI Responses 兼容平台）</option>
+                <option value="anthropic">Anthropic Messages（Claude Code 中转）</option>
                 <option value="gemini">Gemini 原生（Google / Gemini 中转）</option>
               </select>
             </label>
@@ -3690,7 +3696,9 @@ export function App(): JSX.Element {
                 placeholder={
                   draftConfig.apiMode === "gemini"
                     ? "https://api.duckcoding.ai/v1beta"
-                    : "https://api.openai.com/v1"
+                    : draftConfig.apiMode === "anthropic"
+                      ? "https://gateway.example.com"
+                      : "https://api.openai.com/v1"
                 }
                 value={draftConfig.apiBaseUrl}
               />
@@ -3702,7 +3710,13 @@ export function App(): JSX.Element {
               Model Name
               <input
                 onChange={(event) => setDraftConfig({ ...draftConfig, modelName: event.target.value })}
-                placeholder={draftConfig.apiMode === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini"}
+                placeholder={
+                  draftConfig.apiMode === "gemini"
+                    ? "gemini-2.5-flash"
+                    : draftConfig.apiMode === "anthropic"
+                      ? "平台提供的视觉模型名"
+                      : "gpt-4o-mini"
+                }
                 value={draftConfig.modelName}
               />
             </label>
@@ -3715,7 +3729,9 @@ export function App(): JSX.Element {
                     ? "已配置，留空则继续使用当前 Key"
                     : draftConfig.apiMode === "gemini"
                       ? "Gemini API Key 或平台 Key"
-                      : "sk-..."
+                      : draftConfig.apiMode === "anthropic"
+                        ? "ANTHROPIC_AUTH_TOKEN 或平台 Key"
+                        : "sk-..."
                 }
                 type="password"
                 value={draftConfig.apiKey}

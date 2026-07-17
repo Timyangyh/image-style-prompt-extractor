@@ -212,6 +212,16 @@ export const chatCompletionsEndpoint = (baseUrl: string): string =>
 
 export const responsesEndpoint = (baseUrl: string): string => `${normalizeVisionBaseUrl(baseUrl)}/responses`;
 
+export const normalizeVisionApiMode = (apiMode: VisionApiMode | undefined): VisionApiMode =>
+  apiMode === "responses" || apiMode === "anthropic" || apiMode === "gemini" ? apiMode : "chat_completions";
+
+export const anthropicMessagesEndpoint = (baseUrl: string): string => {
+  const normalized = baseUrl.trim().replace(/\/+$/, "");
+  if (/\/messages$/i.test(normalized)) return normalized;
+  if (/\/v1$/i.test(normalized)) return `${normalized}/messages`;
+  return `${normalized}/v1/messages`;
+};
+
 export const geminiGenerateContentEndpoint = (baseUrl: string, modelName: string): string => {
   const normalized = baseUrl.trim().replace(/\/+$/, "");
   const fullEndpoint = normalized.match(/^(.*\/models\/)[^/]+(:generateContent)$/i);
@@ -221,6 +231,7 @@ export const geminiGenerateContentEndpoint = (baseUrl: string, modelName: string
 
 export const visionModelEndpoint = (baseUrl: string, apiMode: VisionApiMode, modelName: string): string => {
   if (apiMode === "responses") return responsesEndpoint(baseUrl);
+  if (apiMode === "anthropic") return anthropicMessagesEndpoint(baseUrl);
   if (apiMode === "gemini") return geminiGenerateContentEndpoint(baseUrl, modelName);
   return chatCompletionsEndpoint(baseUrl);
 };
@@ -234,7 +245,10 @@ export const visionRequestHeaders = (
     "Content-Type": "application/json",
     Accept: "application/json"
   };
-  if (apiMode === "gemini" && isGoogleGeminiEndpoint(endpoint)) {
+  if (apiMode === "anthropic") {
+    headers.Authorization = `Bearer ${apiKey}`;
+    headers["anthropic-version"] = "2023-06-01";
+  } else if (apiMode === "gemini" && isGoogleGeminiEndpoint(endpoint)) {
     headers["x-goog-api-key"] = apiKey;
   } else {
     headers.Authorization = `Bearer ${apiKey}`;
@@ -262,6 +276,21 @@ const geminiInlineImage = (dataUrl: string): { inlineData: { mimeType: string; d
   return {
     inlineData: {
       mimeType: match[1],
+      data: match[2].replace(/\s/g, "")
+    }
+  };
+};
+
+const anthropicImage = (
+  dataUrl: string
+): { type: "image"; source: { type: "base64"; media_type: string; data: string } } => {
+  const match = dataUrl.match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i);
+  if (!match) throw new Error("Anthropic Messages 识图只支持 base64 图片数据。");
+  return {
+    type: "image",
+    source: {
+      type: "base64",
+      media_type: match[1],
       data: match[2].replace(/\s/g, "")
     }
   };
@@ -304,6 +333,24 @@ export const buildVisionModelPayload = (options: VisionModelPayloadOptions): Rec
         ...(options.maxOutputTokens ? { maxOutputTokens: options.maxOutputTokens } : {}),
         ...(options.includeJsonFormat ? { responseMimeType: "application/json" } : {})
       }
+    };
+  }
+
+  if (options.apiMode === "anthropic") {
+    return {
+      model: options.modelName,
+      system: options.systemPrompt,
+      max_tokens: options.maxOutputTokens ?? 16384,
+      temperature: options.temperature,
+      messages: [
+        {
+          role: "user",
+          content: [
+            ...options.imageDataUrls.map(anthropicImage),
+            { type: "text", text: options.userText }
+          ]
+        }
+      ]
     };
   }
 
@@ -408,8 +455,30 @@ export const geminiTextFromResponse = (text: string): string => {
   throw new Error("Gemini 模型返回中没有可解析的文本内容。");
 };
 
+export const anthropicTextFromResponse = (text: string): string => {
+  let payload: {
+    content?: Array<{ type?: string; text?: string }>;
+    choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
+  };
+  try {
+    payload = JSON.parse(text) as typeof payload;
+  } catch {
+    throw new Error("模型接口返回不是有效 JSON。");
+  }
+
+  const contentText = (payload.content || [])
+    .filter((part) => !part.type || part.type === "text")
+    .map((part) => part.text || "")
+    .filter(Boolean)
+    .join("\n");
+  if (contentText) return contentText;
+  if (payload.choices) return completionTextFromResponse(text);
+  throw new Error("Anthropic Messages 模型返回中没有可解析的文本内容。");
+};
+
 export const visionTextFromResponse = (apiMode: VisionApiMode, text: string): string => {
   if (apiMode === "responses") return responsesTextFromResponse(text);
+  if (apiMode === "anthropic") return anthropicTextFromResponse(text);
   if (apiMode === "gemini") return geminiTextFromResponse(text);
   return completionTextFromResponse(text);
 };
