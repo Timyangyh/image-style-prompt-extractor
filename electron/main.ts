@@ -35,8 +35,7 @@ import {
 import { buildFuseSystemPrompt, buildFuseUserPrompt, buildSystemPrompt, buildUserPrompt } from "./prompt";
 import {
   ModelHttpError,
-  chatCompletionsEndpoint,
-  completionTextFromResponse,
+  buildVisionModelPayload,
   extractJsonText,
   getHistoryEntryId,
   isAbortError,
@@ -49,11 +48,15 @@ import {
   shouldCacheImageEditAnnotationResolution,
   shouldRetryFusedPrompt,
   shouldRetryWithoutResponseFormat,
+  visionModelEndpoint,
+  visionRequestHeaders,
+  visionTextFromResponse,
   writeJsonFile
 } from "./main-utils";
 
 const defaultConfig: ModelConfig = {
   apiBaseUrl: "https://api.openai.com/v1",
+  apiMode: "chat_completions",
   modelName: "gpt-4o-mini",
   saveApiKey: false,
   hasApiKey: false
@@ -61,6 +64,7 @@ const defaultConfig: ModelConfig = {
 
 interface EffectiveModelConfig {
   apiBaseUrl: string;
+  apiMode: ModelConfig["apiMode"];
   apiKey: string;
   modelName: string;
   saveApiKey: boolean;
@@ -68,6 +72,7 @@ interface EffectiveModelConfig {
 
 interface StoredModelConfig {
   apiBaseUrl?: string;
+  apiMode?: ModelConfig["apiMode"];
   modelName?: string;
   saveApiKey?: boolean;
   encryptedApiKey?: string;
@@ -76,6 +81,7 @@ interface StoredModelConfig {
 
 const defaultEffectiveConfig: EffectiveModelConfig = {
   apiBaseUrl: defaultConfig.apiBaseUrl,
+  apiMode: defaultConfig.apiMode,
   apiKey: "",
   modelName: defaultConfig.modelName,
   saveApiKey: false
@@ -103,6 +109,7 @@ const imageEditAnnotationResolutionsInFlight = new Set<string>();
 
 const publicConfig = (config: EffectiveModelConfig): ModelConfig => ({
   apiBaseUrl: config.apiBaseUrl,
+  apiMode: config.apiMode,
   modelName: config.modelName,
   saveApiKey: config.saveApiKey,
   hasApiKey: Boolean(config.apiKey)
@@ -135,6 +142,8 @@ const readStoredConfig = async (): Promise<{
   const apiKey = decryptStoredApiKey(stored);
   const config: EffectiveModelConfig = {
     apiBaseUrl: stored.apiBaseUrl?.trim() || defaultEffectiveConfig.apiBaseUrl,
+    apiMode:
+      stored.apiMode === "responses" || stored.apiMode === "gemini" ? stored.apiMode : defaultEffectiveConfig.apiMode,
     apiKey,
     modelName: stored.modelName?.trim() || defaultEffectiveConfig.modelName,
     saveApiKey: Boolean(stored.saveApiKey)
@@ -145,6 +154,7 @@ const readStoredConfig = async (): Promise<{
 const writeStoredConfig = async (config: EffectiveModelConfig): Promise<void> => {
   const payload: StoredModelConfig = {
     apiBaseUrl: config.apiBaseUrl,
+    apiMode: config.apiMode,
     modelName: config.modelName,
     saveApiKey: config.saveApiKey
   };
@@ -174,6 +184,7 @@ const saveConfig = async (config: ModelConfigUpdate): Promise<ModelConfig> => {
   const existing = await getEffectiveConfig();
   const nextConfig: EffectiveModelConfig = {
     apiBaseUrl: config.apiBaseUrl.trim() || defaultConfig.apiBaseUrl,
+    apiMode: config.apiMode === "responses" || config.apiMode === "gemini" ? config.apiMode : "chat_completions",
     modelName: config.modelName.trim() || defaultConfig.modelName,
     apiKey: config.apiKey.trim() || existing.apiKey,
     saveApiKey: Boolean(config.saveApiKey)
@@ -268,52 +279,56 @@ const parseFusedPrompt = (rawText: string, userText?: string): FusePromptRespons
   return { result, rawText, repaired: jsonText !== rawText.trim() };
 };
 
+const postVisionModelRequest = async (
+  config: EffectiveModelConfig,
+  options: {
+    systemPrompt: string;
+    userText: string;
+    imageDataUrls: string[];
+    includeJsonFormat: boolean;
+    temperature: number;
+    maxOutputTokens?: number;
+    signal?: AbortSignal;
+  }
+): Promise<string> => {
+  const endpoint = visionModelEndpoint(config.apiBaseUrl, config.apiMode, config.modelName);
+  const response = await fetch(endpoint, {
+    method: "POST",
+    signal: options.signal,
+    headers: visionRequestHeaders(config.apiMode, config.apiKey.trim(), endpoint),
+    body: JSON.stringify(
+      buildVisionModelPayload({
+        apiMode: config.apiMode,
+        modelName: config.modelName,
+        systemPrompt: options.systemPrompt,
+        userText: options.userText,
+        imageDataUrls: options.imageDataUrls,
+        includeJsonFormat: options.includeJsonFormat,
+        temperature: options.temperature,
+        maxOutputTokens: options.maxOutputTokens
+      })
+    )
+  });
+  const text = await response.text();
+  if (!response.ok) throw new ModelHttpError(response.status, text);
+  return visionTextFromResponse(config.apiMode, text);
+};
+
 const postVisionRequest = async (
   request: AnalyzeImageRequest,
   config: EffectiveModelConfig,
   includeResponseFormat: boolean,
   extraInstruction = "",
   signal?: AbortSignal
-): Promise<string> => {
-  const response = await fetch(chatCompletionsEndpoint(config.apiBaseUrl), {
-    method: "POST",
-    signal,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey.trim()}`
-    },
-    body: JSON.stringify({
-      model: config.modelName,
-      temperature: 0.2,
-      ...(includeResponseFormat ? { response_format: { type: "json_object" } } : {}),
-      messages: [
-        {
-          role: "system",
-          content: `${buildSystemPrompt(request.strictGeneralization)}\n${extraInstruction}`
-        },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: buildUserPrompt() },
-            {
-              type: "image_url",
-              image_url: {
-                url: request.imageDataUrl
-              }
-            }
-          ]
-        }
-      ]
-    })
+): Promise<string> =>
+  postVisionModelRequest(config, {
+    systemPrompt: `${buildSystemPrompt(request.strictGeneralization)}\n${extraInstruction}`,
+    userText: buildUserPrompt(),
+    imageDataUrls: [request.imageDataUrl],
+    includeJsonFormat: includeResponseFormat,
+    temperature: 0.2,
+    signal
   });
-
-  const text = await response.text();
-  if (!response.ok) {
-    throw new ModelHttpError(response.status, text);
-  }
-
-  return completionTextFromResponse(text);
-};
 
 const postFusePromptRequest = async (
   request: FusePromptRequest,
@@ -326,61 +341,20 @@ const postFusePromptRequest = async (
     enforceChinese: false
   });
   const mode = request.mode === "information_layout" ? "information_layout" : "subject_reference";
-  const userContent: Array<
-    | { type: "text"; text: string }
-    | { type: "image_url"; image_url: { url: string } }
-  > = [
-    {
-      type: "text",
-      text: buildFuseUserPrompt(
-        JSON.stringify(normalizedStyleAnalysis, null, 2),
-        request.controls,
-        mode,
-        request.productInfoText,
-        request.editedTextMarkdown
-      )
-    }
-  ];
-
-  if (request.subjectImageDataUrl) {
-    userContent.push({
-      type: "image_url",
-      image_url: {
-        url: request.subjectImageDataUrl
-      }
-    });
-  }
-
-  const response = await fetch(chatCompletionsEndpoint(config.apiBaseUrl), {
-    method: "POST",
-    signal,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey.trim()}`
-    },
-    body: JSON.stringify({
-      model: config.modelName,
-      temperature: 0.2,
-      ...(includeResponseFormat ? { response_format: { type: "json_object" } } : {}),
-      messages: [
-        {
-          role: "system",
-          content: `${buildFuseSystemPrompt()}\n${extraInstruction}`
-        },
-        {
-          role: "user",
-          content: userContent
-        }
-      ]
-    })
+  return postVisionModelRequest(config, {
+    systemPrompt: `${buildFuseSystemPrompt()}\n${extraInstruction}`,
+    userText: buildFuseUserPrompt(
+      JSON.stringify(normalizedStyleAnalysis, null, 2),
+      request.controls,
+      mode,
+      request.productInfoText,
+      request.editedTextMarkdown
+    ),
+    imageDataUrls: request.subjectImageDataUrl ? [request.subjectImageDataUrl] : [],
+    includeJsonFormat: includeResponseFormat,
+    temperature: 0.2,
+    signal
   });
-
-  const text = await response.text();
-  if (!response.ok) {
-    throw new ModelHttpError(response.status, text);
-  }
-
-  return completionTextFromResponse(text);
 };
 
 const resolveImageEditAnnotations = async (
@@ -414,7 +388,7 @@ const resolveImageEditAnnotations = async (
   if (!config.apiKey.trim()) {
     return finalizeResponse(fallback("视觉分析模型尚未配置，请手动补齐修改对象、目标修改和保留项后逐项确认。"));
   }
-  const cacheKey = [contentHash, config.apiBaseUrl.trim(), config.modelName.trim()].join("\n");
+  const cacheKey = [contentHash, config.apiBaseUrl.trim(), config.apiMode, config.modelName.trim()].join("\n");
   const cached = imageEditAnnotationResolutionCache.get(cacheKey);
   if (cached) return finalizeResponse(cached);
   if (imageEditAnnotationResolutionsInFlight.has(cacheKey)) {
@@ -446,39 +420,16 @@ const resolveImageEditAnnotations = async (
     try {
       return await withAbortableRequest("annotation", async (signal) => {
         if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
-        const post = async (includeResponseFormat: boolean): Promise<string> => {
-          const response = await fetch(chatCompletionsEndpoint(config.apiBaseUrl), {
-            method: "POST",
-            signal,
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${config.apiKey.trim()}`
-            },
-            body: JSON.stringify({
-              model: config.modelName,
-              temperature: 0.1,
-              max_tokens: 4096,
-              ...(includeResponseFormat ? { response_format: { type: "json_object" } } : {}),
-              messages: [
-                { role: "system", content: systemPrompt },
-                {
-                  role: "user",
-                  content: [
-                    { type: "text", text: userText },
-                    {
-                      type: "image_url",
-                      image_url: { url: request.sourceImageModelDataUrl || request.sourceImageDataUrl }
-                    },
-                    { type: "image_url", image_url: { url: request.annotationImageDataUrl } }
-                  ]
-                }
-              ]
-            })
+        const post = (includeResponseFormat: boolean): Promise<string> =>
+          postVisionModelRequest(config, {
+            systemPrompt,
+            userText,
+            imageDataUrls: [request.sourceImageModelDataUrl || request.sourceImageDataUrl, request.annotationImageDataUrl],
+            includeJsonFormat: includeResponseFormat,
+            temperature: 0.1,
+            maxOutputTokens: 4096,
+            signal
           });
-          const responseText = await response.text();
-          if (!response.ok) throw new ModelHttpError(response.status, responseText);
-          return completionTextFromResponse(responseText);
-        };
         let rawText: string;
         try {
           rawText = await post(true);

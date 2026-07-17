@@ -4,15 +4,22 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import {
   ModelHttpError,
+  buildVisionModelPayload,
   chatCompletionsEndpoint,
   completionTextFromResponse,
   extractJsonText,
+  geminiGenerateContentEndpoint,
+  geminiTextFromResponse,
   modelRequestTimeoutMessage,
   modelRequestTimeoutMs,
   normalizeHistory,
   readJsonFile,
+  responsesEndpoint,
+  responsesTextFromResponse,
   shouldCacheImageEditAnnotationResolution,
   shouldRetryWithoutResponseFormat,
+  visionModelEndpoint,
+  visionRequestHeaders,
   writeJsonFile
 } from "./main-utils";
 
@@ -27,6 +34,92 @@ describe("main process model utilities", () => {
     expect(chatCompletionsEndpoint("https://api.example.com")).toBe(
       "https://api.example.com/chat/completions"
     );
+    expect(chatCompletionsEndpoint("https://api.example.com/v1/responses")).toBe(
+      "https://api.example.com/v1/chat/completions"
+    );
+    expect(responsesEndpoint("https://api.example.com/v1/chat/completions")).toBe(
+      "https://api.example.com/v1/responses"
+    );
+    expect(geminiGenerateContentEndpoint("https://api.example.com/v1beta", "gemini-2.5-flash")).toBe(
+      "https://api.example.com/v1beta/models/gemini-2.5-flash:generateContent"
+    );
+    expect(
+      visionModelEndpoint(
+        "https://api.example.com/v1beta/models/old-model:generateContent",
+        "gemini",
+        "gemini-2.5-flash"
+      )
+    ).toBe("https://api.example.com/v1beta/models/gemini-2.5-flash:generateContent");
+  });
+
+  it("builds Responses and Gemini native vision payloads without exposing keys", () => {
+    const responsesPayload = buildVisionModelPayload({
+      apiMode: "responses",
+      modelName: "gpt-5.5",
+      systemPrompt: "只返回 JSON",
+      userText: "分析图片",
+      imageDataUrls: ["data:image/png;base64,YWJj"],
+      includeJsonFormat: true,
+      temperature: 0.2,
+      maxOutputTokens: 4096
+    });
+    expect(responsesPayload).toMatchObject({
+      model: "gpt-5.5",
+      store: false,
+      max_output_tokens: 4096,
+      text: { format: { type: "json_object" } },
+      input: [
+        { role: "system", content: [{ type: "input_text", text: "只返回 JSON" }] },
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "分析图片" },
+            { type: "input_image", image_url: "data:image/png;base64,YWJj" }
+          ]
+        }
+      ]
+    });
+
+    const geminiPayload = buildVisionModelPayload({
+      apiMode: "gemini",
+      modelName: "gemini-2.5-flash",
+      systemPrompt: "只返回 JSON",
+      userText: "分析图片",
+      imageDataUrls: ["data:image/jpeg;base64,YWJj"],
+      includeJsonFormat: true,
+      temperature: 0.1
+    });
+    expect(geminiPayload).toMatchObject({
+      systemInstruction: { parts: [{ text: "只返回 JSON" }] },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: "分析图片" },
+            { inlineData: { mimeType: "image/jpeg", data: "YWJj" } }
+          ]
+        }
+      ],
+      generationConfig: { temperature: 0.1, responseMimeType: "application/json" }
+    });
+    expect(JSON.stringify(geminiPayload)).not.toContain("api-key");
+  });
+
+  it("uses the correct auth header for Gemini official and compatible proxy endpoints", () => {
+    expect(
+      visionRequestHeaders(
+        "gemini",
+        "google-key",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+      )
+    ).toMatchObject({ "x-goog-api-key": "google-key" });
+    expect(
+      visionRequestHeaders(
+        "gemini",
+        "proxy-key",
+        "https://api.example.com/v1beta/models/gemini-2.5-flash:generateContent"
+      )
+    ).toMatchObject({ Authorization: "Bearer proxy-key" });
   });
 
   it("extracts JSON from fenced, explained, and pure responses", () => {
@@ -47,6 +140,19 @@ describe("main process model utilities", () => {
     expect(() => completionTextFromResponse(JSON.stringify({ choices: [] }))).toThrow(
       "模型返回中没有可解析的文本内容"
     );
+  });
+
+  it("reads text content from Responses and Gemini native responses", () => {
+    expect(
+      responsesTextFromResponse(
+        JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: "{\"ok\":true}" }] }] })
+      )
+    ).toBe("{\"ok\":true}");
+    expect(
+      geminiTextFromResponse(
+        JSON.stringify({ candidates: [{ content: { parts: [{ text: "{\"ok\":true}" }] } }] })
+      )
+    ).toBe("{\"ok\":true}");
   });
 
   it("falls back without response_format for 4xx response-format attempts", () => {

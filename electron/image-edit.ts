@@ -39,18 +39,29 @@ import {
 import { CodexAuthState, getCodexAuthStatus, loadCodexAuthState, refreshCodexAuthState } from "./codex-auth";
 import { buildCodexHeaders } from "./codex-request";
 import {
+  buildChatCompletionsImagePayload,
   buildCodexResponsesPayload,
+  buildGeminiImagePayload,
   buildImagesGenerationPayload,
   buildOpenRouterImagesPayload,
   buildResponsesPayload,
   generationEndpoint,
   openRouterImagesEndpoint,
   parseGenerationOutputDimensions,
+  parseChatCompletionsImageResponse,
+  parseGeminiImageResponse,
   parseImagesResponse,
   parseOpenRouterImagesResponse,
   parseResponsesImageResponse
 } from "./generation";
-import { ModelHttpError, readJsonFile, writeJsonFile } from "./main-utils";
+import {
+  geminiGenerateContentEndpoint,
+  isGoogleGeminiEndpoint,
+  ModelHttpError,
+  readJsonFile,
+  visionRequestHeaders,
+  writeJsonFile
+} from "./main-utils";
 
 type ImageEditRunnerOutput = Omit<ImageEditOutput, "id" | "createdAt" | "assetFileName">;
 type ImageEditTaskRunner = (task: ImageEditTask, signal: AbortSignal) => Promise<ImageEditRunnerOutput[]>;
@@ -285,6 +296,11 @@ const decryptStoredApiKey = (
 
 const normalizeMainModel = (value: string | undefined): string => value?.trim() || DEFAULT_MAIN_MODEL;
 
+const normalizeGenerationApiMode = (apiMode: GenerationApiMode | undefined): GenerationApiMode => {
+  if (apiMode === "responses" || apiMode === "chat_completions" || apiMode === "gemini") return apiMode;
+  return "images";
+};
+
 const normalizeStoredImageEditBackend = (stored: StoredGenerationConfigForImageEdit): EffectiveImageEditBackend => {
   const legacyApiKey = decryptStoredApiKey(stored);
   const providers = Array.isArray(stored.providers)
@@ -302,7 +318,7 @@ const normalizeStoredImageEditBackend = (stored: StoredGenerationConfigForImageE
               provider.apiBaseUrl?.trim() ||
               (providerType === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : "https://api.openai.com/v1"),
             apiKey: decryptStoredApiKey(provider),
-            apiMode: providerType === "openrouter" ? "images" : provider.apiMode === "responses" ? "responses" : "images",
+            apiMode: providerType === "openrouter" ? "images" : normalizeGenerationApiMode(provider.apiMode),
             imageModel:
               provider.imageModel?.trim() ||
               (providerType === "openrouter" ? DEFAULT_OPENROUTER_IMAGE_MODEL : "gpt-image-2"),
@@ -331,7 +347,7 @@ const normalizeStoredImageEditBackend = (stored: StoredGenerationConfigForImageE
       stored.apiBaseUrl?.trim() ||
       (providerType === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : "https://api.openai.com/v1"),
     apiKey: legacyApiKey,
-    apiMode: providerType === "openrouter" ? "images" : stored.apiMode === "responses" ? "responses" : "images",
+    apiMode: providerType === "openrouter" ? "images" : normalizeGenerationApiMode(stored.apiMode),
     imageModel:
       stored.imageModel?.trim() ||
       (providerType === "openrouter" ? DEFAULT_OPENROUTER_IMAGE_MODEL : "gpt-image-2"),
@@ -454,16 +470,20 @@ const requestJson = async (
   apiKey: string,
   payload: Record<string, unknown>,
   signal: AbortSignal,
-  accept = "application/json"
+  accept = "application/json",
+  authMode: "bearer" | "gemini" = "bearer"
 ): Promise<string> => {
   const response = await fetch(url, {
     method: "POST",
     signal,
-    headers: {
-      "Content-Type": "application/json",
-      Accept: accept,
-      Authorization: `Bearer ${apiKey}`
-    },
+    headers:
+      authMode === "gemini"
+        ? { ...visionRequestHeaders("gemini", apiKey, url), Accept: accept }
+        : {
+            "Content-Type": "application/json",
+            Accept: accept,
+            Authorization: `Bearer ${apiKey}`
+          },
     body: JSON.stringify(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)))
   });
   const text = await response.text();
@@ -1343,6 +1363,40 @@ export class ImageEditService {
     }
     if (backend.providerType === "openrouter") {
       return requestOpenRouterImageEdit(backend, task.finalPrompt, settings, originalReferences, signal);
+    }
+    if (backend.apiMode === "gemini") {
+      const results: ImageEditRunnerOutput[] = [];
+      const endpoint = geminiGenerateContentEndpoint(backend.apiBaseUrl, backend.imageModel);
+      for (let index = 0; index < task.settings.n && results.length < task.settings.n; index += 1) {
+        const responseText = await requestJson(
+          endpoint,
+          backend.apiKey,
+          buildGeminiImagePayload(
+            task.finalPrompt,
+            settings,
+            originalReferences,
+            isGoogleGeminiEndpoint(endpoint)
+          ),
+          signal,
+          "application/json",
+          "gemini"
+        );
+        results.push(...parseGeminiImageResponse(responseText, settings));
+      }
+      return results.slice(0, task.settings.n);
+    }
+    if (backend.apiMode === "chat_completions") {
+      const results: ImageEditRunnerOutput[] = [];
+      for (let index = 0; index < task.settings.n && results.length < task.settings.n; index += 1) {
+        const responseText = await requestJson(
+          generationEndpoint(backend.apiBaseUrl, "chat/completions"),
+          backend.apiKey,
+          buildChatCompletionsImagePayload(task.finalPrompt, settings, originalReferences),
+          signal
+        );
+        results.push(...(await parseChatCompletionsImageResponse(responseText, backend.apiKey, settings)));
+      }
+      return results.slice(0, task.settings.n);
     }
     if (backend.apiMode === "responses") {
       const results: ImageEditRunnerOutput[] = [];

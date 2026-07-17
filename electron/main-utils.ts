@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { normalizeFusedPromptResult, normalizeStyleAnalysis } from "../src/shared/schema";
-import type { HistoryItem, ImageEditAnnotationResolveResponse } from "../src/shared/types";
+import type { HistoryItem, ImageEditAnnotationResolveResponse, VisionApiMode } from "../src/shared/types";
 
 export type ModelRequestKind = "analyze" | "fuse" | "annotation";
 
@@ -201,10 +201,128 @@ export const normalizeHistoryItemForStorage = (item: HistoryItem): HistoryItem =
   return normalizedItem;
 };
 
-export const chatCompletionsEndpoint = (baseUrl: string): string => {
+const normalizeVisionBaseUrl = (baseUrl: string): string =>
+  baseUrl
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/(?:chat\/completions|responses)$/i, "");
+
+export const chatCompletionsEndpoint = (baseUrl: string): string =>
+  `${normalizeVisionBaseUrl(baseUrl)}/chat/completions`;
+
+export const responsesEndpoint = (baseUrl: string): string => `${normalizeVisionBaseUrl(baseUrl)}/responses`;
+
+export const geminiGenerateContentEndpoint = (baseUrl: string, modelName: string): string => {
   const normalized = baseUrl.trim().replace(/\/+$/, "");
-  if (normalized.endsWith("/chat/completions")) return normalized;
-  return `${normalized}/chat/completions`;
+  const fullEndpoint = normalized.match(/^(.*\/models\/)[^/]+(:generateContent)$/i);
+  if (fullEndpoint) return `${fullEndpoint[1]}${encodeURIComponent(modelName.trim())}${fullEndpoint[2]}`;
+  return `${normalized}/models/${encodeURIComponent(modelName.trim())}:generateContent`;
+};
+
+export const visionModelEndpoint = (baseUrl: string, apiMode: VisionApiMode, modelName: string): string => {
+  if (apiMode === "responses") return responsesEndpoint(baseUrl);
+  if (apiMode === "gemini") return geminiGenerateContentEndpoint(baseUrl, modelName);
+  return chatCompletionsEndpoint(baseUrl);
+};
+
+export const visionRequestHeaders = (
+  apiMode: VisionApiMode,
+  apiKey: string,
+  endpoint: string
+): Record<string, string> => {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json"
+  };
+  if (apiMode === "gemini" && isGoogleGeminiEndpoint(endpoint)) {
+    headers["x-goog-api-key"] = apiKey;
+  } else {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  return headers;
+};
+
+export const isGoogleGeminiEndpoint = (endpoint: string): boolean =>
+  new URL(endpoint).hostname.toLowerCase().endsWith("googleapis.com");
+
+interface VisionModelPayloadOptions {
+  apiMode: VisionApiMode;
+  modelName: string;
+  systemPrompt: string;
+  userText: string;
+  imageDataUrls: string[];
+  includeJsonFormat: boolean;
+  temperature: number;
+  maxOutputTokens?: number;
+}
+
+const geminiInlineImage = (dataUrl: string): { inlineData: { mimeType: string; data: string } } => {
+  const match = dataUrl.match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i);
+  if (!match) throw new Error("Gemini 原生识图只支持 base64 图片数据。");
+  return {
+    inlineData: {
+      mimeType: match[1],
+      data: match[2].replace(/\s/g, "")
+    }
+  };
+};
+
+export const buildVisionModelPayload = (options: VisionModelPayloadOptions): Record<string, unknown> => {
+  if (options.apiMode === "responses") {
+    return {
+      model: options.modelName,
+      store: false,
+      ...(options.maxOutputTokens ? { max_output_tokens: options.maxOutputTokens } : {}),
+      ...(options.includeJsonFormat ? { text: { format: { type: "json_object" } } } : {}),
+      input: [
+        {
+          role: "system",
+          content: [{ type: "input_text", text: options.systemPrompt }]
+        },
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: options.userText },
+            ...options.imageDataUrls.map((imageUrl) => ({ type: "input_image", image_url: imageUrl }))
+          ]
+        }
+      ]
+    };
+  }
+
+  if (options.apiMode === "gemini") {
+    return {
+      systemInstruction: { parts: [{ text: options.systemPrompt }] },
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: options.userText }, ...options.imageDataUrls.map(geminiInlineImage)]
+        }
+      ],
+      generationConfig: {
+        temperature: options.temperature,
+        ...(options.maxOutputTokens ? { maxOutputTokens: options.maxOutputTokens } : {}),
+        ...(options.includeJsonFormat ? { responseMimeType: "application/json" } : {})
+      }
+    };
+  }
+
+  return {
+    model: options.modelName,
+    temperature: options.temperature,
+    ...(options.maxOutputTokens ? { max_tokens: options.maxOutputTokens } : {}),
+    ...(options.includeJsonFormat ? { response_format: { type: "json_object" } } : {}),
+    messages: [
+      { role: "system", content: options.systemPrompt },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: options.userText },
+          ...options.imageDataUrls.map((imageUrl) => ({ type: "image_url", image_url: { url: imageUrl } }))
+        ]
+      }
+    ]
+  };
 };
 
 export const extractJsonText = (text: string): string => {
@@ -244,6 +362,56 @@ export const completionTextFromResponse = (text: string): string => {
   }
 
   throw new Error("模型返回中没有可解析的文本内容。");
+};
+
+export const responsesTextFromResponse = (text: string): string => {
+  let payload: {
+    output_text?: string;
+    output?: Array<{ content?: Array<{ text?: string; output_text?: string }> }>;
+    choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
+  };
+  try {
+    payload = JSON.parse(text) as typeof payload;
+  } catch {
+    throw new Error("模型接口返回不是有效 JSON。");
+  }
+
+  if (typeof payload.output_text === "string" && payload.output_text.trim()) return payload.output_text;
+  const outputText = (payload.output || [])
+    .flatMap((item) => item.content || [])
+    .map((part) => part.text || part.output_text || "")
+    .filter(Boolean)
+    .join("\n");
+  if (outputText) return outputText;
+  if (payload.choices) return completionTextFromResponse(text);
+  throw new Error("Responses 模型返回中没有可解析的文本内容。");
+};
+
+export const geminiTextFromResponse = (text: string): string => {
+  let payload: {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
+  };
+  try {
+    payload = JSON.parse(text) as typeof payload;
+  } catch {
+    throw new Error("模型接口返回不是有效 JSON。");
+  }
+
+  const candidateText = (payload.candidates || [])
+    .flatMap((candidate) => candidate.content?.parts || [])
+    .map((part) => part.text || "")
+    .filter(Boolean)
+    .join("\n");
+  if (candidateText) return candidateText;
+  if (payload.choices) return completionTextFromResponse(text);
+  throw new Error("Gemini 模型返回中没有可解析的文本内容。");
+};
+
+export const visionTextFromResponse = (apiMode: VisionApiMode, text: string): string => {
+  if (apiMode === "responses") return responsesTextFromResponse(text);
+  if (apiMode === "gemini") return geminiTextFromResponse(text);
+  return completionTextFromResponse(text);
 };
 
 export const shouldRetryFusedPrompt = (message: string): boolean =>

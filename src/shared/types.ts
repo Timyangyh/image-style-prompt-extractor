@@ -11,19 +11,23 @@ export type ImagePrimaryType =
 
 export interface ModelConfig {
   apiBaseUrl: string;
+  apiMode: VisionApiMode;
   modelName: string;
   saveApiKey: boolean;
   hasApiKey: boolean;
 }
 
+export type VisionApiMode = "chat_completions" | "responses" | "gemini";
+
 export interface ModelConfigUpdate {
   apiBaseUrl: string;
+  apiMode: VisionApiMode;
   apiKey: string;
   modelName: string;
   saveApiKey: boolean;
 }
 
-export type GenerationApiMode = "images" | "responses";
+export type GenerationApiMode = "images" | "responses" | "chat_completions" | "gemini";
 export type GenerationAuthSource = "api" | "codex_oauth";
 export type GenerationProviderType = "openai_compatible" | "openrouter";
 export type GenerationResolution = "1k" | "2k" | "4k";

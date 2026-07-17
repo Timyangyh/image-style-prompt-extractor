@@ -214,7 +214,7 @@ const writeGenerationConfig = async (
   rootDir: string,
   provider: {
     providerType: "openai_compatible" | "openrouter";
-    apiMode: "images" | "responses";
+    apiMode: "images" | "responses" | "chat_completions" | "gemini";
     apiBaseUrl: string;
     imageModel: string;
   }
@@ -747,6 +747,103 @@ describe("ImageEditService model routing", () => {
       const inputImages = payload.input[0].content.filter((item) => item.type === "input_image");
       expect(inputImages).toHaveLength(1);
       expect(inputImages[0]).toMatchObject({ image_url: dataUrl(64, 64) });
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("routes Chat Completions origin regeneration with only original references", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-origin-chat-route-"));
+    const outputBase64 = pngBytes(864, 1536).toString("base64");
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            choices: [{ message: { content: `![image](data:image/png;base64,${outputBase64})` } }]
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await writeGenerationConfig(rootDir, {
+        providerType: "openai_compatible",
+        apiMode: "chat_completions",
+        apiBaseUrl: "https://api.example.com/v1",
+        imageModel: "gemini-3.1-flash-image"
+      });
+      const service = new ImageEditService(rootDir, { concurrency: 1 });
+      const task = await service.createTask(createOriginRegenerationRequest());
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && !["queued", "running"].includes(item.status))
+      );
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe("https://api.example.com/v1/chat/completions");
+      const payload = JSON.parse(String(init.body)) as {
+        n?: number;
+        messages: Array<{ content: Array<Record<string, unknown>> }>;
+      };
+      expect(payload.n).toBeUndefined();
+      const serializedPayload = JSON.stringify(payload);
+      expect(serializedPayload).toContain(dataUrl(64, 64));
+      expect(serializedPayload).not.toContain(dataUrl(1915, 821));
+      expect(serializedPayload).not.toMatch(/mask|input_fidelity/);
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("routes Gemini native origin regeneration through a Bearer-auth compatible proxy", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-origin-gemini-route-"));
+    const outputBase64 = pngBytes(864, 1536).toString("base64");
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            candidates: [
+              { content: { parts: [{ inlineData: { mimeType: "image/png", data: outputBase64 } }] } }
+            ]
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await writeGenerationConfig(rootDir, {
+        providerType: "openai_compatible",
+        apiMode: "gemini",
+        apiBaseUrl: "https://api.example.com/v1beta",
+        imageModel: "gemini-3.1-flash-image"
+      });
+      const service = new ImageEditService(rootDir, { concurrency: 1 });
+      const task = await service.createTask(createOriginRegenerationRequest());
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && !["queued", "running"].includes(item.status))
+      );
+
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe("https://api.example.com/v1beta/models/gemini-3.1-flash-image:generateContent");
+      const headers = new Headers(init.headers);
+      expect(headers.get("authorization")).toBe("Bearer test-key");
+      expect(headers.get("x-goog-api-key")).toBeNull();
+      const payload = JSON.parse(String(init.body)) as {
+        contents: Array<{ parts: Array<Record<string, unknown>> }>;
+        generationConfig: Record<string, unknown>;
+      };
+      const serializedPayload = JSON.stringify(payload);
+      expect(serializedPayload).toContain(dataUrl(64, 64).split(",")[1]);
+      expect(serializedPayload).not.toContain(dataUrl(1915, 821).split(",")[1]);
+      expect(serializedPayload).not.toMatch(/mask|input_fidelity/);
+      expect(payload.contents[0].parts[0]).toMatchObject({ text: expect.stringContaining("第一次生图的原始融合提示词") });
+      expect(payload.generationConfig).toMatchObject({
+        responseModalities: ["TEXT", "IMAGE"],
+        imageConfig: { aspectRatio: "21:9", imageSize: "2K" }
+      });
+      expect(payload.generationConfig.responseFormat).toBeUndefined();
     } finally {
       vi.unstubAllGlobals();
       await rm(rootDir, { recursive: true, force: true });

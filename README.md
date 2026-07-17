@@ -6,7 +6,14 @@
 
 如果需要分析网页或应用界面，可以先截图，然后直接粘贴或上传到应用中分析。项目不包含 Chrome 浏览器插件或自动网页采集服务。
 
-## 当前版本：v1.1.4
+## 当前版本：v1.1.5
+
+- 识图新增 OpenAI Responses 和 Gemini 原生 `generateContent` 协议，并保留 OpenAI Chat Completions 兼容方式。
+- 生图与改图新增 Gemini 原生协议，并支持 OpenAI-compatible Images、Responses 和 Chat Completions。
+- 配置界面把认证方式和调用协议分开显示，并为各协议补充简短的选择说明。
+- 同步刷新 Apple Silicon macOS 与 Windows x64 本地安装包，避免旧版界面与新版协议配置混用。
+
+### v1.1.4
 
 - Windows 改图清单会把纯删除文字正确识别为删除操作，不再因缺少“新文字”而禁用确认按钮。
 - macOS 现有确认门禁和改图流程保持不变。
@@ -122,7 +129,13 @@ Windows 包当前未做商业代码签名。下载后可使用 Release 附带的
 
 ### 配置模型
 
-图片分析流程使用 OpenAI-compatible Chat Completions Vision 接口。进入“模型配置”填写：
+图片分析流程可在“模型配置”中选择平台实际提供的识图协议：
+
+- OpenAI-compatible Chat Completions，多数兼容平台使用。
+- OpenAI Responses，多模态输入使用 `/responses` 的平台使用。
+- Gemini 原生 `generateContent`，Google Gemini 官方或兼容中转平台使用。
+
+选择协议后填写：
 
 - API Base URL，例如 `https://api.openai.com/v1`
 - Model Name，例如 `gpt-4o-mini`
@@ -133,6 +146,8 @@ Windows 包当前未做商业代码签名。下载后可使用 Release 附带的
 - Codex OAuth 本机登录：复用本机 `codex login` 状态，页面只显示是否可用，不接触明文 token。
 - OpenAI-compatible Images API。
 - OpenAI-compatible Responses 图像工具。
+- OpenAI-compatible Chat Completions 生图接口。
+- Gemini 原生 `generateContent` 生图/改图接口。
 - OpenRouter Images API 供应商。
 
 API Key 和 OAuth token 只应在 Electron 主进程和本机配置中使用，不应提交到仓库、issue、日志或截图。

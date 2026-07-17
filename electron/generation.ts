@@ -24,7 +24,14 @@ import {
 } from "../src/shared/generation-size";
 import { CodexAuthState, getCodexAuthStatus, loadCodexAuthState, refreshCodexAuthState } from "./codex-auth";
 import { buildCodexHeaders } from "./codex-request";
-import { ModelHttpError, readJsonFile, writeJsonFile } from "./main-utils";
+import {
+  geminiGenerateContentEndpoint,
+  isGoogleGeminiEndpoint,
+  ModelHttpError,
+  readJsonFile,
+  visionRequestHeaders,
+  writeJsonFile
+} from "./main-utils";
 
 interface EffectiveGenerationConfig {
   authSource: GenerationConfig["authSource"];
@@ -246,11 +253,16 @@ const encryptApiKey = (apiKey: string): string => {
 const normalizeProviderType = (providerType: GenerationProviderType | undefined): GenerationProviderType =>
   providerType === "openrouter" ? "openrouter" : "openai_compatible";
 
+const normalizeGenerationApiMode = (apiMode: GenerationConfig["apiMode"] | undefined): GenerationConfig["apiMode"] => {
+  if (apiMode === "responses" || apiMode === "chat_completions" || apiMode === "gemini") return apiMode;
+  return "images";
+};
+
 export const normalizeGenerationBaseUrl = (baseUrl: string): string => {
   const raw = (baseUrl || defaultConfig.apiBaseUrl).trim().replace(/\/+$/, "");
   const parsed = new URL(raw || defaultConfig.apiBaseUrl);
   let path = parsed.pathname.replace(/\/+$/, "");
-  for (const suffix of ["/responses", "/images/generations", "/images/edits", "/images"]) {
+  for (const suffix of ["/chat/completions", "/responses", "/images/generations", "/images/edits", "/images"]) {
     if (path.endsWith(suffix)) {
       path = path.slice(0, -suffix.length);
       break;
@@ -264,7 +276,7 @@ export const normalizeGenerationBaseUrl = (baseUrl: string): string => {
 
 export const generationEndpoint = (
   baseUrl: string,
-  kind: "images/generations" | "images/edits" | "responses"
+  kind: "images/generations" | "images/edits" | "responses" | "chat/completions"
 ): string => `${normalizeGenerationBaseUrl(baseUrl)}/${kind}`;
 
 export const openRouterImagesEndpoint = (baseUrl: string): string => `${normalizeGenerationBaseUrl(baseUrl)}/images`;
@@ -559,7 +571,7 @@ const normalizeStoredProviders = (
               provider.apiBaseUrl?.trim() ||
               (providerType === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : legacyProvider.apiBaseUrl),
             apiKey: decryptStoredProviderApiKey(provider),
-            apiMode: providerType === "openrouter" ? "images" : provider.apiMode === "responses" ? "responses" : "images",
+            apiMode: providerType === "openrouter" ? "images" : normalizeGenerationApiMode(provider.apiMode),
             imageModel:
               provider.imageModel?.trim() ||
               (providerType === "openrouter" ? DEFAULT_OPENROUTER_IMAGE_MODEL : legacyProvider.imageModel),
@@ -581,12 +593,7 @@ const normalizeStoredProviders = (
       apiBaseUrl:
         stored.apiBaseUrl?.trim() ||
         (legacyProviderType === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : legacyProvider.apiBaseUrl),
-      apiMode:
-        legacyProviderType === "openrouter"
-          ? "images"
-          : stored.apiMode === "responses"
-            ? "responses"
-            : legacyProvider.apiMode,
+      apiMode: legacyProviderType === "openrouter" ? "images" : normalizeGenerationApiMode(stored.apiMode),
       imageModel:
         stored.imageModel?.trim() ||
         (legacyProviderType === "openrouter" ? DEFAULT_OPENROUTER_IMAGE_MODEL : legacyProvider.imageModel),
@@ -649,6 +656,77 @@ export const buildResponsesPayload = (
         content
       }
     ]
+  };
+};
+
+const chatImageSize = (resolution: GenerationRequestSettings["resolution"]): "1K" | "2K" | "4K" => {
+  if (resolution === "4k") return "4K";
+  if (resolution === "2k") return "2K";
+  return "1K";
+};
+
+export const buildChatCompletionsImagePayload = (
+  prompt: string,
+  settings: GenerationRequestSettings,
+  referenceImageDataUrls: string[]
+): Record<string, unknown> => {
+  const content: Array<Record<string, unknown>> = [{ type: "text", text: prompt }];
+  referenceImageDataUrls.forEach((imageUrl) => {
+    content.push({ type: "image_url", image_url: { url: imageUrl } });
+  });
+  const geminiImageConfig = settings.imageModel.toLowerCase().includes("gemini")
+    ? {
+        extra_body: {
+          google: {
+            image_config: {
+              aspect_ratio: settings.aspectRatio,
+              image_size: chatImageSize(settings.resolution)
+            }
+          }
+        }
+      }
+    : {};
+  return {
+    model: settings.imageModel,
+    stream: false,
+    messages: [{ role: "user", content }],
+    ...geminiImageConfig
+  };
+};
+
+const geminiInlineImagePart = (dataUrl: string): Record<string, unknown> => {
+  const { mimeType, buffer } = dataUrlToBuffer(dataUrl);
+  return {
+    inlineData: {
+      mimeType,
+      data: buffer.toString("base64")
+    }
+  };
+};
+
+export const buildGeminiImagePayload = (
+  prompt: string,
+  settings: GenerationRequestSettings,
+  referenceImageDataUrls: string[],
+  useGoogleResponseFormat = false
+): Record<string, unknown> => {
+  const imageConfig: Record<string, string> = {
+    aspectRatio: settings.aspectRatio
+  };
+  if (!settings.imageModel.toLowerCase().includes("gemini-2.5")) {
+    imageConfig.imageSize = chatImageSize(settings.resolution);
+  }
+  return {
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: prompt }, ...referenceImageDataUrls.map(geminiInlineImagePart)]
+      }
+    ],
+    generationConfig: {
+      responseModalities: ["TEXT", "IMAGE"],
+      ...(useGoogleResponseFormat ? { responseFormat: { image: imageConfig } } : { imageConfig })
+    }
   };
 };
 
@@ -732,16 +810,20 @@ const requestJson = async (
   apiKey: string,
   payload: Record<string, unknown>,
   signal: AbortSignal,
-  accept = "application/json"
+  accept = "application/json",
+  authMode: "bearer" | "gemini" = "bearer"
 ): Promise<string> => {
   const response = await fetch(url, {
     method: "POST",
     signal,
-    headers: {
-      "Content-Type": "application/json",
-      Accept: accept,
-      Authorization: `Bearer ${apiKey}`
-    },
+    headers:
+      authMode === "gemini"
+        ? { ...visionRequestHeaders("gemini", apiKey, url), Accept: accept }
+        : {
+            "Content-Type": "application/json",
+            Accept: accept,
+            Authorization: `Bearer ${apiKey}`
+          },
     body: JSON.stringify(Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)))
   });
   const text = await response.text();
@@ -1072,6 +1154,223 @@ export const parseImagesResponse = async (
   return results;
 };
 
+interface ChatImageCandidate {
+  value: string;
+  mimeType?: string;
+  base64?: boolean;
+}
+
+const addChatImageTextCandidates = (text: string, results: ChatImageCandidate[]): void => {
+  const trimmed = text.trim();
+  if (/^(?:data:image\/|https?:\/\/)/i.test(trimmed) && !/\s/.test(trimmed)) {
+    results.push({ value: trimmed });
+  }
+  for (const match of text.matchAll(/!\[[^\]]*\]\((data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=]+|https?:\/\/[^\s)]+)\)/gi)) {
+    results.push({ value: match[1] });
+  }
+  for (const match of text.matchAll(/data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=]+/gi)) {
+    results.push({ value: match[0] });
+  }
+};
+
+const collectChatImageCandidates = (value: unknown, results: ChatImageCandidate[]): void => {
+  if (typeof value === "string") {
+    addChatImageTextCandidates(value, results);
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectChatImageCandidates(item, results));
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const recordType = String(record.type || "").toLowerCase();
+  if (typeof record.b64_json === "string") {
+    results.push({ value: record.b64_json, base64: true });
+  }
+  const inlineData =
+    record.inline_data && typeof record.inline_data === "object"
+      ? (record.inline_data as Record<string, unknown>)
+      : record.inlineData && typeof record.inlineData === "object"
+        ? (record.inlineData as Record<string, unknown>)
+        : null;
+  if (inlineData && typeof inlineData.data === "string") {
+    results.push({
+      value: inlineData.data,
+      mimeType:
+        typeof inlineData.mime_type === "string"
+          ? inlineData.mime_type
+          : typeof inlineData.mimeType === "string"
+            ? inlineData.mimeType
+            : undefined,
+      base64: true
+    });
+  }
+  if (!inlineData && recordType.includes("image") && typeof record.data === "string") {
+    results.push({
+      value: record.data,
+      mimeType:
+        typeof record.mime_type === "string"
+          ? record.mime_type
+          : typeof record.mimeType === "string"
+            ? record.mimeType
+            : undefined,
+      base64: true
+    });
+  }
+
+  const imageUrl = record.image_url;
+  if (typeof imageUrl === "string") addChatImageTextCandidates(imageUrl, results);
+  if (imageUrl && typeof imageUrl === "object") {
+    collectChatImageCandidates((imageUrl as Record<string, unknown>).url, results);
+  }
+  if (typeof record.imageUrl === "string") addChatImageTextCandidates(record.imageUrl, results);
+  if (typeof record.url === "string" && recordType.includes("image")) {
+    addChatImageTextCandidates(record.url, results);
+  }
+  if (typeof record.text === "string") addChatImageTextCandidates(record.text, results);
+  collectChatImageCandidates(record.content, results);
+  collectChatImageCandidates(record.images, results);
+  collectChatImageCandidates(record.data, results);
+};
+
+export const parseChatCompletionsImageResponse = async (
+  text: string,
+  apiKey: string,
+  fallback: Pick<GenerationRequestSettings, "outputFormat" | "size" | "quality" | "background">
+): Promise<ImageResult[]> => {
+  let payload: {
+    choices?: Array<{ message?: { content?: unknown; images?: unknown } }>;
+    data?: unknown;
+    b64_json?: string;
+    image_url?: unknown;
+    usage?: Record<string, unknown>;
+    error?: { code?: string; type?: string; message?: string };
+  };
+  try {
+    payload = JSON.parse(text) as typeof payload;
+  } catch {
+    throw new Error("Chat Completions 生图接口返回不是有效 JSON。");
+  }
+  if (payload.error) {
+    throw new Error(payload.error.message || payload.error.code || payload.error.type || "Chat Completions 生图接口返回错误。");
+  }
+
+  const candidates: ChatImageCandidate[] = [];
+  (payload.choices || []).forEach((choice) => {
+    collectChatImageCandidates(choice.message?.content, candidates);
+    collectChatImageCandidates(choice.message?.images, candidates);
+  });
+  if (Array.isArray(payload.data)) {
+    payload.data.forEach((item) =>
+      collectChatImageCandidates(
+        item && typeof item === "object" ? { type: "image", ...(item as Record<string, unknown>) } : item,
+        candidates
+      )
+    );
+  } else {
+    collectChatImageCandidates(payload.data, candidates);
+  }
+  collectChatImageCandidates(
+    { b64_json: payload.b64_json, image_url: payload.image_url, type: "image" },
+    candidates
+  );
+
+  const uniqueCandidates = candidates.filter(
+    (candidate, index) => candidates.findIndex((item) => item.value === candidate.value) === index
+  );
+  const results: ImageResult[] = [];
+  for (const candidate of uniqueCandidates) {
+    const fallbackMimeType = outputMimeType(fallback.outputFormat);
+    let mimeType = candidate.mimeType || fallbackMimeType;
+    let dataUrl = "";
+    if (candidate.base64) {
+      dataUrl = `data:${mimeType};base64,${candidate.value.replace(/\s/g, "")}`;
+    } else if (candidate.value.startsWith("data:image/")) {
+      dataUrl = candidate.value;
+      mimeType = candidate.value.match(/^data:([^;,]+)/i)?.[1] || mimeType;
+    } else if (candidate.value.startsWith("http://") || candidate.value.startsWith("https://")) {
+      dataUrl = dataUrlFromBytes(await downloadImageUrl(candidate.value, apiKey), mimeType);
+    }
+    if (!dataUrl) continue;
+    results.push(
+      withVerifiedDimensions(
+        {
+          dataUrl,
+          mimeType,
+          size: fallback.size,
+          quality: fallback.quality,
+          background: fallback.background,
+          usage: payload.usage
+        },
+        fallback.size
+      )
+    );
+  }
+  if (!results.length) throw new Error("Chat Completions 生图接口没有返回可用图片。");
+  return results;
+};
+
+export const parseGeminiImageResponse = (
+  text: string,
+  fallback: Pick<GenerationRequestSettings, "outputFormat" | "size" | "quality" | "background">
+): ImageResult[] => {
+  let payload: {
+    candidates?: Array<{ content?: { parts?: Array<Record<string, unknown>> }; finishReason?: string }>;
+    usageMetadata?: Record<string, unknown>;
+    promptFeedback?: { blockReason?: string };
+    error?: { code?: string | number; status?: string; message?: string };
+  };
+  try {
+    payload = JSON.parse(text) as typeof payload;
+  } catch {
+    throw new Error("Gemini 原生生图接口返回不是有效 JSON。");
+  }
+  if (payload.error) {
+    throw new Error(
+      payload.error.message || payload.error.status || String(payload.error.code || "Gemini 原生生图接口返回错误。")
+    );
+  }
+
+  const candidates: ChatImageCandidate[] = [];
+  (payload.candidates || []).forEach((candidate) => {
+    (candidate.content?.parts || [])
+      .filter((part) => part.thought !== true)
+      .forEach((part) => collectChatImageCandidates(part, candidates));
+  });
+  const uniqueCandidates = candidates.filter(
+    (candidate, index) => candidates.findIndex((item) => item.value === candidate.value) === index
+  );
+  const results = uniqueCandidates.flatMap((candidate): ImageResult[] => {
+    if (!candidate.base64) return [];
+    const mimeType = candidate.mimeType || outputMimeType(fallback.outputFormat);
+    return [
+      withVerifiedDimensions(
+        {
+          dataUrl: `data:${mimeType};base64,${candidate.value.replace(/\s/g, "")}`,
+          mimeType,
+          size: fallback.size,
+          quality: fallback.quality,
+          background: fallback.background,
+          usage: payload.usageMetadata
+        },
+        fallback.size
+      )
+    ];
+  });
+  if (!results.length) {
+    const blocked = payload.promptFeedback?.blockReason;
+    const finishReason = payload.candidates?.map((candidate) => candidate.finishReason).find(Boolean);
+    throw new Error(
+      blocked || finishReason
+        ? `Gemini 原生生图接口没有返回可用图片（${blocked || finishReason}）。`
+        : "Gemini 原生生图接口没有返回可用图片。"
+    );
+  }
+  return results;
+};
+
 const parseSseData = (text: string): unknown[] => {
   const events: unknown[] = [];
   text.split(/\r?\n/).forEach((line) => {
@@ -1163,8 +1462,10 @@ const normalizeCreateRequest = (
         ? "responses"
         : config.providerType === "openrouter"
           ? "images"
-          : request.settings.apiMode === "responses"
-            ? "responses"
+          : request.settings.apiMode === "responses" ||
+              request.settings.apiMode === "chat_completions" ||
+              request.settings.apiMode === "gemini"
+            ? request.settings.apiMode
             : config.apiMode,
     imageModel: request.settings.imageModel.trim() || config.imageModel,
     mainModel: normalizeGenerationMainModel(request.settings.mainModel || config.mainModel),
@@ -1250,7 +1551,7 @@ export class GenerationService {
       apiBaseUrl:
         update.apiBaseUrl.trim() || (providerType === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : defaultConfig.apiBaseUrl),
       apiKey: update.apiKey.trim() || existingProvider.apiKey,
-      apiMode: providerType === "openrouter" ? "images" : update.apiMode === "responses" ? "responses" : "images",
+      apiMode: providerType === "openrouter" ? "images" : normalizeGenerationApiMode(update.apiMode),
       imageModel:
         update.imageModel.trim() ||
         (providerType === "openrouter" ? DEFAULT_OPENROUTER_IMAGE_MODEL : defaultConfig.imageModel),
@@ -1288,7 +1589,7 @@ export class GenerationService {
         existingProvider?.apiBaseUrl ||
         (providerType === "openrouter" ? DEFAULT_OPENROUTER_BASE_URL : defaultConfig.apiBaseUrl),
       apiKey: update.apiKey.trim() || existingProvider?.apiKey || "",
-      apiMode: providerType === "openrouter" ? "images" : update.apiMode === "responses" ? "responses" : "images",
+      apiMode: providerType === "openrouter" ? "images" : normalizeGenerationApiMode(update.apiMode),
       imageModel:
         update.imageModel.trim() ||
         existingProvider?.imageModel ||
@@ -1632,6 +1933,9 @@ export class GenerationService {
   ): Promise<ImageResult[]> {
     let results = await this.generate(task, config, signal);
     if (!results.some(hasOutputDimensionProblem) || signal.aborted) return results;
+    if (task.settings.apiMode === "chat_completions" || task.settings.apiMode === "gemini") {
+      return results.map((result) => withLocalResizeFallback(result, task.settings));
+    }
     try {
       const retriedResults = await this.generate(task, config, signal);
       if (retriedResults.length) results = retriedResults;
@@ -1685,6 +1989,42 @@ export class GenerationService {
         referenceImages,
         signal
       );
+    }
+
+    if (task.settings.apiMode === "gemini") {
+      const results: ImageResult[] = [];
+      const endpoint = geminiGenerateContentEndpoint(config.apiBaseUrl, task.settings.imageModel);
+      for (let index = 0; index < task.settings.n && results.length < task.settings.n; index += 1) {
+        const text = await requestJson(
+          endpoint,
+          config.apiKey,
+          buildGeminiImagePayload(
+            task.finalPrompt,
+            task.settings,
+            referenceImages,
+            isGoogleGeminiEndpoint(endpoint)
+          ),
+          signal,
+          "application/json",
+          "gemini"
+        );
+        results.push(...parseGeminiImageResponse(text, task.settings));
+      }
+      return results.slice(0, task.settings.n);
+    }
+
+    if (task.settings.apiMode === "chat_completions") {
+      const results: ImageResult[] = [];
+      for (let index = 0; index < task.settings.n && results.length < task.settings.n; index += 1) {
+        const text = await requestJson(
+          generationEndpoint(config.apiBaseUrl, "chat/completions"),
+          config.apiKey,
+          buildChatCompletionsImagePayload(task.finalPrompt, task.settings, referenceImages),
+          signal
+        );
+        results.push(...(await parseChatCompletionsImageResponse(text, config.apiKey, task.settings)));
+      }
+      return results.slice(0, task.settings.n);
     }
 
     if (task.settings.apiMode === "responses") {

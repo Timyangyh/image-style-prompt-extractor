@@ -87,6 +87,7 @@ import type {
 
 const defaultConfig: ModelConfig = {
   apiBaseUrl: "https://api.openai.com/v1",
+  apiMode: "chat_completions",
   modelName: "gpt-4o-mini",
   saveApiKey: false,
   hasApiKey: false
@@ -1021,7 +1022,41 @@ const generationBackendError = (config: GenerationConfig): string => {
 };
 
 const formatGenerationProviderType = (providerType: GenerationProviderType): string =>
-  providerType === "openrouter" ? "OpenRouter" : "OpenAI-compatible";
+  providerType === "openrouter" ? "OpenRouter" : "通用 API";
+
+const formatGenerationApiMode = (apiMode: GenerationConfig["apiMode"]): string => {
+  if (apiMode === "responses") return "Responses";
+  if (apiMode === "chat_completions") return "Chat Completions";
+  if (apiMode === "gemini") return "Gemini 原生";
+  return "Images";
+};
+
+const generationApiModeNote = (config: GenerationConfigDraft): string => {
+  if (config.authSource === "codex_oauth") {
+    return "适合已在本机登录 Codex 的情况，固定走 Codex 内部 Responses，无需填写 API Key。";
+  }
+  if (config.providerType === "openrouter") {
+    return "适合 OpenRouter，固定调用专用 /images 接口。";
+  }
+  if (config.apiMode === "responses") {
+    return "适合明确提供 /responses 与 image_generation 图像工具的平台。";
+  }
+  if (config.apiMode === "chat_completions") {
+    return "适合用 /chat/completions 返回图片的兼容中转平台，例如部分 New API 平台。";
+  }
+  if (config.apiMode === "gemini") {
+    return "适合 Google Gemini 官方，或在 /v1、/v1beta 下提供 models/{model}:generateContent 的中转平台。";
+  }
+  return "适合提供 /images/generations 和 /images/edits 的 OpenAI 兼容生图平台。";
+};
+
+const visionApiModeNote = (apiMode: ModelConfig["apiMode"]): string => {
+  if (apiMode === "responses") return "适合明确提供 /responses 多模态识图接口的平台。";
+  if (apiMode === "gemini") {
+    return "适合 Google Gemini 官方或提供 /v1beta/models/{model}:generateContent 的中转平台。";
+  }
+  return "适合大多数提供 /chat/completions 多模态识图接口的 OpenAI 兼容平台。";
+};
 
 const formatStyleTerms = (analysis: StyleAnalysis | null): string => {
   if (!analysis) return "";
@@ -1212,6 +1247,7 @@ export function App(): JSX.Element {
       ...nextConfig,
       providerType: activeProvider?.providerType || nextConfig.providerType,
       providerName: activeProvider?.name || "",
+      apiMode: activeProvider?.apiMode || nextConfig.apiMode,
       apiKey: ""
     });
     setGenerationSettings((current) => ({
@@ -1440,15 +1476,7 @@ export function App(): JSX.Element {
   };
 
   const saveGenerationConfig = async () => {
-    const saved = await window.styleExtractor.saveGenerationConfig({
-      ...generationDraft,
-      apiMode:
-        generationDraft.authSource === "codex_oauth" || generationDraft.providerType === "openrouter"
-          ? generationDraft.authSource === "codex_oauth"
-            ? "responses"
-            : "images"
-          : generationDraft.apiMode
-    });
+    const saved = await window.styleExtractor.saveGenerationConfig(generationDraft);
     applyGenerationConfig(saved);
     setShowGenerationConfig(false);
     setStatus("生图配置已保存。");
@@ -3340,22 +3368,21 @@ export function App(): JSX.Element {
           <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
             <div className="modal-title">
               <h2>生图配置</h2>
-              <p>可使用 Codex OAuth 内部后端，或 OpenAI-compatible Images API / Responses 图像工具。</p>
+              <p>支持 Images、Responses、Chat Completions 和 Gemini 原生生图/改图协议。</p>
             </div>
             <label>
-              生图后端
+              认证方式
               <select
                 onChange={(event) =>
                   setGenerationDraft({
                     ...generationDraft,
-                    authSource: event.target.value === "api" ? "api" : "codex_oauth",
-                    apiMode: event.target.value === "api" ? generationDraft.apiMode : "responses"
+                    authSource: event.target.value === "api" ? "api" : "codex_oauth"
                   })
                 }
                 value={generationDraft.authSource}
               >
-                <option value="codex_oauth">Codex OAuth 内部后端</option>
-                <option value="api">OpenAI-compatible API Key</option>
+                <option value="codex_oauth">Codex OAuth（本机登录）</option>
+                <option value="api">API Key（第三方平台）</option>
               </select>
             </label>
             {generationDraft.authSource === "codex_oauth" && (
@@ -3371,6 +3398,46 @@ export function App(): JSX.Element {
                 <span>{generationDraft.codexOAuthPath || "~/.codex/auth.json"}</span>
               </div>
             )}
+            <label>
+              生图/改图协议
+              <select
+                disabled={generationDraft.authSource === "codex_oauth" || generationDraft.providerType === "openrouter"}
+                onChange={(event) =>
+                  setGenerationDraft({
+                    ...generationDraft,
+                    apiMode:
+                      event.target.value === "responses"
+                        ? "responses"
+                        : event.target.value === "chat_completions"
+                          ? "chat_completions"
+                          : event.target.value === "gemini"
+                            ? "gemini"
+                            : "images"
+                  })
+                }
+                value={
+                  generationDraft.authSource === "codex_oauth"
+                    ? "responses"
+                    : generationDraft.providerType === "openrouter"
+                      ? "images"
+                      : generationDraft.apiMode
+                }
+              >
+                {generationDraft.authSource === "codex_oauth" ? (
+                  <option value="responses">Responses（Codex OAuth 内部调用）</option>
+                ) : generationDraft.providerType === "openrouter" ? (
+                  <option value="images">OpenRouter Images（OpenRouter 专用）</option>
+                ) : (
+                  <>
+                    <option value="images">Images API（常见 OpenAI 生图）</option>
+                    <option value="responses">Responses（OpenAI 图像工具）</option>
+                    <option value="chat_completions">Chat Completions（常见中转平台）</option>
+                    <option value="gemini">Gemini 原生（Google / Gemini 中转）</option>
+                  </>
+                )}
+              </select>
+            </label>
+            <p className="config-note">{generationApiModeNote(generationDraft)}</p>
             {generationDraft.authSource === "api" && (
               <div className="generation-provider-panel">
                 <div className="generation-provider-panel-header">
@@ -3408,9 +3475,7 @@ export function App(): JSX.Element {
                             {formatGenerationProviderType(provider.providerType)} · {provider.apiBaseUrl} ·{" "}
                             {provider.providerType === "openrouter"
                               ? "OpenRouter Images"
-                              : provider.apiMode === "responses"
-                                ? "Responses"
-                                : "Images"}{" "}
+                              : formatGenerationApiMode(provider.apiMode)}{" "}
                             · {provider.hasApiKey ? "已配置 Key" : "未配置 Key"}
                           </small>
                         </button>
@@ -3485,7 +3550,7 @@ export function App(): JSX.Element {
                   }}
                   value={generationDraft.providerType}
                 >
-                  <option value="openai_compatible">OpenAI-compatible</option>
+                  <option value="openai_compatible">通用 API（OpenAI / Gemini / 中转）</option>
                   <option value="openrouter">OpenRouter</option>
                 </select>
               </label>
@@ -3505,7 +3570,11 @@ export function App(): JSX.Element {
               <input
                 disabled={generationDraft.authSource === "codex_oauth"}
                 onChange={(event) => setGenerationDraft({ ...generationDraft, apiBaseUrl: event.target.value })}
-                placeholder="https://api.openai.com/v1"
+                placeholder={
+                  generationDraft.apiMode === "gemini"
+                    ? "https://generativelanguage.googleapis.com/v1"
+                    : "https://api.openai.com/v1"
+                }
                 value={generationDraft.apiBaseUrl}
               />
             </label>
@@ -3513,39 +3582,21 @@ export function App(): JSX.Element {
               <p className="config-warning">当前 Base URL 使用 http://，API Key、提示词和图片内容会以明文链路传输。</p>
             )}
             <label>
-              调用方式
-              <select
-                disabled={generationDraft.authSource === "codex_oauth" || generationDraft.providerType === "openrouter"}
-                onChange={(event) =>
-                  setGenerationDraft({
-                    ...generationDraft,
-                    apiMode: event.target.value === "responses" ? "responses" : "images"
-                  })
-                }
-                value={generationDraft.apiMode}
-              >
-                {generationDraft.providerType === "openrouter" ? (
-                  <option value="images">OpenRouter Images API</option>
-                ) : (
-                  <>
-                    <option value="images">Images API</option>
-                    <option value="responses">Responses 图像工具</option>
-                  </>
-                )}
-              </select>
-            </label>
-            <label>
               Image Model
               <input
                 onChange={(event) => setGenerationDraft({ ...generationDraft, imageModel: event.target.value })}
-                placeholder="gpt-image-2"
+                placeholder={generationDraft.apiMode === "gemini" ? "gemini-3.1-flash-image" : "gpt-image-2"}
                 value={generationDraft.imageModel}
               />
             </label>
             <label>
-              Main Model（Responses）
+              Main Model（仅 Responses）
               <input
-                disabled={generationDraft.authSource === "codex_oauth" || generationDraft.providerType === "openrouter"}
+                disabled={
+                  generationDraft.authSource === "codex_oauth" ||
+                  generationDraft.providerType === "openrouter" ||
+                  generationDraft.apiMode !== "responses"
+                }
                 onChange={(event) => setGenerationDraft({ ...generationDraft, mainModel: event.target.value })}
                 placeholder="gpt-5.5"
                 value={generationDraft.mainModel}
@@ -3556,7 +3607,13 @@ export function App(): JSX.Element {
               <input
                 disabled={generationDraft.authSource === "codex_oauth"}
                 onChange={(event) => setGenerationDraft({ ...generationDraft, apiKey: event.target.value })}
-                placeholder={generationDraft.hasApiKey ? "已配置，留空则继续使用当前 Key" : "sk-..."}
+                placeholder={
+                  generationDraft.hasApiKey
+                    ? "已配置，留空则继续使用当前 Key"
+                    : generationDraft.apiMode === "gemini"
+                      ? "Gemini API Key 或平台 Key"
+                      : "sk-..."
+                }
                 type="password"
                 value={generationDraft.apiKey}
               />
@@ -3602,13 +3659,39 @@ export function App(): JSX.Element {
           <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
             <div className="modal-title">
               <h2>模型配置</h2>
-              <p>使用 OpenAI-compatible Vision API；Base URL 可填官方或第三方兼容地址。</p>
+              <p>选择平台实际提供的识图协议，应用会自动拼接对应接口路径。</p>
             </div>
+            <label>
+              识图协议
+              <select
+                onChange={(event) =>
+                  setDraftConfig({
+                    ...draftConfig,
+                    apiMode:
+                      event.target.value === "responses"
+                        ? "responses"
+                        : event.target.value === "gemini"
+                          ? "gemini"
+                          : "chat_completions"
+                  })
+                }
+                value={draftConfig.apiMode}
+              >
+                <option value="chat_completions">Chat Completions（多数 OpenAI 兼容平台）</option>
+                <option value="responses">Responses（OpenAI Responses 兼容平台）</option>
+                <option value="gemini">Gemini 原生（Google / Gemini 中转）</option>
+              </select>
+            </label>
+            <p className="config-note">{visionApiModeNote(draftConfig.apiMode)}</p>
             <label>
               API Base URL
               <input
                 onChange={(event) => setDraftConfig({ ...draftConfig, apiBaseUrl: event.target.value })}
-                placeholder="https://api.openai.com/v1"
+                placeholder={
+                  draftConfig.apiMode === "gemini"
+                    ? "https://api.duckcoding.ai/v1beta"
+                    : "https://api.openai.com/v1"
+                }
                 value={draftConfig.apiBaseUrl}
               />
             </label>
@@ -3619,7 +3702,7 @@ export function App(): JSX.Element {
               Model Name
               <input
                 onChange={(event) => setDraftConfig({ ...draftConfig, modelName: event.target.value })}
-                placeholder="gpt-4o-mini"
+                placeholder={draftConfig.apiMode === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini"}
                 value={draftConfig.modelName}
               />
             </label>
@@ -3627,7 +3710,13 @@ export function App(): JSX.Element {
               API Key
               <input
                 onChange={(event) => setDraftConfig({ ...draftConfig, apiKey: event.target.value })}
-                placeholder={draftConfig.hasApiKey ? "已配置，留空则继续使用当前 Key" : "sk-..."}
+                placeholder={
+                  draftConfig.hasApiKey
+                    ? "已配置，留空则继续使用当前 Key"
+                    : draftConfig.apiMode === "gemini"
+                      ? "Gemini API Key 或平台 Key"
+                      : "sk-..."
+                }
                 type="password"
                 value={draftConfig.apiKey}
               />

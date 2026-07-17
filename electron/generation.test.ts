@@ -3,7 +3,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildChatCompletionsImagePayload,
   buildCodexResponsesPayload,
+  buildGeminiImagePayload,
   buildImagesGenerationPayload,
   buildOpenRouterImagesPayload,
   buildResponsesPayload,
@@ -12,6 +14,8 @@ import {
   normalizeGenerationBaseUrl,
   openRouterImagesEndpoint,
   parseImageDimensions,
+  parseChatCompletionsImageResponse,
+  parseGeminiImageResponse,
   parseImagesResponse,
   parseOpenRouterImagesResponse,
   parseResponsesImageResponse
@@ -133,6 +137,12 @@ describe("generation endpoint helpers", () => {
     expect(normalizeGenerationBaseUrl("https://api.example.com/v1/responses")).toBe(
       "https://api.example.com/v1"
     );
+    expect(normalizeGenerationBaseUrl("https://api.example.com/v1/chat/completions")).toBe(
+      "https://api.example.com/v1"
+    );
+    expect(generationEndpoint("https://api.example.com/v1/", "chat/completions")).toBe(
+      "https://api.example.com/v1/chat/completions"
+    );
     expect(generationEndpoint("https://api.example.com/v1/", "images/edits")).toBe(
       "https://api.example.com/v1/images/edits"
     );
@@ -203,6 +213,80 @@ describe("generation request builders", () => {
     expect(
       (((payload.input as Array<Record<string, unknown>>)[0].content as Array<Record<string, string>>)[1])
     ).toEqual({ type: "input_image", image_url: "data:image/png;base64,abc" });
+  });
+
+  it("builds one-image Chat Completions payloads with references and Gemini image settings", () => {
+    const payload = buildChatCompletionsImagePayload(
+      "按参考图生成横版海报",
+      {
+        ...settings,
+        apiMode: "chat_completions",
+        imageModel: "gemini-3.1-flash-image",
+        resolution: "4k",
+        aspectRatio: "16:9",
+        size: "3840x2160"
+      },
+      ["data:image/png;base64,YWJj"]
+    );
+    expect(payload).toMatchObject({
+      model: "gemini-3.1-flash-image",
+      stream: false,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "按参考图生成横版海报" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,YWJj" } }
+          ]
+        }
+      ],
+      extra_body: {
+        google: { image_config: { aspect_ratio: "16:9", image_size: "4K" } }
+      }
+    });
+    expect(payload.n).toBeUndefined();
+  });
+
+  it("builds Gemini native image generation and editing payloads", () => {
+    const payload = buildGeminiImagePayload(
+      "按参考图生成横版海报",
+      {
+        ...settings,
+        apiMode: "gemini",
+        imageModel: "gemini-3.1-flash-image",
+        resolution: "4k",
+        aspectRatio: "16:9",
+        size: "3840x2160"
+      },
+      ["data:image/png;base64,YWJj"]
+    );
+    expect(payload).toMatchObject({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: "按参考图生成横版海报" },
+            { inlineData: { mimeType: "image/png", data: "YWJj" } }
+          ]
+        }
+      ],
+      generationConfig: {
+        responseModalities: ["TEXT", "IMAGE"],
+        imageConfig: { aspectRatio: "16:9", imageSize: "4K" }
+      }
+    });
+
+    const legacyPayload = buildGeminiImagePayload(
+      "生成方图",
+      { ...settings, apiMode: "gemini", imageModel: "gemini-2.5-flash-image" },
+      []
+    );
+    expect(legacyPayload).toMatchObject({
+      generationConfig: { imageConfig: { aspectRatio: "1:1" } }
+    });
+    expect(
+      ((legacyPayload.generationConfig as Record<string, unknown>).imageConfig as Record<string, unknown>).imageSize
+    ).toBeUndefined();
   });
 
   it("builds Codex OAuth responses payloads with internal backend fields", () => {
@@ -534,6 +618,134 @@ describe("generation config defaults", () => {
 });
 
 describe("generation task queue", () => {
+  it("routes Gemini native generation with official Google authentication", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-gemini-native-"));
+    const b64 = b64Image(pngBytes(1024, 1024));
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: b64 } }] } }],
+            usageMetadata: { totalTokenCount: 30 }
+          }),
+          { status: 200 }
+        )
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const service = new GenerationService(rootDir);
+      await service.saveConfig({
+        authSource: "api",
+        providerType: "openai_compatible",
+        apiBaseUrl: "https://generativelanguage.googleapis.com/v1",
+        apiKey: "test-key",
+        apiMode: "gemini",
+        imageModel: "gemini-3.1-flash-image",
+        mainModel: "gpt-5.5",
+        saveApiKey: false,
+        imagesConcurrency: 1
+      });
+
+      const task = await service.createTask({
+        ...createGenerationRequest("生成 Gemini 原生方图"),
+        settings: {
+          ...settings,
+          apiMode: "gemini",
+          imageModel: "gemini-3.1-flash-image",
+          n: 1
+        }
+      });
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded")
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe(
+        "https://generativelanguage.googleapis.com/v1/models/gemini-3.1-flash-image:generateContent"
+      );
+      const headers = new Headers(init.headers);
+      expect(headers.get("x-goog-api-key")).toBe("test-key");
+      expect(headers.get("authorization")).toBeNull();
+      const payload = JSON.parse(String(init.body)) as Record<string, unknown>;
+      expect(payload).toMatchObject({
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          responseFormat: { image: { aspectRatio: "1:1", imageSize: "1K" } }
+        }
+      });
+      const finished = (await service.getTasks()).find((item) => item.id === task.id);
+      expect(finished?.backend?.apiMode).toBe("gemini");
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("routes Chat Completions generation as one request per requested image", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-chat-completions-"));
+    const b64 = b64Image(pngBytes(1024, 1024));
+    const responseBody = JSON.stringify({
+      choices: [{ message: { content: `![image](data:image/png;base64,${b64})` } }]
+    });
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(responseBody, { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const service = new GenerationService(rootDir);
+      await service.saveConfig({
+        authSource: "api",
+        providerType: "openai_compatible",
+        apiBaseUrl: "https://api.example.com/v1",
+        apiKey: "test-key",
+        apiMode: "chat_completions",
+        imageModel: "gemini-3.1-flash-image",
+        mainModel: "gpt-5.5",
+        saveApiKey: false,
+        imagesConcurrency: 1
+      });
+
+      const task = await service.createTask({
+        ...createGenerationRequest("生成两张参考图海报"),
+        referenceImages: [
+          {
+            id: "ref-chat",
+            name: "ref.png",
+            mimeType: "image/png",
+            dataUrl: "data:image/png;base64,cmVm",
+            thumbnailDataUrl: "data:image/png;base64,cmVm",
+            createdAt: "2026-07-17T00:00:00.000Z"
+          }
+        ],
+        settings: {
+          ...settings,
+          apiMode: "chat_completions",
+          imageModel: "gemini-3.1-flash-image",
+          n: 2
+        }
+      });
+
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded")
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      for (const [url, init] of fetchMock.mock.calls as unknown as Array<[string, RequestInit]>) {
+        expect(String(url)).toBe("https://api.example.com/v1/chat/completions");
+        const payload = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+        expect(payload.n).toBeUndefined();
+        expect(JSON.stringify(payload)).toContain("data:image/png;base64,cmVm");
+      }
+      const finished = (await service.getTasks()).find((item) => item.id === task.id);
+      expect(finished?.outputs).toHaveLength(2);
+      expect(finished?.backend?.apiMode).toBe("chat_completions");
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("enqueues tasks immediately and only runs up to the configured concurrency", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "generation-queue-"));
     const pendingResponses: Array<() => void> = [];
@@ -678,6 +890,50 @@ describe("generation task queue", () => {
         sizeMismatch: true,
         error: expect.stringContaining("3840x2160")
       });
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not bill a second Chat Completions request for a size mismatch", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-chat-size-mismatch-"));
+    const b64 = b64Image(pngBytes(1086, 1448));
+    const responseBody = JSON.stringify({
+      choices: [{ message: { content: `![image](data:image/png;base64,${b64})` } }]
+    });
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(responseBody, { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const service = new GenerationService(rootDir);
+      await service.saveConfig({
+        authSource: "api",
+        providerType: "openai_compatible",
+        apiBaseUrl: "https://api.example.com/v1",
+        apiKey: "test-key",
+        apiMode: "chat_completions",
+        imageModel: "gemini-3.1-flash-image",
+        mainModel: "gpt-5.5",
+        saveApiKey: false,
+        imagesConcurrency: 1
+      });
+      const task = await service.createTask({
+        ...createGenerationRequest("横版 4K 海报"),
+        settings: {
+          ...settings,
+          apiMode: "chat_completions",
+          imageModel: "gemini-3.1-flash-image",
+          resolution: "4k",
+          aspectRatio: "16:9",
+          size: "3840x2160",
+          n: 1
+        }
+      });
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && item.status === "partial_failed")
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       vi.unstubAllGlobals();
       await rm(rootDir, { recursive: true, force: true });
@@ -957,6 +1213,58 @@ describe("generation response parsers", () => {
         mimeType: "image/png",
         requestedSize: "1024x1024",
         actualSize: "1024x1024"
+      }
+    ]);
+  });
+
+  it("parses Chat Completions Markdown data URLs and message image blocks", async () => {
+    const b64 = b64Image(pngBytes(1024, 1024));
+    const response = JSON.stringify({
+      choices: [
+        {
+          message: {
+            content: `已生成：![image](data:image/png;base64,${b64})`,
+            images: [{ type: "image_url", image_url: { url: `data:image/png;base64,${b64}` } }]
+          }
+        }
+      ],
+      usage: { total_tokens: 30 }
+    });
+    await expect(parseChatCompletionsImageResponse(response, "test-key", settings)).resolves.toMatchObject([
+      {
+        dataUrl: `data:image/png;base64,${b64}`,
+        mimeType: "image/png",
+        requestedSize: "1024x1024",
+        actualSize: "1024x1024",
+        usage: { total_tokens: 30 }
+      }
+    ]);
+  });
+
+  it("parses Gemini native final image parts and ignores thought images", () => {
+    const thoughtB64 = b64Image(pngBytes(256, 256));
+    const finalB64 = b64Image(pngBytes(1024, 1024));
+    const response = JSON.stringify({
+      candidates: [
+        {
+          content: {
+            parts: [
+              { thought: true, inlineData: { mimeType: "image/png", data: thoughtB64 } },
+              { text: "已生成" },
+              { inlineData: { mimeType: "image/png", data: finalB64 } }
+            ]
+          }
+        }
+      ],
+      usageMetadata: { totalTokenCount: 42 }
+    });
+    expect(parseGeminiImageResponse(response, settings)).toMatchObject([
+      {
+        dataUrl: `data:image/png;base64,${finalB64}`,
+        mimeType: "image/png",
+        requestedSize: "1024x1024",
+        actualSize: "1024x1024",
+        usage: { totalTokenCount: 42 }
       }
     ]);
   });
