@@ -1452,7 +1452,11 @@ const normalizeCreateRequest = (
 ): GenerationCreateRequest => {
   const prompt = request.prompt.trim();
   if (!prompt) throw new Error("请先导入或填写生图提示词。");
-  if (!request.promptSource.sourceImageDataUrl && !request.promptSource.sourceThumbnailDataUrl) {
+  if (
+    request.promptSource.kind !== "manual" &&
+    !request.promptSource.sourceImageDataUrl &&
+    !request.promptSource.sourceThumbnailDataUrl
+  ) {
     throw new Error("当前提示词缺少原始提取图来源，无法建立后续对比关系。");
   }
 

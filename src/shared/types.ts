@@ -51,6 +51,8 @@ export type GenerationRequestSizeStrategy =
   | "openrouter_normalized"
   | "openrouter_aspect_ratio";
 export type GenerationPromptSourceKind =
+  | "text_to_image"
+  | "manual"
   | "universal"
   | "layout"
   | "negative"

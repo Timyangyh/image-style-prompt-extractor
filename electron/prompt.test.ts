@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { buildFuseUserPrompt } from "./prompt";
+import { buildFuseUserPrompt, buildSystemPrompt } from "./prompt";
+
+describe("image analysis prompt", () => {
+  it("requires a complete generalized text-to-image instruction", () => {
+    const prompt = buildSystemPrompt(true);
+
+    expect(prompt).toContain("generation_guidance.for_text_to_image");
+    expect(prompt).toContain("完整中文说明");
+    expect(prompt).toContain("视觉风格、构图与排版系统、文字层级、配色、光影、字体气质、装饰语言和可替换内容槽位");
+    expect(prompt).toContain("禁止写入原图具体文案、品牌、Logo、价格、型号、日期和数据");
+    expect(prompt).toContain("[MAIN_TITLE]");
+    expect(prompt).toContain("把专有内容抽象成占位符");
+  });
+});
 
 describe("fusion prompt controls", () => {
   it("defaults to preserving subject hair and pose from the single input image", () => {
