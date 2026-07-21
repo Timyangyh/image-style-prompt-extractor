@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, session, shell } from "electron";
+import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { writeFile } from "node:fs/promises";
 import type {
@@ -6,8 +7,11 @@ import type {
   AnalyzeImageResponse,
   FusePromptRequest,
   FusePromptResponse,
-  HistoryItem,
   GenerationOutputsSaveRequest,
+  HistoryDeleteItemRequest,
+  HistoryItem,
+  HistoryPatchItemRequest,
+  HistorySaveItemRequest,
   ImageEditAnnotationResolveRequest,
   ImageEditAnnotationResolveResponse,
   ImageEditOutputsSaveRequest,
@@ -21,6 +25,7 @@ import {
   parseImageEditAnnotationResolution
 } from "../src/shared/image-edit-regeneration";
 import { normalizeFusedPromptResult, normalizeStyleAnalysis } from "../src/shared/schema";
+import { WORKSPACE_CONCURRENCY_LIMIT } from "../src/shared/workspace-concurrency";
 import { GenerationService } from "./generation";
 import { ImageEditService, imageEditAnnotationContentHash } from "./image-edit";
 import { clearWindowsSessionData } from "./session-cleanup";
@@ -34,15 +39,14 @@ import {
 } from "./generation-save";
 import { buildFuseSystemPrompt, buildFuseUserPrompt, buildSystemPrompt, buildUserPrompt } from "./prompt";
 import {
+  AbortableOperationRegistry,
+  HistoryStore,
   ModelHttpError,
   buildVisionModelPayload,
   extractJsonText,
-  getHistoryEntryId,
   isAbortError,
   modelRequestTimeoutMessage,
   modelRequestTimeoutMs,
-  normalizeHistory,
-  normalizeHistoryItemForStorage,
   normalizeVisionApiMode,
   parseExtractedJson,
   readJsonFile,
@@ -89,6 +93,7 @@ const defaultEffectiveConfig: EffectiveModelConfig = {
 };
 
 const WINDOWS_DATA_CLEAR_ERROR_MESSAGE = "已抹除全部本机数据。";
+const ANNOTATION_CANCEL_ERROR_MESSAGE = "已取消改图标注解析。";
 
 const e2eUserDataDir = process.env.IMAGE_STYLE_E2E_USER_DATA_DIR?.trim();
 if (!app.isPackaged && e2eUserDataDir) app.setPath("userData", resolve(e2eUserDataDir));
@@ -99,14 +104,65 @@ const historyPath = () => join(userDataDir(), "history.json");
 
 let mainWindow: BrowserWindow | null = null;
 let runtimeConfig: EffectiveModelConfig | null = null;
-let analyzeAbortController: AbortController | null = null;
-let fuseAbortController: AbortController | null = null;
 let localDataEpoch = 0;
-const annotationAbortControllers = new Set<AbortController>();
+let isClearingLocalData = false;
+let clearAllLocalDataPromise: Promise<ModelConfig> | null = null;
+const extractionOperations = new AbortableOperationRegistry(WORKSPACE_CONCURRENCY_LIMIT);
+const annotationOperations = new AbortableOperationRegistry(WORKSPACE_CONCURRENCY_LIMIT);
+const historyStore = new HistoryStore(historyPath);
 let generationService: GenerationService | null = null;
 let imageEditService: ImageEditService | null = null;
 const imageEditAnnotationResolutionCache = new Map<string, ImageEditAnnotationResolveResponse>();
-const imageEditAnnotationResolutionsInFlight = new Set<string>();
+
+interface OptionalOperationIdentity {
+  workflowId?: string;
+  operationId?: string;
+  revision?: number;
+}
+
+const validateOperationIdentity = (request: OptionalOperationIdentity): OptionalOperationIdentity => {
+  const values = [request.workflowId, request.operationId, request.revision];
+  const presentCount = values.filter((value) => value !== undefined).length;
+  if (presentCount === 0) return {};
+  if (presentCount !== values.length) throw new Error("工作流请求身份不完整。");
+  if (
+    typeof request.workflowId !== "string" ||
+    request.workflowId !== request.workflowId.trim() ||
+    !request.workflowId ||
+    request.workflowId.length > 200
+  ) {
+    throw new Error("工作流 ID 无效。");
+  }
+  if (
+    typeof request.operationId !== "string" ||
+    request.operationId !== request.operationId.trim() ||
+    !request.operationId ||
+    request.operationId.length > 200
+  ) {
+    throw new Error("操作 ID 无效。");
+  }
+  if (!Number.isSafeInteger(request.revision) || (request.revision as number) < 0) {
+    throw new Error("工作流修订版本无效。");
+  }
+  return {
+    workflowId: request.workflowId,
+    operationId: request.operationId,
+    revision: request.revision
+  };
+};
+
+const registryOperationId = (kind: "analyze" | "fuse" | "annotation", operationId?: string): string =>
+  operationId || `legacy:${kind}:${randomUUID()}`;
+
+const assertLocalDataEpoch = (epoch: number): void => {
+  if (epoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
+};
+
+const assertOperationActive = (signal: AbortSignal): void => {
+  if (!signal.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("模型请求已取消。");
+};
 
 const publicConfig = (config: EffectiveModelConfig): ModelConfig => ({
   apiBaseUrl: config.apiBaseUrl,
@@ -200,23 +256,35 @@ const clearConfig = async (): Promise<ModelConfig> => {
   return publicConfig(runtimeConfig);
 };
 
-const clearAllLocalData = async (): Promise<ModelConfig> => {
-  if (process.platform === "win32") {
-    localDataEpoch += 1;
-    const reason = new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
-    analyzeAbortController?.abort(reason);
-    fuseAbortController?.abort(reason);
-    for (const controller of annotationAbortControllers) controller.abort(reason);
+const clearAllLocalData = (): Promise<ModelConfig> => {
+  if (clearAllLocalDataPromise) return clearAllLocalDataPromise;
+
+  isClearingLocalData = true;
+  localDataEpoch += 1;
+  historyStore.invalidate();
+  const reason = new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
+
+  const clearing = (async (): Promise<ModelConfig> => {
+    await Promise.all([extractionOperations.abortAll(reason), annotationOperations.abortAll(reason)]);
     imageEditAnnotationResolutionCache.clear();
-    imageEditAnnotationResolutionsInFlight.clear();
-  }
-  runtimeConfig = { ...defaultEffectiveConfig };
-  await writeStoredConfig(runtimeConfig);
-  await writeJsonFile(historyPath(), []);
-  await generationService?.clearAll();
-  await imageEditService?.clearAll();
-  await clearWindowsSessionData(session.defaultSession);
-  return publicConfig(runtimeConfig);
+    runtimeConfig = { ...defaultEffectiveConfig };
+    await writeStoredConfig(runtimeConfig);
+    await historyStore.clearInvalidated();
+    await generationService?.clearAll();
+    await imageEditService?.clearAll();
+    await clearWindowsSessionData(session.defaultSession);
+    return publicConfig(runtimeConfig);
+  })();
+
+  clearAllLocalDataPromise = clearing.finally(() => {
+    isClearingLocalData = false;
+    clearAllLocalDataPromise = null;
+  });
+  return clearAllLocalDataPromise;
+};
+
+const assertLocalDataMutationAllowed = (): void => {
+  if (isClearingLocalData) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
 };
 
 const saveGenerationOutputs = async (request: GenerationOutputsSaveRequest) => {
@@ -357,9 +425,12 @@ const postFusePromptRequest = async (
   });
 };
 
-const resolveImageEditAnnotations = async (
+const resolveImageEditAnnotations = (
   request: ImageEditAnnotationResolveRequest
 ): Promise<ImageEditAnnotationResolveResponse> => {
+  const identity = validateOperationIdentity(request);
+  const requestDataEpoch = localDataEpoch;
+  const operationId = registryOperationId("annotation", identity.operationId);
   if (!request.sourceImageDataUrl.startsWith("data:image/")) throw new Error("待修改生成图数据格式无效。");
   if (request.sourceImageModelDataUrl && !request.sourceImageModelDataUrl.startsWith("data:image/")) {
     throw new Error("模型用待修改图数据格式无效。");
@@ -374,52 +445,54 @@ const resolveImageEditAnnotations = async (
     request.instruction,
     basePrompt
   );
-  const requestDataEpoch = localDataEpoch;
   const createdAt = new Date().toISOString();
-  const finalizeResponse = (response: ImageEditAnnotationResolveResponse): ImageEditAnnotationResolveResponse => {
-    if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
-    return response;
-  };
-  const fallback = (reason: string): ImageEditAnnotationResolveResponse => ({
-    fallbackReason: reason,
-    resolution: manualImageEditAnnotationResolution(annotationItems, { contentHash, createdAt }, reason)
-  });
-  const config = await getEffectiveConfig();
-  if (!config.apiKey.trim()) {
-    return finalizeResponse(fallback("视觉分析模型尚未配置，请手动补齐修改对象、目标修改和保留项后逐项确认。"));
-  }
-  const cacheKey = [contentHash, config.apiBaseUrl.trim(), config.apiMode, config.modelName.trim()].join("\n");
-  const cached = imageEditAnnotationResolutionCache.get(cacheKey);
-  if (cached) return finalizeResponse(cached);
-  if (imageEditAnnotationResolutionsInFlight.has(cacheKey)) {
-    throw new Error("同一标注版本正在解析，请等待当前解析完成。");
-  }
-  imageEditAnnotationResolutionsInFlight.add(cacheKey);
-
-  try {
-    const systemPrompt = [
-      "你是改图标注语义解析器。你只负责理解用户已经画出的编号标注，不生成图片，也不扩写修改目标。",
-      "必须返回一个 JSON 对象，唯一顶层字段是 items。items 数量、index 和请求编号必须完全一致，不能缺号、重号或新增编号。",
-      "每项字段固定为 index、target_object、current_state、requested_change、preserve、spatial_anchors、original_text、replacement_text、confidence、ambiguity。",
-      "target_object 与 requested_change 必须非空。只根据待修改图、黑白编号定位图、结构化几何和用户原始说明识别对象；不得新增用户未要求的事实、品牌、文字、人物或修改目标。",
-      "涉及文字替换时，original_text 和 replacement_text 必须拆分；replacement_text 只能逐字来自用户说明，无法确认则留空并在 ambiguity 说明。",
-      process.platform === "win32"
-        ? "纯删除文字或删除包含文字的对象时，不属于文字替换，original_text 和 replacement_text 必须同时留空。"
-        : "",
-      "对象不明确、文字不可辨认或置信度低于 0.80 时必须填写 ambiguity，不能猜测。所有说明使用中文。"
-    ]
-      .filter(Boolean)
-      .join("\n");
-    const userText = [
-      `原始生图基础提示词：\n${basePrompt}`,
-      `本轮总体说明：\n${request.instruction.trim() || "无"}`,
-      `编号、用户局部说明和结构化几何：\n${JSON.stringify(annotationItems, null, 2)}`,
-      "第一张图片是待修改生成图，只用于理解当前画面；第二张图片是低遮挡黑白编号定位图，只用于确认编号位置。"
-    ].join("\n\n");
+  return withAbortableRequest(annotationOperations, "annotation", operationId, async (signal) => {
+    const finalizeResponse = (response: ImageEditAnnotationResolveResponse): ImageEditAnnotationResolveResponse => {
+      assertLocalDataEpoch(requestDataEpoch);
+      if (
+        signal.aborted &&
+        signal.reason instanceof Error &&
+        signal.reason.message === ANNOTATION_CANCEL_ERROR_MESSAGE
+      ) {
+        throw signal.reason;
+      }
+      return { ...response, ...identity };
+    };
+    const fallback = (reason: string): ImageEditAnnotationResolveResponse => ({
+      fallbackReason: reason,
+      resolution: manualImageEditAnnotationResolution(annotationItems, { contentHash, createdAt }, reason)
+    });
+    assertLocalDataEpoch(requestDataEpoch);
+    const config = await getEffectiveConfig();
+    assertLocalDataEpoch(requestDataEpoch);
+    if (!config.apiKey.trim()) {
+      return finalizeResponse(fallback("视觉分析模型尚未配置，请手动补齐修改对象、目标修改和保留项后逐项确认。"));
+    }
+    const cacheKey = [contentHash, config.apiBaseUrl.trim(), config.apiMode, config.modelName.trim()].join("\n");
+    const cached = imageEditAnnotationResolutionCache.get(cacheKey);
+    if (cached) return finalizeResponse(cached);
 
     try {
-      return await withAbortableRequest("annotation", async (signal) => {
-        if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
+      const systemPrompt = [
+        "你是改图标注语义解析器。你只负责理解用户已经画出的编号标注，不生成图片，也不扩写修改目标。",
+        "必须返回一个 JSON 对象，唯一顶层字段是 items。items 数量、index 和请求编号必须完全一致，不能缺号、重号或新增编号。",
+        "每项字段固定为 index、target_object、current_state、requested_change、preserve、spatial_anchors、original_text、replacement_text、confidence、ambiguity。",
+        "target_object 与 requested_change 必须非空。只根据待修改图、黑白编号定位图、结构化几何和用户原始说明识别对象；不得新增用户未要求的事实、品牌、文字、人物或修改目标。",
+        "涉及文字替换时，original_text 和 replacement_text 必须拆分；replacement_text 只能逐字来自用户说明，无法确认则留空并在 ambiguity 说明。",
+        process.platform === "win32"
+          ? "纯删除文字或删除包含文字的对象时，不属于文字替换，original_text 和 replacement_text 必须同时留空。"
+          : "",
+        "对象不明确、文字不可辨认或置信度低于 0.80 时必须填写 ambiguity，不能猜测。所有说明使用中文。"
+      ]
+        .filter(Boolean)
+        .join("\n");
+      const userText = [
+        `原始生图基础提示词：\n${basePrompt}`,
+        `本轮总体说明：\n${request.instruction.trim() || "无"}`,
+        `编号、用户局部说明和结构化几何：\n${JSON.stringify(annotationItems, null, 2)}`,
+        "第一张图片是待修改生成图，只用于理解当前画面；第二张图片是低遮挡黑白编号定位图，只用于确认编号位置。"
+      ].join("\n\n");
+      try {
         const post = (includeResponseFormat: boolean): Promise<string> =>
           postVisionModelRequest(config, {
             systemPrompt,
@@ -438,7 +511,7 @@ const resolveImageEditAnnotations = async (
           rawText = await post(false);
         }
         const parsed = parseExtractedJson(rawText, "改图标注解析结果");
-        const response = finalizeResponse({
+        const response: ImageEditAnnotationResolveResponse = {
           resolution: normalizeWindowsTextRemovalResolution(
             parseImageEditAnnotationResolution(parsed, annotationItems, {
               contentHash,
@@ -447,103 +520,115 @@ const resolveImageEditAnnotations = async (
               createdAt
             })
           )
-        });
+        };
         if (shouldCacheImageEditAnnotationResolution(response)) {
           imageEditAnnotationResolutionCache.set(cacheKey, response);
         }
-        return response;
-      });
+        return finalizeResponse(response);
+      } catch (error) {
+        if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
+        if (
+          signal.aborted &&
+          signal.reason instanceof Error &&
+          signal.reason.message === ANNOTATION_CANCEL_ERROR_MESSAGE
+        ) {
+          throw signal.reason;
+        }
+        const reason = error instanceof Error ? error.message : String(error);
+        return finalizeResponse(fallback(`视觉解析不可用：${reason} 请手动补齐并确认修改清单。`));
+      }
     } catch (error) {
-      if (
-        requestDataEpoch !== localDataEpoch ||
-        (error instanceof Error && error.message === WINDOWS_DATA_CLEAR_ERROR_MESSAGE)
-      ) {
+      if (requestDataEpoch !== localDataEpoch) {
         throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
       }
-      const reason = error instanceof Error ? error.message : String(error);
-      return finalizeResponse(fallback(`视觉解析不可用：${reason} 请手动补齐并确认修改清单。`));
+      throw error;
     }
-  } finally {
-    imageEditAnnotationResolutionsInFlight.delete(cacheKey);
-  }
+  });
 };
 
 const withAbortableRequest = async <T>(
+  registry: AbortableOperationRegistry,
   kind: "analyze" | "fuse" | "annotation",
+  operationId: string,
   task: (signal: AbortSignal) => Promise<T>
 ): Promise<T> => {
-  const controller = new AbortController();
-  if (kind === "analyze") analyzeAbortController = controller;
-  if (kind === "fuse") fuseAbortController = controller;
-  if (kind === "annotation") annotationAbortControllers.add(controller);
+  if (isClearingLocalData) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
+  const operation = registry.register(operationId, kind);
 
   const timeout = setTimeout(() => {
-    controller.abort(new Error(modelRequestTimeoutMessage(kind)));
+    registry.cancel(operationId, kind, new Error(modelRequestTimeoutMessage(kind)));
   }, modelRequestTimeoutMs(kind));
 
   try {
-    return await task(controller.signal);
+    return await task(operation.signal);
   } catch (error) {
-    if (controller.signal.aborted || isAbortError(error)) {
-      const reason = controller.signal.reason;
+    if (operation.signal.aborted || isAbortError(error)) {
+      const reason = operation.signal.reason;
       if (reason instanceof Error) throw reason;
       throw new Error("模型请求已取消。");
     }
     throw error;
   } finally {
     clearTimeout(timeout);
-    if (kind === "analyze" && analyzeAbortController === controller) analyzeAbortController = null;
-    if (kind === "fuse" && fuseAbortController === controller) fuseAbortController = null;
-    if (kind === "annotation") annotationAbortControllers.delete(controller);
+    operation.release();
   }
 };
 
-const analyzeImage = async (request: AnalyzeImageRequest): Promise<AnalyzeImageResponse> => {
+const analyzeImage = (request: AnalyzeImageRequest): Promise<AnalyzeImageResponse> => {
+  const identity = validateOperationIdentity(request);
   const requestDataEpoch = localDataEpoch;
-  const config = await getEffectiveConfig();
-  if (!config.apiKey.trim()) {
-    throw new Error("请先填写模型 API Key。");
-  }
+  const historyEpochAtStart = historyStore.currentEpoch;
+  const operationId = registryOperationId("analyze", identity.operationId);
   if (!request.imageDataUrl.startsWith("data:image/")) {
     throw new Error("图片数据格式无效。");
   }
 
-  return withAbortableRequest("analyze", async (signal) => {
-  if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
-  let rawText = "";
-  try {
-    rawText = await postVisionRequest(request, config, true, "", signal);
-  } catch (error) {
-    if (!shouldRetryWithoutResponseFormat(error, true)) throw error;
-    rawText = await postVisionRequest(request, config, false, "", signal);
-  }
+  return withAbortableRequest(extractionOperations, "analyze", operationId, async (signal) => {
+    assertLocalDataEpoch(requestDataEpoch);
+    const config = await getEffectiveConfig();
+    assertLocalDataEpoch(requestDataEpoch);
+    if (!config.apiKey.trim()) throw new Error("请先填写模型 API Key。");
+    const finalizeResponse = (
+      response: Omit<AnalyzeImageResponse, keyof OptionalOperationIdentity | "historyEpochAtStart">
+    ): AnalyzeImageResponse => {
+      assertLocalDataEpoch(requestDataEpoch);
+      assertOperationActive(signal);
+      return { ...response, ...identity, historyEpochAtStart };
+    };
 
-  try {
-    const { analysis, repaired } = parseAnalysis(rawText, request.sourceCapture);
-    return { analysis, rawText, repaired };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!message.includes("必须使用中文提示词")) throw error;
+    let rawText = "";
+    try {
+      rawText = await postVisionRequest(request, config, true, "", signal);
+    } catch (error) {
+      if (!shouldRetryWithoutResponseFormat(error, true)) throw error;
+      rawText = await postVisionRequest(request, config, false, "", signal);
+    }
 
-    const retryText = await postVisionRequest(
-      request,
-      config,
-      false,
-      "上一次输出包含英文提示词模板。本次必须把所有面向用户复制使用的提示词模板改写为中文，只保留 [MAIN_TITLE] 这类占位符为英文格式。",
-      signal
-    );
-    const { analysis } = parseAnalysis(retryText, request.sourceCapture);
-    return { analysis, rawText: retryText, repaired: true };
-  }
+    try {
+      const { analysis, repaired } = parseAnalysis(rawText, request.sourceCapture);
+      return finalizeResponse({ analysis, rawText, repaired });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("必须使用中文提示词")) throw error;
+
+      const retryText = await postVisionRequest(
+        request,
+        config,
+        false,
+        "上一次输出包含英文提示词模板。本次必须把所有面向用户复制使用的提示词模板改写为中文，只保留 [MAIN_TITLE] 这类占位符为英文格式。",
+        signal
+      );
+      const { analysis } = parseAnalysis(retryText, request.sourceCapture);
+      return finalizeResponse({ analysis, rawText: retryText, repaired: true });
+    }
   });
 };
 
-const fusePrompt = async (request: FusePromptRequest): Promise<FusePromptResponse> => {
+const fusePrompt = (request: FusePromptRequest): Promise<FusePromptResponse> => {
+  const identity = validateOperationIdentity(request);
   const requestDataEpoch = localDataEpoch;
-  const config = await getEffectiveConfig();
-  if (!config.apiKey.trim()) {
-    throw new Error("请先填写模型 API Key。");
-  }
+  const historyEpochAtStart = historyStore.currentEpoch;
+  const operationId = registryOperationId("fuse", identity.operationId);
   const mode = request.mode === "information_layout" ? "information_layout" : "subject_reference";
   const hasSubjectImage = Boolean(request.subjectImageDataUrl);
   const hasProductInfoText = Boolean(request.productInfoText?.trim());
@@ -564,42 +649,48 @@ const fusePrompt = async (request: FusePromptRequest): Promise<FusePromptRespons
     Boolean(request.editedTextMarkdown?.trim());
   const userText = textInjectionActive ? request.editedTextMarkdown : undefined;
 
-  return withAbortableRequest("fuse", async (signal) => {
-  if (requestDataEpoch !== localDataEpoch) throw new Error(WINDOWS_DATA_CLEAR_ERROR_MESSAGE);
-  let rawText = "";
-  try {
-    rawText = await postFusePromptRequest(request, config, true, "", signal);
-  } catch (error) {
-    if (!shouldRetryWithoutResponseFormat(error, true)) throw error;
-    rawText = await postFusePromptRequest(request, config, false, "", signal);
-  }
+  return withAbortableRequest(extractionOperations, "fuse", operationId, async (signal) => {
+    assertLocalDataEpoch(requestDataEpoch);
+    const config = await getEffectiveConfig();
+    assertLocalDataEpoch(requestDataEpoch);
+    if (!config.apiKey.trim()) throw new Error("请先填写模型 API Key。");
+    const finalizeResponse = (
+      response: Omit<FusePromptResponse, keyof OptionalOperationIdentity | "historyEpochAtStart">
+    ): FusePromptResponse => {
+      assertLocalDataEpoch(requestDataEpoch);
+      assertOperationActive(signal);
+      return { ...response, ...identity, historyEpochAtStart };
+    };
 
-  try {
-    return parseFusedPrompt(rawText, userText);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!shouldRetryFusedPrompt(message)) throw error;
+    let rawText = "";
+    try {
+      rawText = await postFusePromptRequest(request, config, true, "", signal);
+    } catch (error) {
+      if (!shouldRetryWithoutResponseFormat(error, true)) throw error;
+      rawText = await postFusePromptRequest(request, config, false, "", signal);
+    }
 
-    const retryText = await postFusePromptRequest(
-      request,
-      config,
-      false,
-      `上一次输出的融合结果不合格。请重新输出完整 JSON，并严格遵守：fused_prompt 以及 fused_prompt_json 内所有面向用户复制的字段都必须是完整中文自然语言，不能为空。最终提示词是写给一个只能看到一张图片的外部生图模型的单图编辑指令：不能出现“第一张图”“第二张图”“第1张”“第2张”这类图片顺序描述，也不能出现“参考图”“主体参考图”“样式参考图”“风格参考图”“目标图”“目标视觉风格图”“当前解析图”“随附”“主体照片”这类双图视角指代，更不能要求“请同时提供一张照片/图片”。错误示例：“请同时提供一张主体照片，保留主体参考图中的人物。”正确示例：“对这张图片进行风格化重绘：保持图中人物的脸部、体态和人数不变，将画面改为冷调商务海报式构图、低饱和蓝灰配色和柔和侧光。”主体模式把视觉风格来源改写成具体构图、配色、光影、服装、发型或姿态描述，把主体写成“图中最清晰、最突出的前景人物或物体”；产品信息布局模式写成“已解析出的资料卡布局风格”和“用户提供的新产品信息”。${
-        textInjectionActive
-          ? "本次用户已提供编辑后的图中文字：画面可见文字只能来自这段文字，必须按原文使用；所有字段（包括 social_cover_text_layout）都不能出现任何 [XXX] 形式占位符。"
-          : "除 fused_prompt_json.social_cover_text_layout 中允许使用 [SOCIAL_ASPECT_RATIO]、[TOP_SUPER_TITLE]、[BOTTOM_SUPER_TITLE] 之外，不能包含任何 [MAIN_TITLE]、[SUBJECT_GROUP]、[MAIN_OBJECT] 等待填占位符。"
-      }如果用户输入了新产品文字，最终可见文字只能来自用户输入，不得新增用户未输入的标题、卖点、参数、结论、价格、型号、适用场景、评价词或营销词；没有输入的内容块必须留空或省略。并补齐 social_cover_text_layout、information_layout_adaptation、pose_transfer 和 wardrobe_transfer。`,
-      signal
-    );
-    const response = parseFusedPrompt(retryText, userText);
-    return { ...response, repaired: true };
-  }
+    try {
+      return finalizeResponse(parseFusedPrompt(rawText, userText));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!shouldRetryFusedPrompt(message)) throw error;
+
+      const retryText = await postFusePromptRequest(
+        request,
+        config,
+        false,
+        `上一次输出的融合结果不合格。请重新输出完整 JSON，并严格遵守：fused_prompt 以及 fused_prompt_json 内所有面向用户复制的字段都必须是完整中文自然语言，不能为空。最终提示词是写给一个只能看到一张图片的外部生图模型的单图编辑指令：不能出现“第一张图”“第二张图”“第1张”“第2张”这类图片顺序描述，也不能出现“参考图”“主体参考图”“样式参考图”“风格参考图”“目标图”“目标视觉风格图”“当前解析图”“随附”“主体照片”这类双图视角指代，更不能要求“请同时提供一张照片/图片”。错误示例：“请同时提供一张主体照片，保留主体参考图中的人物。”正确示例：“对这张图片进行风格化重绘：保持图中人物的脸部、体态和人数不变，将画面改为冷调商务海报式构图、低饱和蓝灰配色和柔和侧光。”主体模式把视觉风格来源改写成具体构图、配色、光影、服装、发型或姿态描述，把主体写成“图中最清晰、最突出的前景人物或物体”；产品信息布局模式写成“已解析出的资料卡布局风格”和“用户提供的新产品信息”。${
+          textInjectionActive
+            ? "本次用户已提供编辑后的图中文字：画面可见文字只能来自这段文字，必须按原文使用；所有字段（包括 social_cover_text_layout）都不能出现任何 [XXX] 形式占位符。"
+            : "除 fused_prompt_json.social_cover_text_layout 中允许使用 [SOCIAL_ASPECT_RATIO]、[TOP_SUPER_TITLE]、[BOTTOM_SUPER_TITLE] 之外，不能包含任何 [MAIN_TITLE]、[SUBJECT_GROUP]、[MAIN_OBJECT] 等待填占位符。"
+        }如果用户输入了新产品文字，最终可见文字只能来自用户输入，不得新增用户未输入的标题、卖点、参数、结论、价格、型号、适用场景、评价词或营销词；没有输入的内容块必须留空或省略。并补齐 social_cover_text_layout、information_layout_adaptation、pose_transfer 和 wardrobe_transfer。`,
+        signal
+      );
+      const response = parseFusedPrompt(retryText, userText);
+      return finalizeResponse({ ...response, repaired: true });
+    }
   });
-};
-
-const readRawHistory = async (): Promise<unknown[]> => {
-  const history = await readJsonFile<unknown>(historyPath(), []);
-  return Array.isArray(history) ? history : [];
 };
 
 const createWindow = (): void => {
@@ -647,38 +738,43 @@ app.whenReady().then(async () => {
   if (process.platform === "win32") {
     Menu.setApplicationMenu(Menu.buildFromTemplate(windowsApplicationMenuTemplate(!app.isPackaged)));
   }
-  generationService = new GenerationService(userDataDir());
-  imageEditService = new ImageEditService(userDataDir());
+  const generation = new GenerationService(userDataDir());
+  const imageEdit = new ImageEditService(userDataDir(), {
+    backendResolver: (providerId, snapshot) => generation.resolveImageBackend(providerId, snapshot)
+  });
+  generationService = generation;
+  imageEditService = imageEdit;
+  await Promise.all([generation.resumePendingTasks(), imageEdit.resumePendingTasks()]);
   ipcMain.handle("config:get", getConfig);
   ipcMain.handle("config:save", (_event, config: ModelConfigUpdate) => saveConfig(config));
   ipcMain.handle("config:clear", clearConfig);
   ipcMain.handle("data:clear-all", clearAllLocalData);
   ipcMain.handle("image:analyze", (_event, request: AnalyzeImageRequest) => analyzeImage(request));
-  ipcMain.handle("image:cancel-analysis", () => {
-    analyzeAbortController?.abort(new Error("已取消图片分析。"));
+  ipcMain.handle("image:cancel-analysis", (_event, operationId?: string) => {
+    extractionOperations.cancel(operationId, "analyze", new Error("已取消图片分析。"));
   });
   ipcMain.handle("prompt:fuse", (_event, request: FusePromptRequest) => fusePrompt(request));
-  ipcMain.handle("prompt:cancel-fuse", () => {
-    fuseAbortController?.abort(new Error("已取消提示词生成。"));
+  ipcMain.handle("prompt:cancel-fuse", (_event, operationId?: string) => {
+    extractionOperations.cancel(operationId, "fuse", new Error("已取消提示词生成。"));
   });
-  ipcMain.handle("history:get", async () => normalizeHistory(await readRawHistory()));
-  ipcMain.handle("history:save-item", async (_event, item: HistoryItem) => {
-    const normalizedItem = normalizeHistoryItemForStorage(item);
-    const history = await readRawHistory();
-    const nextRaw = [
-      normalizedItem,
-      ...history.filter((entry) => getHistoryEntryId(entry) !== normalizedItem.id)
-    ].slice(0, 50);
-    await writeJsonFile(historyPath(), nextRaw);
-    return normalizeHistory(nextRaw);
+  ipcMain.handle("history:get", async () => (await historyStore.getSnapshot()).items);
+  ipcMain.handle("history:get-snapshot", async () => historyStore.getSnapshot());
+  ipcMain.handle("history:save-item", (_event, request: HistoryItem | HistorySaveItemRequest) => {
+    assertLocalDataMutationAllowed();
+    return historyStore.save(request);
   });
-  ipcMain.handle("history:delete-item", async (_event, id: string) => {
-    const history = await readRawHistory();
-    const nextRaw = history.filter((entry) => getHistoryEntryId(entry) !== id);
-    await writeJsonFile(historyPath(), nextRaw);
-    return normalizeHistory(nextRaw);
+  ipcMain.handle("history:patch-item", (_event, request: HistoryPatchItemRequest) => {
+    assertLocalDataMutationAllowed();
+    return historyStore.patch(request);
   });
-  ipcMain.handle("history:clear", async () => writeJsonFile(historyPath(), []));
+  ipcMain.handle("history:delete-item", (_event, request: string | HistoryDeleteItemRequest) => {
+    assertLocalDataMutationAllowed();
+    return historyStore.delete(request);
+  });
+  ipcMain.handle("history:clear", async () => {
+    assertLocalDataMutationAllowed();
+    return historyStore.clear();
+  });
   ipcMain.handle("generation:config:get", async () => generationService?.getConfig());
   ipcMain.handle("generation:config:save", async (_event, config) => generationService?.saveConfig(config));
   ipcMain.handle("generation:provider:save", async (_event, provider) => generationService?.saveProvider(provider));
@@ -691,6 +787,8 @@ app.whenReady().then(async () => {
     generationService?.reorderProviders(ids)
   );
   ipcMain.handle("generation:tasks:get", async () => generationService?.getTasks());
+  ipcMain.handle("generation:tasks:summaries", async () => generationService?.getTaskSummaries());
+  ipcMain.handle("generation:task:get", async (_event, id: string) => generationService?.getTask(id));
   ipcMain.handle("generation:task:create", async (_event, request) => generationService?.createTask(request));
   ipcMain.handle("generation:task:cancel", async (_event, id: string) => generationService?.cancelTask(id));
   ipcMain.handle("generation:task:visibility", async (_event, update) =>
@@ -702,9 +800,14 @@ app.whenReady().then(async () => {
     saveGenerationOutputs(request)
   );
   ipcMain.handle("imageEdit:tasks:get", async () => imageEditService?.getTasks());
+  ipcMain.handle("imageEdit:tasks:summaries", async () => imageEditService?.getTaskSummaries());
+  ipcMain.handle("imageEdit:task:get", async (_event, id: string) => imageEditService?.getTask(id));
   ipcMain.handle("imageEdit:annotations:resolve", async (_event, request: ImageEditAnnotationResolveRequest) =>
     resolveImageEditAnnotations(request)
   );
+  ipcMain.handle("imageEdit:annotations:cancel", (_event, operationId?: string) => {
+    annotationOperations.cancel(operationId, "annotation", new Error(ANNOTATION_CANCEL_ERROR_MESSAGE));
+  });
   ipcMain.handle("imageEdit:task:create", async (_event, request) => imageEditService?.createTask(request));
   ipcMain.handle("imageEdit:task:cancel", async (_event, id: string) => imageEditService?.cancelTask(id));
   ipcMain.handle("imageEdit:task:retry", async (_event, id: string) => imageEditService?.retryTask(id));

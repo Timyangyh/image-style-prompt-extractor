@@ -74,7 +74,6 @@ export interface GenerationConfig {
   saveApiKey: boolean;
   hasApiKey: boolean;
   codexOAuthAvailable: boolean;
-  codexOAuthPath: string;
   codexOAuthAccountId?: string;
   codexOAuthLastRefresh?: string;
   codexOAuthError?: string;
@@ -134,6 +133,7 @@ export interface GenerationPromptSource {
   kind: GenerationPromptSourceKind;
   label: string;
   historyItemId?: string;
+  sourceExtractionWorkflowId?: string;
   sourceImageDataUrl?: string;
   sourceThumbnailDataUrl?: string;
   sourceFileName?: string;
@@ -157,6 +157,7 @@ export interface GenerationRequestSettings {
 }
 
 export interface GenerationCreateRequest {
+  clientWorkflowId?: string;
   prompt: string;
   promptSource: GenerationPromptSource;
   referenceImages: GenerationReferenceImage[];
@@ -164,6 +165,7 @@ export interface GenerationCreateRequest {
 }
 
 export interface GenerationBackendSnapshot {
+  providerId?: string;
   authSource: GenerationAuthSource;
   providerType: GenerationProviderType;
   providerName?: string;
@@ -222,6 +224,7 @@ export interface GenerationTaskVisibilityUpdate {
 
 export interface GenerationTask {
   id: string;
+  clientWorkflowId?: string;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -446,6 +449,9 @@ export interface ImageEditAnnotationResolution {
 }
 
 export interface ImageEditAnnotationResolveRequest {
+  workflowId?: string;
+  operationId?: string;
+  revision?: number;
   sourceImageDataUrl: string;
   sourceImageModelDataUrl?: string;
   annotationImageDataUrl: string;
@@ -455,6 +461,9 @@ export interface ImageEditAnnotationResolveRequest {
 }
 
 export interface ImageEditAnnotationResolveResponse {
+  workflowId?: string;
+  operationId?: string;
+  revision?: number;
   resolution: ImageEditAnnotationResolution;
   fallbackReason?: string;
 }
@@ -493,6 +502,7 @@ export interface ImageEditRequestSettings {
 }
 
 export interface ImageEditCreateRequest {
+  clientWorkflowId?: string;
   sourceImage: ImageEditSourceImage;
   sourceIntegrity?: ImageEditSourceIntegrity;
   annotationImage: ImageEditAnnotationImage;
@@ -505,6 +515,7 @@ export interface ImageEditCreateRequest {
 }
 
 export interface ImageEditBackendSnapshot {
+  providerId?: string;
   authSource: GenerationAuthSource;
   providerType: GenerationProviderType;
   providerName?: string;
@@ -585,6 +596,7 @@ export type ImageEditOutputsSaveResult = GenerationOutputsSaveResult;
 
 export interface ImageEditTask {
   id: string;
+  clientWorkflowId?: string;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -616,6 +628,9 @@ export interface ImageEditTask {
 }
 
 export interface AnalyzeImageRequest {
+  workflowId?: string;
+  operationId?: string;
+  revision?: number;
   imageDataUrl: string;
   mimeType: string;
   strictGeneralization: boolean;
@@ -623,6 +638,10 @@ export interface AnalyzeImageRequest {
 }
 
 export interface AnalyzeImageResponse {
+  workflowId?: string;
+  operationId?: string;
+  revision?: number;
+  historyEpochAtStart?: number;
   analysis: StyleAnalysis;
   rawText: string;
   repaired: boolean;
@@ -637,6 +656,9 @@ export interface FusePromptControls {
 }
 
 export interface FusePromptRequest {
+  workflowId?: string;
+  operationId?: string;
+  revision?: number;
   styleAnalysis: StyleAnalysis;
   mode?: FusePromptMode;
   subjectImageDataUrl?: string;
@@ -710,6 +732,10 @@ export interface FusedPromptResult {
 }
 
 export interface FusePromptResponse {
+  workflowId?: string;
+  operationId?: string;
+  revision?: number;
+  historyEpochAtStart?: number;
   result: FusedPromptResult;
   rawText: string;
   repaired: boolean;
@@ -729,6 +755,45 @@ export interface HistoryItem {
   fusedPromptResult?: FusedPromptResult;
   fusedPromptCreatedAt?: string;
 }
+
+export interface HistorySnapshot {
+  items: HistoryItem[];
+  epoch: number;
+}
+
+export interface HistorySaveItemRequest {
+  item: HistoryItem;
+  expectedHistoryEpoch?: number;
+}
+
+export interface HistoryItemPatch {
+  editedTextMarkdown?: string;
+  fusedPromptResult?: FusedPromptResult;
+  fusedPromptCreatedAt?: string;
+}
+
+export interface HistoryPatchItemRequest extends HistoryItemPatch {
+  id: string;
+  expectedHistoryEpoch?: number;
+}
+
+export interface HistoryDeleteItemRequest {
+  id: string;
+  expectedHistoryEpoch?: number;
+}
+
+export interface TaskStatusSummary<Status extends string, Visibility extends string> {
+  id: string;
+  clientWorkflowId?: string;
+  status: Status;
+  updatedAt: string;
+  outputCount: number;
+  error?: string;
+  visibility: Visibility;
+}
+
+export type GenerationTaskSummary = TaskStatusSummary<GenerationTaskStatus, GenerationTaskVisibility>;
+export type ImageEditTaskSummary = TaskStatusSummary<ImageEditTaskStatus, ImageEditTaskVisibility>;
 
 export type SourceCaptureSourceType =
   | "uploaded_image"
@@ -964,13 +1029,15 @@ export interface AppApi {
   getConfig: () => Promise<ModelConfig>;
   saveConfig: (config: ModelConfigUpdate) => Promise<ModelConfig>;
   analyzeImage: (request: AnalyzeImageRequest) => Promise<AnalyzeImageResponse>;
-  cancelAnalyzeImage: () => Promise<void>;
+  cancelAnalyzeImage: (operationId?: string) => Promise<void>;
   fusePrompt: (request: FusePromptRequest) => Promise<FusePromptResponse>;
-  cancelFusePrompt: () => Promise<void>;
+  cancelFusePrompt: (operationId?: string) => Promise<void>;
   exportJson: (payload: StyleAnalysis) => Promise<{ canceled: boolean; filePath?: string }>;
   getHistory: () => Promise<HistoryItem[]>;
-  saveHistoryItem: (item: HistoryItem) => Promise<HistoryItem[]>;
-  deleteHistoryItem: (id: string) => Promise<HistoryItem[]>;
+  getHistorySnapshot: () => Promise<HistorySnapshot>;
+  saveHistoryItem: (request: HistoryItem | HistorySaveItemRequest) => Promise<HistoryItem[]>;
+  patchHistoryItem: (request: HistoryPatchItemRequest) => Promise<HistoryItem[]>;
+  deleteHistoryItem: (request: string | HistoryDeleteItemRequest) => Promise<HistoryItem[]>;
   clearHistory: () => Promise<void>;
   clearConfig: () => Promise<ModelConfig>;
   clearAllLocalData: () => Promise<ModelConfig>;
@@ -982,6 +1049,8 @@ export interface AppApi {
   selectGenerationProvider: (id: string) => Promise<GenerationConfig>;
   reorderGenerationProviders: (ids: string[]) => Promise<GenerationConfig>;
   getGenerationTasks: () => Promise<GenerationTask[]>;
+  getGenerationTaskSummaries: () => Promise<GenerationTaskSummary[]>;
+  getGenerationTask: (id: string) => Promise<GenerationTask | null>;
   createGenerationTask: (request: GenerationCreateRequest) => Promise<GenerationTask>;
   cancelGenerationTask: (id: string) => Promise<GenerationTask | null>;
   updateGenerationTaskVisibility: (update: GenerationTaskVisibilityUpdate) => Promise<GenerationTask[]>;
@@ -989,7 +1058,10 @@ export interface AppApi {
   clearGenerationTasks: () => Promise<void>;
   saveGenerationOutputs: (request: GenerationOutputsSaveRequest) => Promise<GenerationOutputsSaveResult>;
   getImageEditTasks: () => Promise<ImageEditTask[]>;
+  getImageEditTaskSummaries: () => Promise<ImageEditTaskSummary[]>;
+  getImageEditTask: (id: string) => Promise<ImageEditTask | null>;
   resolveImageEditAnnotations: (request: ImageEditAnnotationResolveRequest) => Promise<ImageEditAnnotationResolveResponse>;
+  cancelImageEditAnnotationResolution: (operationId?: string) => Promise<void>;
   createImageEditTask: (request: ImageEditCreateRequest) => Promise<ImageEditTask>;
   cancelImageEditTask: (id: string) => Promise<ImageEditTask | null>;
   retryImageEditTask: (id: string) => Promise<ImageEditTask>;

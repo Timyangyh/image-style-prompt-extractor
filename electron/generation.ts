@@ -13,9 +13,11 @@ import {
   GenerationRequestSizeStrategy,
   GenerationRequestSettings,
   GenerationTask,
+  GenerationTaskSummary,
   GenerationTaskVisibility,
   GenerationTaskVisibilityUpdate
 } from "../src/shared/types";
+import { WORKSPACE_CAPACITY_REACHED, WORKSPACE_CONCURRENCY_LIMIT } from "../src/shared/workspace-concurrency";
 import {
   defaultGenerationAspectRatio,
   defaultGenerationResolution,
@@ -24,6 +26,7 @@ import {
 } from "../src/shared/generation-size";
 import { CodexAuthState, getCodexAuthStatus, loadCodexAuthState, refreshCodexAuthState } from "./codex-auth";
 import { buildCodexHeaders } from "./codex-request";
+import { sanitizePublicError as sanitizeSummaryError } from "./error-sanitizer";
 import {
   geminiGenerateContentEndpoint,
   isGoogleGeminiEndpoint,
@@ -93,6 +96,22 @@ interface StoredGenerationProvider {
 
 type ImageResult = Omit<GenerationOutput, "id" | "createdAt">;
 
+export interface GenerationExecutionBackend {
+  authSource: GenerationConfig["authSource"];
+  providerId?: string;
+  providerType: GenerationProviderType;
+  providerName?: string;
+  apiBaseUrl: string;
+  apiKey: string;
+  apiMode: GenerationConfig["apiMode"];
+  imageModel: string;
+  mainModel: string;
+}
+
+export interface GenerationServiceOptions {
+  runner?: (task: GenerationTask, backend: GenerationExecutionBackend, signal: AbortSignal) => Promise<ImageResult[]>;
+}
+
 const LEGACY_DEFAULT_MAIN_MODEL = "gpt-5.4-mini";
 const DEFAULT_MAIN_MODEL = "gpt-5.5";
 const DEFAULT_REASONING_EFFORT = "high";
@@ -118,6 +137,14 @@ const MAX_STORED_TASKS = 80;
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 
 const clamp = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max);
+
+const isActiveTask = (task: Pick<GenerationTask, "status">): boolean =>
+  task.status === "queued" || task.status === "running";
+
+const capacityError = (): Error & { code: typeof WORKSPACE_CAPACITY_REACHED } =>
+  Object.assign(new Error(`生图工作区最多同时保留 ${WORKSPACE_CONCURRENCY_LIMIT} 个进行中的任务。`), {
+    code: WORKSPACE_CAPACITY_REACHED
+  });
 
 const createDefaultProvider = (apiKey = ""): EffectiveGenerationProvider => {
   const now = new Date().toISOString();
@@ -199,7 +226,6 @@ const publicConfig = async (config: EffectiveGenerationConfig): Promise<Generati
     saveApiKey: activeProvider.saveApiKey,
     hasApiKey: Boolean(activeProvider.apiKey),
     codexOAuthAvailable: codexStatus.available,
-    codexOAuthPath: codexStatus.path,
     codexOAuthAccountId: codexStatus.accountId,
     codexOAuthLastRefresh: codexStatus.lastRefresh,
     codexOAuthError: codexStatus.error,
@@ -210,6 +236,7 @@ const publicConfig = async (config: EffectiveGenerationConfig): Promise<Generati
 const backendSnapshotForConfig = (config: EffectiveGenerationConfig): GenerationTask["backend"] => {
   const activeProvider = activeProviderForConfig(config);
   return {
+    providerId: activeProvider.id,
     authSource: config.authSource,
     providerType: activeProvider.providerType,
     providerName: activeProvider.name,
@@ -1510,15 +1537,19 @@ const summarizeOutputProblems = (
 };
 
 export class GenerationService {
+  private readonly runner: NonNullable<GenerationServiceOptions["runner"]>;
   private runtimeConfig: EffectiveGenerationConfig | null = null;
   private abortControllers = new Map<string, AbortController>();
   private activeTaskRuns = new Set<Promise<void>>();
   private dataEpoch = 0;
   private isClearingAll = false;
+  private clearOperation: Promise<void> | null = null;
   private isQueuePumpActive = false;
   private taskMutationQueue: Promise<unknown> = Promise.resolve();
 
-  constructor(private readonly rootDir: string) {}
+  constructor(private readonly rootDir: string, options: GenerationServiceOptions = {}) {
+    this.runner = options.runner || ((task, backend, signal) => this.generateWithSizeRetry(task, backend, signal));
+  }
 
   private configPath(): string {
     return join(this.rootDir, "generation", "config.json");
@@ -1569,7 +1600,11 @@ export class GenerationService {
       authSource: update.authSource === "api" ? "api" : "codex_oauth",
       activeProviderId: nextProvider.id,
       providers: nextProviders,
-      imagesConcurrency: clamp(Math.round(update.imagesConcurrency || defaultConfig.imagesConcurrency), 1, 16)
+      imagesConcurrency: clamp(
+        Math.round(update.imagesConcurrency || defaultConfig.imagesConcurrency),
+        1,
+        WORKSPACE_CONCURRENCY_LIMIT
+      )
     });
     await this.writeStoredConfig(next);
     this.runtimeConfig = next;
@@ -1708,7 +1743,7 @@ export class GenerationService {
     return publicConfig(this.runtimeConfig);
   }
 
-  async clearAll(platform: NodeJS.Platform = process.platform): Promise<void> {
+  async clearAll(_platform: NodeJS.Platform = process.platform): Promise<void> {
     const provider = createDefaultProvider();
     this.runtimeConfig = configWithActiveProvider({
       authSource: defaultConfig.authSource,
@@ -1716,34 +1751,43 @@ export class GenerationService {
       providers: [provider],
       imagesConcurrency: defaultConfig.imagesConcurrency
     });
-    if (platform !== "win32") {
-      await rm(join(this.rootDir, "generation"), { recursive: true, force: true });
-      return;
-    }
-
-    this.isClearingAll = true;
-    this.dataEpoch += 1;
-    try {
-      for (const controller of this.abortControllers.values()) {
-        controller.abort(new Error("已抹除全部本机数据。"));
-      }
-      await Promise.allSettled([...this.activeTaskRuns]);
-      await this.taskMutationQueue;
-      this.abortControllers.clear();
-      await rm(join(this.rootDir, "generation"), { recursive: true, force: true });
-    } finally {
-      this.isClearingAll = false;
-    }
+    await this.clearTaskData(true, "已抹除全部本机数据。");
   }
 
   async getTasks(): Promise<GenerationTask[]> {
-    return this.reconcileStaleRunningTasks(await this.readTasks());
+    await this.reconcileStaleRunningTasks();
+    return this.readTasks();
+  }
+
+  async resumePendingTasks(): Promise<void> {
+    await this.reconcileStaleRunningTasks();
+    this.scheduleQueueProcessing();
+  }
+
+  async getTaskSummaries(): Promise<GenerationTaskSummary[]> {
+    await this.reconcileStaleRunningTasks();
+    const tasks = await this.readTasks();
+    return tasks.map((task) => ({
+      id: task.id,
+      clientWorkflowId: task.clientWorkflowId || `task:${task.id}`,
+      status: task.status,
+      updatedAt: task.updatedAt,
+      outputCount: Array.isArray(task.outputs) ? task.outputs.length : 0,
+      error: sanitizeSummaryError(task.error),
+      visibility: normalizeTaskVisibility(task.visibility)
+    }));
+  }
+
+  async getTask(id: string): Promise<GenerationTask | null> {
+    if (!id.trim()) return null;
+    await this.reconcileStaleRunningTasks();
+    return (await this.readTasks()).find((item) => item.id === id) || null;
   }
 
   async deleteTask(id: string): Promise<GenerationTask[]> {
     this.abortControllers.get(id)?.abort(new Error("已删除生图任务。"));
-    this.abortControllers.delete(id);
     const tasks = await this.mutateTasks((currentTasks) => {
+      this.abortControllers.get(id)?.abort(new Error("已删除生图任务。"));
       const nextTasks = currentTasks.filter((task) => task.id !== id);
       return { tasks: nextTasks, result: nextTasks };
     });
@@ -1752,16 +1796,13 @@ export class GenerationService {
   }
 
   async clearTasks(): Promise<void> {
-    for (const controller of this.abortControllers.values()) {
-      controller.abort(new Error("已清空生图任务。"));
-    }
-    this.abortControllers.clear();
-    await this.mutateTasks(() => ({ tasks: [], result: undefined }));
+    await this.clearTaskData(false, "已清空生图任务。");
   }
 
   async cancelTask(id: string): Promise<GenerationTask | null> {
     this.abortControllers.get(id)?.abort(new Error("已取消生图任务。"));
     const task = await this.mutateTasks((tasks) => {
+      this.abortControllers.get(id)?.abort(new Error("已取消生图任务。"));
       const taskIndex = tasks.findIndex((item) => item.id === id);
       if (taskIndex === -1) return { tasks, result: null };
       const task = tasks[taskIndex];
@@ -1808,6 +1849,8 @@ export class GenerationService {
   }
 
   async createTask(request: GenerationCreateRequest): Promise<GenerationTask> {
+    const creationEpoch = this.dataEpoch;
+    if (this.isClearingAll) throw new Error("生图任务正在清理，请稍后再试。");
     const config = await this.getEffectiveConfig();
     if (config.authSource === "api" && !config.apiKey.trim()) throw new Error("请先填写生图 API Key。");
     if (config.authSource === "codex_oauth") {
@@ -1820,6 +1863,7 @@ export class GenerationService {
     const now = new Date().toISOString();
     const task: GenerationTask = {
       id: randomUUID(),
+      clientWorkflowId: normalized.clientWorkflowId,
       createdAt: now,
       updatedAt: now,
       status: "queued",
@@ -1831,9 +1875,43 @@ export class GenerationService {
       backend: backendSnapshotForConfig(config),
       outputs: []
     };
-    await this.upsertTask(task);
+    await this.mutateTasks((tasks) => {
+      if (this.isClearingAll || creationEpoch !== this.dataEpoch) {
+        throw new Error("生图任务数据已被清理，请重新提交。");
+      }
+      if (tasks.filter(isActiveTask).length >= WORKSPACE_CONCURRENCY_LIMIT) throw capacityError();
+      return { tasks: [task, ...tasks], result: undefined };
+    });
     this.scheduleQueueProcessing();
     return task;
+  }
+
+  private async clearTaskData(removeDomain: boolean, reason: string): Promise<void> {
+    if (this.clearOperation) {
+      await this.clearOperation;
+      if (removeDomain) await this.clearTaskData(true, reason);
+      return;
+    }
+    this.isClearingAll = true;
+    this.dataEpoch += 1;
+    const operation = (async () => {
+      for (const controller of this.abortControllers.values()) controller.abort(new Error(reason));
+      await Promise.allSettled([...this.activeTaskRuns]);
+      await this.taskMutationQueue;
+      this.abortControllers.clear();
+      if (removeDomain) {
+        await rm(join(this.rootDir, "generation"), { recursive: true, force: true });
+      } else {
+        await this.mutateTasks(() => ({ tasks: [], result: undefined }));
+      }
+    })();
+    this.clearOperation = operation;
+    try {
+      await operation;
+    } finally {
+      this.clearOperation = null;
+      this.isClearingAll = false;
+    }
   }
 
   private scheduleQueueProcessing(): void {
@@ -1848,16 +1926,18 @@ export class GenerationService {
       while (true) {
         if (this.isClearingAll) return;
         const config = await this.getEffectiveConfig();
-        const availableSlots = clamp(config.imagesConcurrency, 1, 16) - this.abortControllers.size;
+        const availableSlots =
+          clamp(config.imagesConcurrency, 1, WORKSPACE_CONCURRENCY_LIMIT) - this.abortControllers.size;
         if (availableSlots <= 0) return;
-        const tasks = await this.reconcileStaleRunningTasks(await this.readTasks());
+        await this.reconcileStaleRunningTasks();
+        const tasks = await this.readTasks();
         const queuedTasks = tasks
           .filter((task) => task.status === "queued")
           .sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime())
           .slice(0, availableSlots);
         if (!queuedTasks.length) return;
         for (const queuedTask of queuedTasks) {
-          await this.startQueuedTask(queuedTask, config);
+          await this.startQueuedTask(queuedTask);
         }
       }
     } finally {
@@ -1866,73 +1946,111 @@ export class GenerationService {
       if (
         !this.isClearingAll &&
         tasks.some((task) => task.status === "queued") &&
-        this.abortControllers.size < (await this.getEffectiveConfig()).imagesConcurrency
+        this.abortControllers.size <
+          clamp((await this.getEffectiveConfig()).imagesConcurrency, 1, WORKSPACE_CONCURRENCY_LIMIT)
       ) {
         this.scheduleQueueProcessing();
       }
     }
   }
 
-  private async startQueuedTask(task: GenerationTask, config: EffectiveGenerationConfig): Promise<void> {
-    const dataEpoch = this.dataEpoch;
-    const latestTask = (await this.readTasks()).find((item) => item.id === task.id);
-    if (this.isClearingAll || dataEpoch !== this.dataEpoch || !latestTask || latestTask.status !== "queued") return;
-    const now = new Date().toISOString();
-    const runningTask: GenerationTask = {
-      ...latestTask,
-      status: "running",
-      startedAt: latestTask.startedAt || now,
-      updatedAt: now,
-      error: undefined
-    };
+  private async startQueuedTask(task: GenerationTask): Promise<void> {
+    const runEpoch = this.dataEpoch;
     const controller = new AbortController();
+    let runningTask: GenerationTask | null = null;
+    try {
+      runningTask = await this.mutateTasks((tasks) => {
+        const taskIndex = tasks.findIndex((item) => item.id === task.id);
+        const latestTask = taskIndex >= 0 ? tasks[taskIndex] : undefined;
+        if (
+          this.isClearingAll ||
+          runEpoch !== this.dataEpoch ||
+          !latestTask ||
+          latestTask.status !== "queued" ||
+          this.abortControllers.has(task.id)
+        ) {
+          return { tasks, result: null };
+        }
+        const now = new Date().toISOString();
+        const nextTask: GenerationTask = {
+          ...latestTask,
+          status: "running",
+          startedAt: latestTask.startedAt || now,
+          updatedAt: now,
+          error: undefined
+        };
+        this.abortControllers.set(nextTask.id, controller);
+        const nextTasks = [...tasks];
+        nextTasks[taskIndex] = nextTask;
+        return { tasks: nextTasks, result: nextTask };
+      });
+    } catch (error) {
+      if (this.abortControllers.get(task.id) === controller) this.abortControllers.delete(task.id);
+      throw error;
+    }
+    if (!runningTask) return;
+    const canRun = await this.mutateTasks((tasks) => ({
+      tasks,
+      result:
+        !this.isClearingAll &&
+        runEpoch === this.dataEpoch &&
+        this.abortControllers.get(task.id) === controller &&
+        tasks.some((item) => item.id === task.id && item.status === "running")
+    }));
+    if (!canRun || controller.signal.aborted) {
+      if (this.abortControllers.get(task.id) === controller) this.abortControllers.delete(task.id);
+      return;
+    }
     const timeout = setTimeout(() => {
       controller.abort(new Error("生图请求超过 10 分钟未响应，请检查 Base URL 或稍后重试。"));
     }, GENERATION_TIMEOUT_MS);
-    this.abortControllers.set(runningTask.id, controller);
-    await this.upsertTask(runningTask);
 
-    const taskRun = this.runQueuedTask(runningTask, config, controller, timeout);
+    const taskRun = this.runQueuedTask(runningTask, runEpoch, controller, timeout);
     this.activeTaskRuns.add(taskRun);
     void taskRun.finally(() => this.activeTaskRuns.delete(taskRun)).catch(() => undefined);
   }
 
   private async runQueuedTask(
     task: GenerationTask,
-    config: EffectiveGenerationConfig,
+    runEpoch: number,
     controller: AbortController,
     timeout: NodeJS.Timeout
   ): Promise<void> {
     try {
-      const results = await this.generateWithSizeRetry(task, config, controller.signal);
-      task.outputs = results.map((result) => ({
+      const backend = await this.resolveImageBackend(task.backend?.providerId, task.backend);
+      const results = await this.runner(task, backend, controller.signal);
+      const outputs = results.map((result) => ({
         ...result,
+        error: sanitizeSummaryError(result.error),
         id: randomUUID(),
         createdAt: new Date().toISOString()
       }));
-      const outputProblem = summarizeOutputProblems(task.outputs, task.settings.n);
-      task.status = task.outputs.length === task.settings.n && !outputProblem ? "succeeded" : "partial_failed";
-      if (!task.outputs.length) task.status = "failed";
-      task.error = outputProblem;
-      task.updatedAt = new Date().toISOString();
-      task.completedAt = task.updatedAt;
-      await this.upsertTask(task);
+      const outputProblem = sanitizeSummaryError(summarizeOutputProblems(outputs, task.settings.n));
+      const status = !outputs.length
+        ? "failed"
+        : outputs.length === task.settings.n && !outputProblem
+          ? "succeeded"
+          : "partial_failed";
+      await this.finishRunningTask(task.id, runEpoch, {
+        status,
+        outputs,
+        error: outputProblem
+      });
     } catch (error) {
-      task.updatedAt = new Date().toISOString();
-      task.completedAt = task.updatedAt;
-      task.status = controller.signal.aborted ? "canceled" : "failed";
-      task.error = error instanceof Error ? error.message : String(error);
-      await this.upsertTask(task);
+      await this.finishRunningTask(task.id, runEpoch, {
+        status: controller.signal.aborted ? "canceled" : "failed",
+        error: sanitizeSummaryError(error instanceof Error ? error.message : String(error))
+      });
     } finally {
       clearTimeout(timeout);
-      this.abortControllers.delete(task.id);
+      if (this.abortControllers.get(task.id) === controller) this.abortControllers.delete(task.id);
       this.scheduleQueueProcessing();
     }
   }
 
   private async generateWithSizeRetry(
     task: GenerationTask,
-    config: EffectiveGenerationConfig,
+    config: GenerationExecutionBackend,
     signal: AbortSignal
   ): Promise<ImageResult[]> {
     let results = await this.generate(task, config, signal);
@@ -1944,12 +2062,14 @@ export class GenerationService {
       const retriedResults = await this.generate(task, config, signal);
       if (retriedResults.length) results = retriedResults;
     } catch (error) {
-      const retryMessage = error instanceof Error ? error.message : String(error);
+      const retryMessage = sanitizeSummaryError(error instanceof Error ? error.message : String(error));
       results = results.map((result) =>
         result.error
           ? {
               ...result,
-              error: `${result.error} 自动重试一次仍未拿到合规尺寸：${retryMessage}`
+              error: sanitizeSummaryError(
+                `${result.error} 自动重试一次仍未拿到合规尺寸：${retryMessage || "未知错误"}`
+              )
             }
           : result
       );
@@ -1962,7 +2082,7 @@ export class GenerationService {
 
   private async generate(
     task: GenerationTask,
-    config: EffectiveGenerationConfig,
+    config: GenerationExecutionBackend,
     signal: AbortSignal
   ): Promise<ImageResult[]> {
     const referenceImages = task.referenceImages.map((image) => image.dataUrl);
@@ -2066,6 +2186,52 @@ export class GenerationService {
     }));
   }
 
+  async resolveImageBackend(
+    providerId?: string,
+    snapshot?: GenerationTask["backend"]
+  ): Promise<GenerationExecutionBackend> {
+    const config = await this.getEffectiveConfig();
+    const authSource = snapshot?.authSource || config.authSource;
+    const requestedProviderId = snapshot?.providerId || providerId;
+    if (authSource === "codex_oauth") {
+      const status = await getCodexAuthStatus();
+      if (!status.available) {
+        throw new Error(`创建任务时使用的 Codex OAuth 凭证当前不可用。${status.error ? `（${status.error}）` : ""}`);
+      }
+      const activeProvider = activeProviderForConfig(config);
+      return {
+        authSource,
+        providerId: requestedProviderId,
+        providerType: snapshot?.providerType || activeProvider.providerType,
+        providerName: snapshot?.providerName || activeProvider.name,
+        apiBaseUrl: snapshot?.apiBaseUrl || activeProvider.apiBaseUrl,
+        apiKey: "",
+        apiMode: snapshot?.apiMode || "responses",
+        imageModel: snapshot?.imageModel || activeProvider.imageModel,
+        mainModel: snapshot?.mainModel || activeProvider.mainModel
+      };
+    }
+
+    const provider = requestedProviderId
+      ? config.providers.find((item) => item.id === requestedProviderId)
+      : activeProviderForConfig(config);
+    if (!provider) throw new Error("创建任务时使用的生图供应商已被删除，任务无法继续。");
+    if (!provider.apiKey.trim()) {
+      throw new Error("创建任务时使用的生图供应商凭证当前不可用，请恢复后重试。");
+    }
+    return {
+      authSource: "api",
+      providerId: requestedProviderId || provider.id,
+      providerType: snapshot?.providerType || provider.providerType,
+      providerName: snapshot?.providerName || provider.name,
+      apiBaseUrl: snapshot?.apiBaseUrl || provider.apiBaseUrl,
+      apiKey: provider.apiKey,
+      apiMode: snapshot?.apiMode || provider.apiMode,
+      imageModel: snapshot?.imageModel || provider.imageModel,
+      mainModel: snapshot?.mainModel || provider.mainModel
+    };
+  }
+
   private async readStoredConfig(): Promise<{
     config: EffectiveGenerationConfig;
     hasLegacyPlainApiKey: boolean;
@@ -2087,7 +2253,11 @@ export class GenerationService {
               : defaultConfig.authSource,
       activeProviderId,
       providers,
-      imagesConcurrency: clamp(Math.round(stored.imagesConcurrency || defaultConfig.imagesConcurrency), 1, 16)
+      imagesConcurrency: clamp(
+        Math.round(stored.imagesConcurrency || defaultConfig.imagesConcurrency),
+        1,
+        WORKSPACE_CONCURRENCY_LIMIT
+      )
     });
     return {
       config,
@@ -2139,27 +2309,73 @@ export class GenerationService {
     return config;
   }
 
-  private async readTasks(): Promise<GenerationTask[]> {
+  private async readTasksWithMetadata(): Promise<{ tasks: GenerationTask[]; normalized: boolean }> {
     const tasks = await readJsonFile<GenerationTask[]>(this.tasksPath(), []);
-    return Array.isArray(tasks) ? tasks : [];
+    if (!Array.isArray(tasks)) return { tasks: [], normalized: false };
+    let normalized = false;
+    const sanitized = tasks.map((task) => {
+      const error = sanitizeSummaryError(task.error);
+      let outputChanged = false;
+      const outputs = task.outputs.map((output) => {
+        const outputError = sanitizeSummaryError(output.error);
+        if (outputError === output.error) return output;
+        outputChanged = true;
+        return { ...output, error: outputError };
+      });
+      if (error === task.error && !outputChanged) return task;
+      normalized = true;
+      return { ...task, error, outputs };
+    });
+    return { tasks: sanitized, normalized };
   }
 
-  private async reconcileStaleRunningTasks(tasks: GenerationTask[]): Promise<GenerationTask[]> {
-    let changed = false;
-    const now = new Date().toISOString();
-    const next = tasks.map((task) => {
-      if (task.status !== "running" || this.abortControllers.has(task.id)) return task;
-      changed = true;
-      return {
-        ...task,
-        status: "failed" as const,
-        updatedAt: now,
-        completedAt: now,
-        error: task.error || "应用或生图进程已重启，这条运行中的任务未完成，请重试。"
-      };
+  private async readTasks(): Promise<GenerationTask[]> {
+    return (await this.readTasksWithMetadata()).tasks;
+  }
+
+  private async reconcileStaleRunningTasks(): Promise<void> {
+    await this.mutateTasks((tasks) => {
+      const now = new Date().toISOString();
+      let changed = false;
+      const next = tasks.map((task) =>
+        task.status !== "running" || this.abortControllers.has(task.id)
+          ? task
+          : ((changed = true), {
+              ...task,
+              status: "failed" as const,
+              updatedAt: now,
+              completedAt: now,
+              error: task.error || "应用或生图进程已重启，这条运行中的任务未完成，请重试。"
+            })
+      );
+      return { tasks: changed ? next : tasks, result: undefined };
     });
-    if (changed) await this.writeTasks(next);
-    return next;
+  }
+
+  private async finishRunningTask(
+    id: string,
+    runEpoch: number,
+    update: Pick<GenerationTask, "status" | "error"> & { outputs?: GenerationOutput[] }
+  ): Promise<GenerationTask | null> {
+    return this.mutateTasks((tasks) => {
+      const taskIndex = tasks.findIndex((item) => item.id === id);
+      const task = taskIndex >= 0 ? tasks[taskIndex] : undefined;
+      if (!task || task.status !== "running" || runEpoch !== this.dataEpoch) {
+        return { tasks, result: null };
+      }
+      const now = new Date().toISOString();
+      const finishedTask: GenerationTask = {
+        ...task,
+        status: update.status,
+        outputs: update.outputs || task.outputs,
+        error: update.error,
+        updatedAt: now,
+        completedAt: now
+      };
+      const nextTasks = [...tasks];
+      nextTasks[taskIndex] = finishedTask;
+      return { tasks: nextTasks, result: finishedTask };
+    });
   }
 
   private async writeTasks(tasks: GenerationTask[]): Promise<void> {
@@ -2171,9 +2387,9 @@ export class GenerationService {
     mutation: (tasks: GenerationTask[]) => { tasks: GenerationTask[]; result: Result } | Promise<{ tasks: GenerationTask[]; result: Result }>
   ): Promise<Result> {
     const runMutation = this.taskMutationQueue.then(async () => {
-      const currentTasks = await this.readTasks();
+      const { tasks: currentTasks, normalized } = await this.readTasksWithMetadata();
       const { tasks, result } = await mutation(currentTasks);
-      await this.writeTasks(tasks);
+      if (normalized || tasks !== currentTasks) await this.writeTasks(tasks);
       return result;
     });
     this.taskMutationQueue = runMutation.then(
@@ -2183,10 +2399,4 @@ export class GenerationService {
     return runMutation;
   }
 
-  private async upsertTask(task: GenerationTask): Promise<void> {
-    await this.mutateTasks((tasks) => {
-      const next = [task, ...tasks.filter((item) => item.id !== task.id)].slice(0, MAX_STORED_TASKS);
-      return { tasks: next, result: undefined };
-    });
-  }
 }

@@ -212,14 +212,14 @@ try {
   let page = launchedState.page;
 
   assert.equal(await page.title(), "图片复刻大师");
-  await page.getByText("支持拖拽、选择文件、Ctrl + V").first().waitFor();
+  await page.getByText("当前没有图片解析流程。").waitFor();
   await page.locator('input[type="file"]').first().setInputFiles(sourceImagePath);
   await page.locator('img[alt="待分析图片预览"]').waitFor();
 
   await page.getByRole("button", { name: "生图工作台" }).click();
-  await page.getByRole("heading", { name: "生图工作台" }).waitFor();
+  await page.getByText("当前没有生图流程。").waitFor();
   await page.getByRole("button", { name: "改图工作台" }).click();
-  await page.getByRole("heading", { name: "改图工作台" }).waitFor();
+  await page.getByText("当前没有改图流程。").waitFor();
   await page.getByRole("button", { name: "提示词提取" }).click();
 
   const modelConfig = await page.evaluate(async ({ secret }) => {

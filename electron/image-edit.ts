@@ -22,10 +22,12 @@ import type {
   ImageEditOriginReference,
   ImageEditOutputsSaveRequest,
   ImageEditTask,
+  ImageEditTaskSummary,
   ImageEditStoredFidelityMode,
   ImageEditTaskVisibility,
   ImageEditTaskVisibilityUpdate
 } from "../src/shared/types";
+import { WORKSPACE_CAPACITY_REACHED, WORKSPACE_CONCURRENCY_LIMIT } from "../src/shared/workspace-concurrency";
 import {
   assertConfirmedAnnotationResolution,
   buildOriginRegenerationPrompt,
@@ -38,6 +40,7 @@ import {
 } from "../src/shared/generation-size";
 import { CodexAuthState, getCodexAuthStatus, loadCodexAuthState, refreshCodexAuthState } from "./codex-auth";
 import { buildCodexHeaders } from "./codex-request";
+import { sanitizePublicError as sanitizeSummaryError } from "./error-sanitizer";
 import {
   buildChatCompletionsImagePayload,
   buildCodexResponsesPayload,
@@ -54,6 +57,7 @@ import {
   parseOpenRouterImagesResponse,
   parseResponsesImageResponse
 } from "./generation";
+import type { GenerationExecutionBackend } from "./generation";
 import {
   geminiGenerateContentEndpoint,
   isGoogleGeminiEndpoint,
@@ -66,13 +70,20 @@ import {
 type ImageEditRunnerOutput = Omit<ImageEditOutput, "id" | "createdAt" | "assetFileName">;
 type ImageEditTaskRunner = (task: ImageEditTask, signal: AbortSignal) => Promise<ImageEditRunnerOutput[]>;
 
-interface ImageEditServiceOptions {
+export type ImageEditBackendResolver = (
+  providerId?: string,
+  snapshot?: ImageEditTask["backend"]
+) => Promise<GenerationExecutionBackend>;
+
+export interface ImageEditServiceOptions {
   concurrency?: number;
   runner?: ImageEditTaskRunner;
+  backendResolver?: ImageEditBackendResolver;
 }
 
 interface EffectiveImageEditBackend {
   authSource: GenerationAuthSource;
+  providerId?: string;
   providerType: GenerationProviderType;
   providerName?: string;
   apiBaseUrl: string;
@@ -153,6 +164,14 @@ const MAX_IMAGE_EDIT_SOURCE_BYTES = 32 * 1024 * 1024;
 const MAX_IMAGE_EDIT_SOURCE_PIXELS = 12_000_000;
 
 const clamp = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max);
+
+const isActiveTask = (task: Pick<ImageEditTask, "status">): boolean =>
+  task.status === "queued" || task.status === "running";
+
+const capacityError = (): Error & { code: typeof WORKSPACE_CAPACITY_REACHED } =>
+  Object.assign(new Error(`改图工作区最多同时保留 ${WORKSPACE_CONCURRENCY_LIMIT} 个进行中的任务。`), {
+    code: WORKSPACE_CAPACITY_REACHED
+  });
 
 const normalizeTaskVisibility = (value: ImageEditTaskVisibility | undefined): ImageEditTaskVisibility =>
   value === "archived" || value === "hidden" ? value : "active";
@@ -301,14 +320,17 @@ const normalizeGenerationApiMode = (apiMode: GenerationApiMode | undefined): Gen
   return "images";
 };
 
-const normalizeStoredImageEditBackend = (stored: StoredGenerationConfigForImageEdit): EffectiveImageEditBackend => {
+const normalizeStoredImageEditBackend = (
+  stored: StoredGenerationConfigForImageEdit,
+  requestedProviderId?: string
+): EffectiveImageEditBackend | null => {
   const legacyApiKey = decryptStoredApiKey(stored);
   const providers = Array.isArray(stored.providers)
     ? stored.providers
-        .map((provider, index): EffectiveImageEditBackend & { id: string } => {
+        .map((provider, index): EffectiveImageEditBackend => {
           const providerType = normalizeProviderType(provider.providerType);
           return {
-            id: provider.id?.trim() || `provider-${index + 1}`,
+            providerId: provider.id?.trim() || `provider-${index + 1}`,
             authSource: "api",
             providerType,
             providerName:
@@ -325,12 +347,12 @@ const normalizeStoredImageEditBackend = (stored: StoredGenerationConfigForImageE
             mainModel: normalizeMainModel(provider.mainModel)
           };
         })
-        .filter((provider) => provider.id)
+        .filter((provider) => provider.providerId)
     : [];
 
-  const activeProvider =
-    providers.find((provider) => provider.id === stored.activeProviderId) ||
-    providers[0];
+  const activeProvider = requestedProviderId
+    ? providers.find((provider) => provider.providerId === requestedProviderId)
+    : providers.find((provider) => provider.providerId === stored.activeProviderId) || providers[0];
   if (activeProvider) {
     return {
       ...activeProvider,
@@ -338,8 +360,11 @@ const normalizeStoredImageEditBackend = (stored: StoredGenerationConfigForImageE
     };
   }
 
+  if (requestedProviderId && providers.length) return null;
+
   const providerType = normalizeProviderType(stored.providerType);
   return {
+    providerId: stored.activeProviderId,
     authSource: stored.authSource === "api" || legacyApiKey ? "api" : "codex_oauth",
     providerType,
     providerName: providerType === "openrouter" ? "OpenRouter" : "默认 API 供应商",
@@ -372,6 +397,7 @@ export const forceOriginRegenerationResponsesAction = (payload: Record<string, u
 });
 
 const backendSnapshotForTask = (config: EffectiveImageEditBackend): ImageEditTask["backend"] => ({
+  providerId: config.providerId,
   authSource: config.authSource,
   providerType: config.providerType,
   providerName: config.providerName,
@@ -698,6 +724,7 @@ const normalizeCreateRequest = (request: ImageEditCreateRequest): ImageEditCreat
   const normalizedSize = normalizeGenerationSizeSettings(request.settings);
 
   return {
+    clientWorkflowId: request.clientWorkflowId,
     sourceImage: {
       ...request.sourceImage,
       mimeType: sourceAsset.mimeType,
@@ -735,17 +762,27 @@ export class ImageEditService {
   private readonly concurrency: number;
   private readonly runner: ImageEditTaskRunner;
   private readonly usesInjectedRunner: boolean;
+  private readonly backendResolver?: ImageEditBackendResolver;
   private abortControllers = new Map<string, AbortController>();
   private activeTaskRuns = new Set<Promise<void>>();
+  private activeTaskRunsById = new Map<string, Promise<void>>();
+  private activeAssetPreparations = new Set<Promise<unknown>>();
+  private pendingReservations = new Map<string, number>();
   private dataEpoch = 0;
   private isClearingAll = false;
+  private clearOperation: Promise<void> | null = null;
   private isQueuePumpActive = false;
   private taskMutationQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly rootDir: string, options: ImageEditServiceOptions = {}) {
-    this.concurrency = clamp(Math.round(options.concurrency || 2), 1, 8);
+    this.concurrency = clamp(
+      Math.round(options.concurrency || WORKSPACE_CONCURRENCY_LIMIT),
+      1,
+      WORKSPACE_CONCURRENCY_LIMIT
+    );
     this.runner = options.runner || ((task, signal) => this.runImageEditModel(task, signal));
     this.usesInjectedRunner = Boolean(options.runner);
+    this.backendResolver = options.backendResolver;
   }
 
   private imageEditDir(): string {
@@ -954,86 +991,160 @@ export class ImageEditService {
     };
   }
 
+  private async hydrateTaskForExecution(task: StoredImageEditTask): Promise<ImageEditTask> {
+    const regenerationContext = task.regenerationContext
+      ? {
+          ...task.regenerationContext,
+          originalReferences: await Promise.all(
+            task.regenerationContext.originalReferences.map(async (reference) => ({
+              ...reference,
+              dataUrl: await this.readAssetDataUrl(task.id, reference.assetFileName, reference.mimeType).catch(() => ""),
+              thumbnailDataUrl: ""
+            }))
+          )
+        }
+      : undefined;
+    return {
+      ...task,
+      fidelityMode: normalizeFidelityMode(task.fidelityMode),
+      annotationItems: normalizeAnnotationItems(task.annotationItems),
+      sourceImage: { ...task.sourceImage, dataUrl: "", thumbnailDataUrl: "" },
+      modelInputImage: undefined,
+      annotationImage: { ...task.annotationImage, dataUrl: "", thumbnailDataUrl: "" },
+      maskImage: undefined,
+      localProtectionMaskImage: undefined,
+      regenerationContext,
+      outputs: []
+    };
+  }
+
   async getTasks(): Promise<ImageEditTask[]> {
-    return Promise.all((await this.reconcileStaleRunningTasks(await this.readTasks())).map((task) => this.hydrateTask(task)));
+    await this.reconcileStaleRunningTasks();
+    return Promise.all((await this.readTasks()).map((task) => this.hydrateTask(task)));
+  }
+
+  async getTaskSummaries(): Promise<ImageEditTaskSummary[]> {
+    await this.reconcileStaleRunningTasks();
+    return (await this.readTasks()).map((task) => ({
+      id: task.id,
+      clientWorkflowId: task.clientWorkflowId || `task:${task.id}`,
+      status: task.status,
+      updatedAt: task.updatedAt,
+      outputCount: Array.isArray(task.outputs) ? task.outputs.length : 0,
+      error: sanitizeSummaryError(task.error),
+      visibility: normalizeTaskVisibility(task.visibility)
+    }));
+  }
+
+  async getTask(id: string): Promise<ImageEditTask | null> {
+    if (!id.trim()) return null;
+    await this.reconcileStaleRunningTasks();
+    const task = (await this.readTasks()).find((item) => item.id === id);
+    return task ? this.hydrateTask(task) : null;
+  }
+
+  async resumePendingTasks(): Promise<void> {
+    await this.reconcileStaleRunningTasks();
+    this.scheduleQueueProcessing();
   }
 
   async createTask(request: ImageEditCreateRequest): Promise<ImageEditTask> {
+    const creationEpoch = this.dataEpoch;
+    if (this.isClearingAll) throw new Error("改图任务正在清理，请稍后再试。");
     const normalized = normalizeCreateRequest(request);
-    const backend = this.usesInjectedRunner ? null : await this.getEffectiveBackend();
+    const backend = this.usesInjectedRunner ? null : await this.resolveBackend();
     const now = new Date().toISOString();
     const taskId = randomUUID();
-    const sourceAssetFileName = await this.writeAsset(taskId, "source", normalized.sourceImage.dataUrl);
-    const annotationAssetFileName = await this.writeAsset(taskId, "annotation", normalized.annotationImage.dataUrl);
-    const originReferenceAssetFileNames = normalized.regenerationContext
-      ? await Promise.all(
-          normalized.regenerationContext.originalReferences.map((reference, index) =>
-            this.writeAsset(taskId, `origin-reference-${String(index + 1).padStart(2, "0")}`, reference.dataUrl)
-          )
-        )
-      : [];
-    const settings = backend
-      ? {
-          ...normalized.settings,
-          apiMode:
-            backend.authSource === "codex_oauth"
-              ? "responses"
-              : backend.providerType === "openrouter"
-                ? "images"
-                : backend.apiMode,
-          imageModel: backend.imageModel,
-          mainModel: backend.mainModel
-        }
-      : normalized.settings;
-    const backendSnapshot = backend ? backendSnapshotForTask(backend) : undefined;
-    const task: ImageEditTask = {
-      id: taskId,
-      createdAt: now,
-      updatedAt: now,
-      status: "queued",
-      visibility: "active",
-      sourceImage: {
-        ...normalized.sourceImage,
-        assetFileName: sourceAssetFileName
-      },
-      sourceIntegrity: normalized.sourceIntegrity,
-      annotationImage: {
-        ...normalized.annotationImage,
-        assetFileName: annotationAssetFileName
-      },
-      annotationItems: normalized.annotationItems || [],
-      annotationResolution: normalized.annotationResolution,
-      regenerationContext: normalized.regenerationContext
+    await this.reserveTaskSlot(taskId, creationEpoch);
+    let committed = false;
+    try {
+      const assetPreparation = (async () => {
+        const sourceAssetFileName = await this.writeAsset(taskId, "source", normalized.sourceImage.dataUrl);
+        const annotationAssetFileName = await this.writeAsset(taskId, "annotation", normalized.annotationImage.dataUrl);
+        const originReferenceAssetFileNames = normalized.regenerationContext
+          ? await Promise.all(
+              normalized.regenerationContext.originalReferences.map((reference, index) =>
+                this.writeAsset(taskId, `origin-reference-${String(index + 1).padStart(2, "0")}`, reference.dataUrl)
+              )
+            )
+          : [];
+        return { sourceAssetFileName, annotationAssetFileName, originReferenceAssetFileNames };
+      })();
+      this.activeAssetPreparations.add(assetPreparation);
+      const { sourceAssetFileName, annotationAssetFileName, originReferenceAssetFileNames } = await assetPreparation.finally(
+        () => this.activeAssetPreparations.delete(assetPreparation)
+      );
+      const settings = backend
         ? {
-            ...normalized.regenerationContext,
-            originalReferences: normalized.regenerationContext.originalReferences.map((reference, index) => ({
-              ...reference,
-              assetFileName: originReferenceAssetFileNames[index]
-            }))
+            ...normalized.settings,
+            apiMode:
+              backend.authSource === "codex_oauth"
+                ? "responses"
+                : backend.providerType === "openrouter"
+                  ? "images"
+                  : backend.apiMode,
+            imageModel: backend.imageModel,
+            mainModel: backend.mainModel
           }
-        : undefined,
-      fidelityMode: "origin_regenerate",
-      instruction: normalized.instruction,
-      finalPrompt: buildOriginRegenerationPrompt(
-        normalized.regenerationContext?.basePrompt || "",
-        normalized.instruction,
-        normalized.annotationItems || [],
-        normalized.annotationResolution as ImageEditAnnotationResolution,
-        settings
-      ),
-      settings,
-      backend: backendSnapshot,
-      diagnostics: diagnosticsForTask(normalized, backend, backendSnapshot),
-      outputs: []
-    };
-    await this.upsertTask(task);
-    this.scheduleQueueProcessing();
-    return task;
+        : normalized.settings;
+      const backendSnapshot = backend ? backendSnapshotForTask(backend) : undefined;
+      const task: ImageEditTask = {
+        id: taskId,
+        clientWorkflowId: normalized.clientWorkflowId,
+        createdAt: now,
+        updatedAt: now,
+        status: "queued",
+        visibility: "active",
+        sourceImage: {
+          ...normalized.sourceImage,
+          assetFileName: sourceAssetFileName
+        },
+        sourceIntegrity: normalized.sourceIntegrity,
+        annotationImage: {
+          ...normalized.annotationImage,
+          assetFileName: annotationAssetFileName
+        },
+        annotationItems: normalized.annotationItems || [],
+        annotationResolution: normalized.annotationResolution,
+        regenerationContext: normalized.regenerationContext
+          ? {
+              ...normalized.regenerationContext,
+              originalReferences: normalized.regenerationContext.originalReferences.map((reference, index) => ({
+                ...reference,
+                assetFileName: originReferenceAssetFileNames[index]
+              }))
+            }
+          : undefined,
+        fidelityMode: "origin_regenerate",
+        instruction: normalized.instruction,
+        finalPrompt: buildOriginRegenerationPrompt(
+          normalized.regenerationContext?.basePrompt || "",
+          normalized.instruction,
+          normalized.annotationItems || [],
+          normalized.annotationResolution as ImageEditAnnotationResolution,
+          settings
+        ),
+        settings,
+        backend: backendSnapshot,
+        diagnostics: diagnosticsForTask(normalized, backend, backendSnapshot),
+        outputs: []
+      };
+      await this.commitReservedTask(task, creationEpoch);
+      committed = true;
+      this.scheduleQueueProcessing();
+      return task;
+    } catch (error) {
+      await rm(this.assetsDir(taskId), { recursive: true, force: true });
+      throw error;
+    } finally {
+      if (!committed) await this.releaseTaskReservation(taskId);
+    }
   }
 
   async cancelTask(id: string): Promise<ImageEditTask | null> {
     this.abortControllers.get(id)?.abort(new Error("已取消改图任务。"));
     const task = await this.mutateTasks(async (tasks) => {
+      this.abortControllers.get(id)?.abort(new Error("已取消改图任务。"));
       const taskIndex = tasks.findIndex((item) => item.id === id);
       if (taskIndex === -1) return { tasks, result: null };
       const task = tasks[taskIndex];
@@ -1066,12 +1177,14 @@ export class ImageEditService {
       throw new Error("旧版改图任务仅保留历史结果，不能沿用已移除的执行方式重试。");
     }
     return this.createTask({
+      clientWorkflowId: sourceTask.clientWorkflowId,
       sourceImage: {
         ...sourceTask.sourceImage,
         id: randomUUID(),
         createdAt: new Date().toISOString(),
         sourcePointer: {
           kind: "restored_edit_output",
+          historyItemId: sourceTask.sourceImage.sourcePointer.historyItemId,
           imageEditTaskId: sourceTask.id,
           importedAt: new Date().toISOString()
         }
@@ -1125,47 +1238,55 @@ export class ImageEditService {
 
   async deleteTask(id: string): Promise<ImageEditTask[]> {
     this.abortControllers.get(id)?.abort(new Error("已删除改图任务。"));
-    this.abortControllers.delete(id);
-    await rm(this.assetsDir(id), { recursive: true, force: true });
     const tasks = await this.mutateTasks((currentTasks) => {
+      this.abortControllers.get(id)?.abort(new Error("已删除改图任务。"));
       const nextTasks = currentTasks.filter((task) => task.id !== id);
       return { tasks: nextTasks, result: nextTasks };
     });
+    const activeRun = this.activeTaskRunsById.get(id);
+    if (activeRun) await Promise.allSettled([activeRun]);
+    await rm(this.assetsDir(id), { recursive: true, force: true });
     this.scheduleQueueProcessing();
     return Promise.all(tasks.map((task) => this.hydrateTask(task)));
   }
 
   async clearTasks(): Promise<void> {
-    for (const controller of this.abortControllers.values()) {
-      controller.abort(new Error("已清空改图任务。"));
-    }
-    this.abortControllers.clear();
-    await rm(this.imageEditDir(), { recursive: true, force: true });
-    await this.writeTasks([]);
+    await this.clearTaskData(false, "已清空改图任务。");
   }
 
-  async clearAll(platform: NodeJS.Platform = process.platform): Promise<void> {
-    if (platform !== "win32") {
-      await this.clearTasks();
-      return;
-    }
-    this.isClearingAll = true;
-    this.dataEpoch += 1;
-    try {
-      for (const controller of this.abortControllers.values()) {
-        controller.abort(new Error("已抹除全部本机数据。"));
-      }
-      await Promise.allSettled([...this.activeTaskRuns]);
-      await this.taskMutationQueue;
-      this.abortControllers.clear();
-      await rm(this.imageEditDir(), { recursive: true, force: true });
-    } finally {
-      this.isClearingAll = false;
-    }
+  async clearAll(_platform: NodeJS.Platform = process.platform): Promise<void> {
+    await this.clearTaskData(true, "已抹除全部本机数据。");
   }
 
   async saveOutputs(_request: ImageEditOutputsSaveRequest): Promise<never> {
     throw new Error("改图输出保存尚未完成接入。");
+  }
+
+  private async clearTaskData(removeDomain: boolean, reason: string): Promise<void> {
+    if (this.clearOperation) {
+      await this.clearOperation;
+      if (removeDomain) await this.clearTaskData(true, reason);
+      return;
+    }
+    this.isClearingAll = true;
+    this.dataEpoch += 1;
+    const operation = (async () => {
+      for (const controller of this.abortControllers.values()) controller.abort(new Error(reason));
+      await Promise.allSettled([...this.activeAssetPreparations]);
+      await Promise.allSettled([...this.activeTaskRuns]);
+      await this.taskMutationQueue;
+      this.abortControllers.clear();
+      this.pendingReservations.clear();
+      await rm(this.imageEditDir(), { recursive: true, force: true });
+      if (!removeDomain) await this.writeTasks([]);
+    })();
+    this.clearOperation = operation;
+    try {
+      await operation;
+    } finally {
+      this.clearOperation = null;
+      this.isClearingAll = false;
+    }
   }
 
   private scheduleQueueProcessing(): void {
@@ -1181,7 +1302,8 @@ export class ImageEditService {
         if (this.isClearingAll) return;
         const availableSlots = this.concurrency - this.abortControllers.size;
         if (availableSlots <= 0) return;
-        const tasks = await this.reconcileStaleRunningTasks(await this.readTasks());
+        await this.reconcileStaleRunningTasks();
+        const tasks = await this.readTasks();
         const queuedTasks = tasks
           .filter((task) => task.status === "queued")
           .sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime())
@@ -1205,37 +1327,77 @@ export class ImageEditService {
   }
 
   private async startQueuedTask(task: StoredImageEditTask): Promise<void> {
-    const dataEpoch = this.dataEpoch;
-    const latestTask = (await this.readTasks()).find((item) => item.id === task.id);
-    if (this.isClearingAll || dataEpoch !== this.dataEpoch || !latestTask || latestTask.status !== "queued") return;
-    const now = new Date().toISOString();
-    const runningTask: StoredImageEditTask = {
-      ...latestTask,
-      status: "running",
-      startedAt: latestTask.startedAt || now,
-      updatedAt: now,
-      error: undefined
-    };
+    const runEpoch = this.dataEpoch;
     const controller = new AbortController();
+    let runningTask: StoredImageEditTask | null = null;
+    try {
+      runningTask = await this.mutateTasks((tasks) => {
+        const taskIndex = tasks.findIndex((item) => item.id === task.id);
+        const latestTask = taskIndex >= 0 ? tasks[taskIndex] : undefined;
+        if (
+          this.isClearingAll ||
+          runEpoch !== this.dataEpoch ||
+          !latestTask ||
+          latestTask.status !== "queued" ||
+          this.abortControllers.has(task.id)
+        ) {
+          return { tasks, result: null };
+        }
+        const now = new Date().toISOString();
+        const nextTask: StoredImageEditTask = {
+          ...latestTask,
+          status: "running",
+          startedAt: latestTask.startedAt || now,
+          updatedAt: now,
+          error: undefined
+        };
+        this.abortControllers.set(nextTask.id, controller);
+        const nextTasks = [...tasks];
+        nextTasks[taskIndex] = nextTask;
+        return { tasks: nextTasks, result: nextTask };
+      });
+    } catch (error) {
+      if (this.abortControllers.get(task.id) === controller) this.abortControllers.delete(task.id);
+      throw error;
+    }
+    if (!runningTask) return;
+    const canRun = await this.mutateTasks((tasks) => ({
+      tasks,
+      result:
+        !this.isClearingAll &&
+        runEpoch === this.dataEpoch &&
+        this.abortControllers.get(task.id) === controller &&
+        tasks.some((item) => item.id === task.id && item.status === "running")
+    }));
+    if (!canRun || controller.signal.aborted) {
+      if (this.abortControllers.get(task.id) === controller) this.abortControllers.delete(task.id);
+      return;
+    }
     const timeout = setTimeout(() => {
       controller.abort(new Error("改图请求超过 10 分钟未响应，请检查后端或稍后重试。"));
     }, IMAGE_EDIT_TIMEOUT_MS);
-    this.abortControllers.set(runningTask.id, controller);
-    await this.writeStoredTask(runningTask);
 
-    const taskRun = this.runQueuedTask(runningTask, controller, timeout);
+    const taskRun = this.runQueuedTask(runningTask, runEpoch, controller, timeout);
     this.activeTaskRuns.add(taskRun);
-    void taskRun.finally(() => this.activeTaskRuns.delete(taskRun)).catch(() => undefined);
+    this.activeTaskRunsById.set(runningTask.id, taskRun);
+    void taskRun
+      .finally(() => {
+        this.activeTaskRuns.delete(taskRun);
+        if (this.activeTaskRunsById.get(runningTask.id) === taskRun) this.activeTaskRunsById.delete(runningTask.id);
+      })
+      .catch(() => undefined);
   }
 
   private async runQueuedTask(
     task: StoredImageEditTask,
+    runEpoch: number,
     controller: AbortController,
     timeout: NodeJS.Timeout
   ): Promise<void> {
-    const hydratedTask = await this.hydrateTask(task);
+    const writtenOutputFileNames: string[] = [];
     try {
-      const results = await this.runner(hydratedTask, controller.signal);
+      const executionTask = await this.hydrateTaskForExecution(task);
+      const results = await this.runner(executionTask, controller.signal);
       const now = new Date().toISOString();
       const outputs: ImageEditOutput[] = [];
       for (const [index, result] of results.entries()) {
@@ -1247,8 +1409,10 @@ export class ImageEditService {
           `output-${String(index + 1).padStart(2, "0")}`,
           canonicalOutputDataUrl
         );
+        writtenOutputFileNames.push(assetFileName);
         outputs.push({
           ...result,
+          error: sanitizeSummaryError(result.error),
           dataUrl: canonicalOutputDataUrl,
           mimeType: inspectedOutput.mimeType,
           actualSize: inspectedOutput.size,
@@ -1260,36 +1424,35 @@ export class ImageEditService {
           assetFileName
         });
       }
-      const outputProblem = summarizeOutputProblems(outputs, task.settings.n);
-      const finishedTask: ImageEditTask = {
-        ...hydratedTask,
+      const outputProblem = sanitizeSummaryError(summarizeOutputProblems(outputs, task.settings.n));
+      const storedOutputs = this.stripTaskAssets({
+        ...executionTask,
         outputs,
+        status: "running",
+        updatedAt: now
+      }).outputs;
+      const finished = await this.finishRunningTask(task.id, runEpoch, {
+        outputs: storedOutputs,
         status: !outputs.length ? "failed" : outputProblem ? "partial_failed" : "succeeded",
-        error: outputProblem,
-        updatedAt: now,
-        completedAt: now
-      };
-      await this.upsertTask(finishedTask);
+        error: outputProblem
+      });
+      if (!finished) await this.removeOutputAssets(task.id, writtenOutputFileNames);
     } catch (error) {
-      const now = new Date().toISOString();
-      const failedTask: ImageEditTask = {
-        ...hydratedTask,
+      const finished = await this.finishRunningTask(task.id, runEpoch, {
         status: controller.signal.aborted ? "canceled" : "failed",
-        error: error instanceof Error ? error.message : String(error),
-        updatedAt: now,
-        completedAt: now
-      };
-      await this.upsertTask(failedTask);
+        error: sanitizeSummaryError(error instanceof Error ? error.message : String(error))
+      });
+      if (!finished) await this.removeOutputAssets(task.id, writtenOutputFileNames);
     } finally {
       clearTimeout(timeout);
-      this.abortControllers.delete(task.id);
+      if (this.abortControllers.get(task.id) === controller) this.abortControllers.delete(task.id);
       this.scheduleQueueProcessing();
     }
   }
 
-  private async readTasks(): Promise<StoredImageEditTask[]> {
+  private async readTasksWithMetadata(): Promise<{ tasks: StoredImageEditTask[]; normalized: boolean }> {
     const tasks = await readJsonFile<StoredImageEditTask[]>(this.tasksPath(), []);
-    if (!Array.isArray(tasks)) return [];
+    if (!Array.isArray(tasks)) return { tasks: [], normalized: false };
     let changed = false;
     const withoutThumbnail = <T extends object>(value: T): T => {
       if (!("thumbnailDataUrl" in value)) return value;
@@ -1297,46 +1460,97 @@ export class ImageEditService {
       changed = true;
       return metadata as T;
     };
-    const sanitized = tasks.map((task) => ({
-      ...task,
-      sourceImage: withoutThumbnail(task.sourceImage),
-      annotationImage: withoutThumbnail(task.annotationImage),
-      maskImage: task.maskImage ? withoutThumbnail(task.maskImage) : undefined,
-      localProtectionMaskImage: task.localProtectionMaskImage
-        ? withoutThumbnail(task.localProtectionMaskImage)
-        : undefined,
-      regenerationContext: task.regenerationContext
-        ? {
-            ...task.regenerationContext,
-            originalReferences: task.regenerationContext.originalReferences.map((reference) =>
-              withoutThumbnail(reference)
-            )
-          }
-        : undefined
-    }));
-    if (changed) await this.writeTasks(sanitized);
-    return sanitized;
+    const sanitized = tasks.map((task) => {
+      const error = sanitizeSummaryError(task.error);
+      if (error !== task.error) changed = true;
+      const outputs = task.outputs.map((output) => {
+        const outputError = sanitizeSummaryError(output.error);
+        if (outputError === output.error) return output;
+        changed = true;
+        return { ...output, error: outputError };
+      });
+      return {
+        ...task,
+        error,
+        outputs,
+        sourceImage: withoutThumbnail(task.sourceImage),
+        annotationImage: withoutThumbnail(task.annotationImage),
+        maskImage: task.maskImage ? withoutThumbnail(task.maskImage) : undefined,
+        localProtectionMaskImage: task.localProtectionMaskImage
+          ? withoutThumbnail(task.localProtectionMaskImage)
+          : undefined,
+        regenerationContext: task.regenerationContext
+          ? {
+              ...task.regenerationContext,
+              originalReferences: task.regenerationContext.originalReferences.map((reference) =>
+                withoutThumbnail(reference)
+              )
+            }
+          : undefined
+      };
+    });
+    return { tasks: sanitized, normalized: changed };
   }
 
-  private async getEffectiveBackend(): Promise<EffectiveImageEditBackend> {
+  private async readTasks(): Promise<StoredImageEditTask[]> {
+    return (await this.readTasksWithMetadata()).tasks;
+  }
+
+  private async resolveBackend(
+    providerId?: string,
+    snapshot?: ImageEditTask["backend"]
+  ): Promise<EffectiveImageEditBackend> {
+    if (this.backendResolver) return this.backendResolver(providerId, snapshot);
     const stored = await readJsonFile<StoredGenerationConfigForImageEdit>(this.generationConfigPath(), {});
-    const backend = normalizeStoredImageEditBackend(stored);
-    if (backend.authSource === "codex_oauth") {
+    const defaultBackend = normalizeStoredImageEditBackend(stored);
+    const authSource = snapshot?.authSource || defaultBackend?.authSource || "codex_oauth";
+    const requestedProviderId = snapshot?.providerId || providerId;
+    const liveBackend = normalizeStoredImageEditBackend(stored, authSource === "api" ? requestedProviderId : undefined);
+    const fallbackBackend = liveBackend || defaultBackend;
+    if (!fallbackBackend) throw new Error("没有找到可用的生图供应商。");
+    if (authSource === "codex_oauth") {
       const status = await getCodexAuthStatus();
       if (!status.available) {
-        throw new Error(`请先完成 Codex OAuth 登录：运行 codex login 后再试。${status.error ? `（${status.error}）` : ""}`);
+        throw new Error(`创建任务时使用的 Codex OAuth 凭证当前不可用。${status.error ? `（${status.error}）` : ""}`);
       }
-      return backend;
+      return {
+        ...fallbackBackend,
+        authSource,
+        providerId: requestedProviderId,
+        providerType: snapshot?.providerType || fallbackBackend.providerType,
+        providerName: snapshot?.providerName || fallbackBackend.providerName,
+        apiBaseUrl: snapshot?.apiBaseUrl || fallbackBackend.apiBaseUrl,
+        apiKey: "",
+        apiMode: snapshot?.apiMode || "responses",
+        imageModel: snapshot?.imageModel || fallbackBackend.imageModel,
+        mainModel: snapshot?.mainModel || fallbackBackend.mainModel
+      };
     }
-    if (!backend.apiKey.trim()) throw new Error("请先在生图配置中填写可用于改图的 API Key。");
-    return backend;
+    if (!liveBackend && requestedProviderId) {
+      throw new Error("创建任务时使用的生图供应商已被删除，改图任务无法继续。");
+    }
+    const backend = liveBackend || fallbackBackend;
+    if (!backend.apiKey.trim()) {
+      throw new Error("创建任务时使用的生图供应商凭证当前不可用，请恢复后重试。");
+    }
+    return {
+      ...backend,
+      authSource: "api",
+      providerId: requestedProviderId || backend.providerId,
+      providerType: snapshot?.providerType || backend.providerType,
+      providerName: snapshot?.providerName || backend.providerName,
+      apiBaseUrl: snapshot?.apiBaseUrl || backend.apiBaseUrl,
+      apiMode: snapshot?.apiMode || backend.apiMode,
+      imageModel: snapshot?.imageModel || backend.imageModel,
+      mainModel: snapshot?.mainModel || backend.mainModel
+    };
   }
 
   private async runImageEditModel(task: ImageEditTask, signal: AbortSignal): Promise<ImageEditRunnerOutput[]> {
     if (task.fidelityMode !== "origin_regenerate" || !task.regenerationContext) {
       throw new Error("旧版改图任务仅保留历史结果，已不再执行旁路参考或严格 mask 请求。");
     }
-    const backend = await this.getEffectiveBackend();
+    const backend = await this.resolveBackend(task.backend?.providerId, task.backend);
     const settings = toGenerationSettings(task.settings);
     const originalReferences = task.regenerationContext.originalReferences
       .map((reference) => reference.dataUrl)
@@ -1433,27 +1647,96 @@ export class ImageEditService {
     );
     return parseImagesResponse(responseText, backend.apiKey, settings);
   }
-  private async reconcileStaleRunningTasks(tasks: StoredImageEditTask[]): Promise<StoredImageEditTask[]> {
-    let changed = false;
-    const now = new Date().toISOString();
-    const next = tasks.map((task) => {
-      if (task.status !== "running" || this.abortControllers.has(task.id)) return task;
-      changed = true;
-      return {
-        ...task,
-        status: "failed" as const,
-        updatedAt: now,
-        completedAt: now,
-        error: task.error || "应用或改图进程已重启，这条运行中的任务未完成，请重试。"
-      };
+
+  private async reconcileStaleRunningTasks(): Promise<void> {
+    await this.mutateTasks((tasks) => {
+      const now = new Date().toISOString();
+      let changed = false;
+      const next = tasks.map((task) => {
+        if (task.status !== "running" || this.abortControllers.has(task.id)) return task;
+        changed = true;
+        return {
+          ...task,
+          status: "failed" as const,
+          updatedAt: now,
+          completedAt: now,
+          error: task.error || "应用或改图进程已重启，这条运行中的任务未完成，请重试。"
+        };
+      });
+      return { tasks: changed ? next : tasks, result: undefined };
     });
-    if (changed) await this.writeTasks(next);
-    return next;
+  }
+
+  private async reserveTaskSlot(taskId: string, creationEpoch: number): Promise<void> {
+    await this.mutateTasks((tasks) => {
+      if (this.isClearingAll || creationEpoch !== this.dataEpoch) {
+        throw new Error("改图任务数据已被清理，请重新提交。");
+      }
+      if (tasks.filter(isActiveTask).length + this.pendingReservations.size >= WORKSPACE_CONCURRENCY_LIMIT) {
+        throw capacityError();
+      }
+      this.pendingReservations.set(taskId, creationEpoch);
+      return { tasks, result: undefined };
+    });
+  }
+
+  private async releaseTaskReservation(taskId: string): Promise<void> {
+    await this.mutateTasks((tasks) => {
+      this.pendingReservations.delete(taskId);
+      return { tasks, result: undefined };
+    });
+  }
+
+  private async commitReservedTask(task: ImageEditTask, creationEpoch: number): Promise<void> {
+    const storedTask = this.stripTaskAssets(task);
+    await this.mutateTasks((tasks) => {
+      const reservationEpoch = this.pendingReservations.get(task.id);
+      this.pendingReservations.delete(task.id);
+      if (this.isClearingAll || creationEpoch !== this.dataEpoch || reservationEpoch !== creationEpoch) {
+        throw new Error("改图任务数据已被清理，请重新提交。");
+      }
+      return { tasks: [storedTask, ...tasks], result: undefined };
+    });
+  }
+
+  private async finishRunningTask(
+    id: string,
+    runEpoch: number,
+    update: Pick<StoredImageEditTask, "status" | "error"> & { outputs?: StoredImageEditOutput[] }
+  ): Promise<StoredImageEditTask | null> {
+    return this.mutateTasks((tasks) => {
+      const taskIndex = tasks.findIndex((item) => item.id === id);
+      const task = taskIndex >= 0 ? tasks[taskIndex] : undefined;
+      if (!task || task.status !== "running" || runEpoch !== this.dataEpoch) {
+        return { tasks, result: null };
+      }
+      const now = new Date().toISOString();
+      const finishedTask: StoredImageEditTask = {
+        ...task,
+        status: update.status,
+        outputs: update.outputs || task.outputs,
+        error: update.error,
+        updatedAt: now,
+        completedAt: now
+      };
+      const nextTasks = [...tasks];
+      nextTasks[taskIndex] = finishedTask;
+      return { tasks: nextTasks, result: finishedTask };
+    });
+  }
+
+  private async removeOutputAssets(taskId: string, fileNames: string[]): Promise<void> {
+    await Promise.allSettled(
+      fileNames.map((fileName) => rm(join(this.assetsDir(taskId), fileName), { force: true }))
+    );
   }
 
   private async writeTasks(tasks: StoredImageEditTask[]): Promise<void> {
+    const retained = tasks.slice(0, MAX_STORED_TASKS);
+    const dropped = tasks.slice(MAX_STORED_TASKS);
     await mkdir(this.imageEditDir(), { recursive: true });
-    await writeJsonFile(this.tasksPath(), tasks.slice(0, MAX_STORED_TASKS));
+    await writeJsonFile(this.tasksPath(), retained);
+    await Promise.allSettled(dropped.map((task) => rm(this.assetsDir(task.id), { recursive: true, force: true })));
   }
 
   private async mutateTasks<Result>(
@@ -1462,9 +1745,9 @@ export class ImageEditService {
       | ((tasks: StoredImageEditTask[]) => Promise<{ tasks: StoredImageEditTask[]; result: Result }>)
   ): Promise<Result> {
     const runMutation = this.taskMutationQueue.then(async () => {
-      const currentTasks = await this.readTasks();
+      const { tasks: currentTasks, normalized } = await this.readTasksWithMetadata();
       const { tasks, result } = await mutation(currentTasks);
-      await this.writeTasks(tasks);
+      if (normalized || tasks !== currentTasks) await this.writeTasks(tasks);
       return result;
     });
     this.taskMutationQueue = runMutation.then(
@@ -1472,16 +1755,5 @@ export class ImageEditService {
       () => undefined
     );
     return runMutation;
-  }
-
-  private async upsertTask(task: ImageEditTask): Promise<void> {
-    await this.writeStoredTask(this.stripTaskAssets(task));
-  }
-
-  private async writeStoredTask(task: StoredImageEditTask): Promise<void> {
-    await this.mutateTasks((tasks) => {
-      const next = [task, ...tasks.filter((item) => item.id !== task.id)].slice(0, MAX_STORED_TASKS);
-      return { tasks: next, result: undefined };
-    });
   }
 }

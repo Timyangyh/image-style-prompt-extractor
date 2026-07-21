@@ -2,9 +2,89 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { normalizeFusedPromptResult, normalizeStyleAnalysis } from "../src/shared/schema";
-import type { HistoryItem, ImageEditAnnotationResolveResponse, VisionApiMode } from "../src/shared/types";
+import type {
+  HistoryDeleteItemRequest,
+  HistoryItem,
+  HistoryItemPatch,
+  HistoryPatchItemRequest,
+  HistorySaveItemRequest,
+  HistorySnapshot,
+  ImageEditAnnotationResolveResponse,
+  VisionApiMode
+} from "../src/shared/types";
 
 export type ModelRequestKind = "analyze" | "fuse" | "annotation";
+
+export const MODEL_OPERATION_CAPACITY_ERROR = "MODEL_OPERATION_CAPACITY_REACHED";
+export const HISTORY_STALE_EPOCH_ERROR = "图片分析历史已变更，当前结果未保存。";
+export const HISTORY_ITEM_NOT_FOUND_ERROR = "目标图片分析历史已不存在，当前结果未保存。";
+
+interface AbortableOperationEntry {
+  kind: ModelRequestKind;
+  controller: AbortController;
+  settled: Promise<void>;
+  settle: () => void;
+}
+
+export interface AbortableOperationHandle {
+  operationId: string;
+  signal: AbortSignal;
+  release: () => void;
+}
+
+export class AbortableOperationRegistry {
+  private readonly entries = new Map<string, AbortableOperationEntry>();
+
+  constructor(private readonly limit: number) {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("模型请求并发上限无效。");
+  }
+
+  get activeCount(): number {
+    return this.entries.size;
+  }
+
+  register(operationId: string, kind: ModelRequestKind): AbortableOperationHandle {
+    if (!operationId.trim()) throw new Error("操作 ID 不能为空。");
+    if (this.entries.has(operationId)) throw new Error("该操作正在执行，请等待完成。");
+    if (this.entries.size >= this.limit) {
+      throw new Error(`${MODEL_OPERATION_CAPACITY_ERROR}：同时进行的模型请求已达 ${this.limit} 个。`);
+    }
+
+    const controller = new AbortController();
+    let settle = (): void => undefined;
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const entry: AbortableOperationEntry = { kind, controller, settled, settle };
+    this.entries.set(operationId, entry);
+
+    let released = false;
+    return {
+      operationId,
+      signal: controller.signal,
+      release: () => {
+        if (released) return;
+        released = true;
+        if (this.entries.get(operationId) === entry) this.entries.delete(operationId);
+        entry.settle();
+      }
+    };
+  }
+
+  cancel(operationId: string | undefined, kind: ModelRequestKind, reason: Error): boolean {
+    if (!operationId) return false;
+    const entry = this.entries.get(operationId);
+    if (!entry || entry.kind !== kind) return false;
+    entry.controller.abort(reason);
+    return true;
+  }
+
+  async abortAll(reason: Error): Promise<void> {
+    const entries = [...this.entries.values()];
+    for (const entry of entries) entry.controller.abort(reason);
+    await Promise.allSettled(entries.map((entry) => entry.settled));
+  }
+}
 
 const DEFAULT_MODEL_REQUEST_TIMEOUT_MS = 300_000;
 const ANNOTATION_REQUEST_TIMEOUT_MS = 120_000;
@@ -200,6 +280,173 @@ export const normalizeHistoryItemForStorage = (item: HistoryItem): HistoryItem =
   }
   return normalizedItem;
 };
+
+const historyPatchKeys = ["editedTextMarkdown", "fusedPromptResult", "fusedPromptCreatedAt"] as const;
+const historyPatchRequestKeys = new Set<string>(["id", "expectedHistoryEpoch", ...historyPatchKeys]);
+
+const hasOwn = (value: object, key: PropertyKey): boolean => Object.prototype.hasOwnProperty.call(value, key);
+
+const normalizeExpectedHistoryEpoch = (value: unknown): number | undefined => {
+  if (value === undefined) return undefined;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error("图片分析历史版本无效。");
+  return value as number;
+};
+
+const normalizeHistoryPatch = (request: HistoryPatchItemRequest): HistoryItemPatch => {
+  const record = asRecord(request);
+  if (!record) throw new Error("图片分析历史更新请求无效。");
+  for (const key of Object.keys(record)) {
+    if (!historyPatchRequestKeys.has(key)) throw new Error(`不允许更新图片分析历史字段：${key}`);
+  }
+
+  const patch: HistoryItemPatch = {};
+  if (hasOwn(record, "editedTextMarkdown")) {
+    if (record.editedTextMarkdown !== undefined && typeof record.editedTextMarkdown !== "string") {
+      throw new Error("图片文字编辑稿格式无效。");
+    }
+    patch.editedTextMarkdown = record.editedTextMarkdown as string | undefined;
+  }
+  if (hasOwn(record, "fusedPromptResult")) {
+    patch.fusedPromptResult =
+      record.fusedPromptResult === undefined
+        ? undefined
+        : normalizeFusedPromptResult(record.fusedPromptResult, { enforceRules: false });
+  }
+  if (hasOwn(record, "fusedPromptCreatedAt")) {
+    if (record.fusedPromptCreatedAt !== undefined && typeof record.fusedPromptCreatedAt !== "string") {
+      throw new Error("融合提示词创建时间格式无效。");
+    }
+    patch.fusedPromptCreatedAt = record.fusedPromptCreatedAt as string | undefined;
+  }
+  if (!historyPatchKeys.some((key) => hasOwn(patch, key))) {
+    throw new Error("图片分析历史更新内容不能为空。");
+  }
+  return patch;
+};
+
+export const upsertHistoryEntry = (history: unknown[], item: HistoryItem, limit = 50): unknown[] => {
+  const normalizedItem = normalizeHistoryItemForStorage(item);
+  return [normalizedItem, ...history.filter((entry) => getHistoryEntryId(entry) !== normalizedItem.id)].slice(0, limit);
+};
+
+export const patchHistoryEntry = (
+  history: unknown[],
+  request: HistoryPatchItemRequest
+): unknown[] => {
+  const id = request.id?.trim();
+  if (!id) throw new Error("图片分析历史 ID 不能为空。");
+  const index = history.findIndex((entry) => getHistoryEntryId(entry) === id);
+  if (index < 0) throw new Error(HISTORY_ITEM_NOT_FOUND_ERROR);
+  const record = asRecord(history[index]);
+  if (!record) throw new Error(HISTORY_ITEM_NOT_FOUND_ERROR);
+  const patch = normalizeHistoryPatch(request);
+  const next = [...history];
+  next[index] = { ...record, ...patch };
+  return next;
+};
+
+export const deleteHistoryEntry = (history: unknown[], id: string): unknown[] =>
+  history.filter((entry) => getHistoryEntryId(entry) !== id);
+
+const historyPathValue = (path: string | (() => string)): string => (typeof path === "function" ? path() : path);
+
+export class HistoryStore {
+  private epoch = 0;
+  private mutationQueue: Promise<unknown> = Promise.resolve();
+
+  constructor(private readonly path: string | (() => string)) {}
+
+  get currentEpoch(): number {
+    return this.epoch;
+  }
+
+  invalidate(): number {
+    this.epoch += 1;
+    return this.epoch;
+  }
+
+  async getSnapshot(): Promise<HistorySnapshot> {
+    while (true) {
+      const epochAtStart = this.epoch;
+      await this.mutationQueue;
+      const history = await this.readRaw();
+      if (epochAtStart === this.epoch) return { items: normalizeHistory(history), epoch: epochAtStart };
+    }
+  }
+
+  async save(requestOrItem: HistoryItem | HistorySaveItemRequest): Promise<HistoryItem[]> {
+    const record = asRecord(requestOrItem);
+    const isRequest = Boolean(record && hasOwn(record, "item"));
+    const request = isRequest
+      ? (requestOrItem as HistorySaveItemRequest)
+      : ({ item: requestOrItem as HistoryItem } satisfies HistorySaveItemRequest);
+    const expectedEpoch = normalizeExpectedHistoryEpoch(request.expectedHistoryEpoch);
+    return this.mutate(expectedEpoch, (history) => upsertHistoryEntry(history, request.item));
+  }
+
+  async patch(request: HistoryPatchItemRequest): Promise<HistoryItem[]> {
+    const expectedEpoch = normalizeExpectedHistoryEpoch(request.expectedHistoryEpoch);
+    return this.mutate(expectedEpoch, (history) => patchHistoryEntry(history, request));
+  }
+
+  async delete(requestOrId: string | HistoryDeleteItemRequest): Promise<HistoryItem[]> {
+    const request =
+      typeof requestOrId === "string" ? { id: requestOrId } : requestOrId;
+    const id = request.id?.trim();
+    if (!id) throw new Error("图片分析历史 ID 不能为空。");
+    const expectedEpoch = normalizeExpectedHistoryEpoch(request.expectedHistoryEpoch);
+    return this.mutate(expectedEpoch, (history) => deleteHistoryEntry(history, id));
+  }
+
+  clear(): Promise<void> {
+    this.invalidate();
+    return this.clearInvalidated();
+  }
+
+  clearInvalidated(): Promise<void> {
+    return this.enqueue(async () => {
+      await writeJsonFile(historyPathValue(this.path), []);
+    });
+  }
+
+  private async readRaw(): Promise<unknown[]> {
+    const history = await readJsonFile<unknown>(historyPathValue(this.path), []);
+    return Array.isArray(history) ? history : [];
+  }
+
+  private assertEpoch(expectedEpoch: number | undefined): void {
+    if (expectedEpoch === undefined) {
+      // Legacy payloads remain readable before the first clear, but cannot safely
+      // participate after an epoch boundary because they could revive cleared data.
+      if (this.epoch !== 0) throw new Error(HISTORY_STALE_EPOCH_ERROR);
+      return;
+    }
+    if (expectedEpoch !== this.epoch) throw new Error(HISTORY_STALE_EPOCH_ERROR);
+  }
+
+  private mutate(
+    expectedEpoch: number | undefined,
+    mutation: (history: unknown[]) => unknown[]
+  ): Promise<HistoryItem[]> {
+    return this.enqueue(async () => {
+      this.assertEpoch(expectedEpoch);
+      const next = mutation(await this.readRaw());
+      this.assertEpoch(expectedEpoch);
+      await writeJsonFile(historyPathValue(this.path), next);
+      this.assertEpoch(expectedEpoch);
+      return normalizeHistory(next);
+    });
+  }
+
+  private enqueue<Result>(operation: () => Promise<Result>): Promise<Result> {
+    const run = this.mutationQueue.then(operation);
+    this.mutationQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+}
 
 const normalizeVisionBaseUrl = (baseUrl: string): string =>
   baseUrl

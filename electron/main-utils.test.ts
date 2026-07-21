@@ -2,7 +2,12 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
+import { normalizeFusedPromptResult } from "../src/shared/schema";
 import {
+  AbortableOperationRegistry,
+  HISTORY_ITEM_NOT_FOUND_ERROR,
+  HISTORY_STALE_EPOCH_ERROR,
+  HistoryStore,
   ModelHttpError,
   anthropicMessagesEndpoint,
   anthropicTextFromResponse,
@@ -25,6 +30,20 @@ import {
   visionRequestHeaders,
   writeJsonFile
 } from "./main-utils";
+
+const testHistoryItem = (id: string) =>
+  normalizeHistory([
+    {
+      id,
+      createdAt: `2026-07-21T00:00:0${id.length % 10}.000Z`,
+      thumbnailDataUrl: `data:image/jpeg;base64,${id}`,
+      analysis: {
+        style_reference: {
+          universal_style_prompt: `通用风格 ${id}`
+        }
+      }
+    }
+  ])[0];
 
 describe("main process model utilities", () => {
   it("builds chat completions endpoints from common base URLs", () => {
@@ -270,6 +289,45 @@ describe("main process model utilities", () => {
       })
     ).toBe(true);
   });
+
+  it("enforces shared capacity and cancels only the addressed operation", async () => {
+    const registry = new AbortableOperationRegistry(5);
+    const handles = [
+      registry.register("analyze-1", "analyze"),
+      registry.register("fuse-1", "fuse"),
+      registry.register("analyze-2", "analyze"),
+      registry.register("fuse-2", "fuse"),
+      registry.register("analyze-3", "analyze")
+    ];
+
+    expect(() => registry.register("sixth", "fuse")).toThrow("MODEL_OPERATION_CAPACITY_REACHED");
+    expect(registry.cancel("analyze-2", "analyze", new Error("已取消指定解析。"))).toBe(true);
+    expect(handles[2].signal.aborted).toBe(true);
+    expect(handles.filter((handle, index) => index !== 2 && handle.signal.aborted)).toEqual([]);
+    expect(registry.cancel("fuse-1", "analyze", new Error("不应取消。"))).toBe(false);
+    expect(registry.cancel("missing", "analyze", new Error("幂等取消。"))).toBe(false);
+
+    for (const handle of handles) handle.release();
+    expect(registry.activeCount).toBe(0);
+  });
+
+  it("waits for registered operations to settle during abort-all", async () => {
+    const registry = new AbortableOperationRegistry(2);
+    const first = registry.register("first", "analyze");
+    const second = registry.register("second", "fuse");
+    let settled = false;
+    const aborting = registry.abortAll(new Error("清空本机数据。")).then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(first.signal.aborted).toBe(true);
+    expect(second.signal.aborted).toBe(true);
+    expect(settled).toBe(false);
+    first.release();
+    second.release();
+    await aborting;
+    expect(settled).toBe(true);
+  });
 });
 
 describe("main process history and JSON file utilities", () => {
@@ -292,6 +350,98 @@ describe("main process history and JSON file utilities", () => {
 
     expect(history).toHaveLength(1);
     expect(history[0].analysis.style_reference.universal_style_prompt).toContain("Create a clean poster");
+  });
+
+  it("serializes five concurrent history creates without dropping entries", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "image-style-history-create-"));
+    const path = join(dir, "history.json");
+    try {
+      const store = new HistoryStore(path);
+      await Promise.all(
+        ["one", "two", "three", "four", "five"].map((id) =>
+          store.save({ item: testHistoryItem(id), expectedHistoryEpoch: 0 })
+        )
+      );
+      const snapshot = await store.getSnapshot();
+      expect(snapshot.items.map((item) => item.id).sort()).toEqual(["five", "four", "one", "three", "two"]);
+      expect(snapshot.epoch).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("merges concurrent text and fused-prompt patches on the same history entry", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "image-style-history-patch-"));
+    const path = join(dir, "history.json");
+    try {
+      const store = new HistoryStore(path);
+      await store.save({ item: testHistoryItem("shared"), expectedHistoryEpoch: 0 });
+      const fusedPromptResult = normalizeFusedPromptResult(
+        { fused_prompt: "对这张图片进行冷色调海报风格重绘，保持主体身份与画面信息层级。" },
+        { enforceRules: false }
+      );
+
+      await Promise.all([
+        store.patch({ id: "shared", expectedHistoryEpoch: 0, editedTextMarkdown: "# 新标题" }),
+        store.patch({
+          id: "shared",
+          expectedHistoryEpoch: 0,
+          fusedPromptResult,
+          fusedPromptCreatedAt: "2026-07-21T01:00:00.000Z"
+        })
+      ]);
+
+      const item = (await store.getSnapshot()).items[0];
+      expect(item.editedTextMarkdown).toBe("# 新标题");
+      expect(item.fusedPromptResult?.fused_prompt).toBe(fusedPromptResult.fused_prompt);
+      expect(item.fusedPromptCreatedAt).toBe("2026-07-21T01:00:00.000Z");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects stale writes after clear and never revives a deleted patch target", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "image-style-history-epoch-"));
+    const path = join(dir, "history.json");
+    try {
+      const store = new HistoryStore(path);
+      await store.save({ item: testHistoryItem("stale"), expectedHistoryEpoch: 0 });
+      await store.clear();
+      await expect(
+        store.save({ item: testHistoryItem("late"), expectedHistoryEpoch: 0 })
+      ).rejects.toThrow(HISTORY_STALE_EPOCH_ERROR);
+      await expect(store.save(testHistoryItem("legacy-late"))).rejects.toThrow(HISTORY_STALE_EPOCH_ERROR);
+      expect((await store.getSnapshot()).items).toEqual([]);
+
+      await store.save({ item: testHistoryItem("target"), expectedHistoryEpoch: 1 });
+      await store.delete({ id: "target", expectedHistoryEpoch: 1 });
+      await expect(
+        store.patch({ id: "target", expectedHistoryEpoch: 1, editedTextMarkdown: "不应复活" })
+      ).rejects.toThrow(HISTORY_ITEM_NOT_FOUND_ERROR);
+      expect((await store.getSnapshot()).items).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps legacy save/delete payloads while rejecting non-whitelisted patches", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "image-style-history-legacy-ipc-"));
+    const path = join(dir, "history.json");
+    try {
+      const store = new HistoryStore(path);
+      await store.save(testHistoryItem("legacy-payload"));
+      await expect(
+        store.patch({
+          id: "legacy-payload",
+          expectedHistoryEpoch: 0,
+          analysis: {}
+        } as never)
+      ).rejects.toThrow("不允许更新图片分析历史字段：analysis");
+      await store.delete("legacy-payload");
+      expect((await store.getSnapshot()).items).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("writes JSON through a temp file and preserves valid content", async () => {
