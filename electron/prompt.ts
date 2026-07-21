@@ -30,6 +30,7 @@ export const buildSystemPrompt = (strictGeneralization: boolean): string => `
 24. 所有提示词模板必须用中文展示，尤其是 universal_style_prompt、layout_prompt、color_prompt、lighting_prompt、typography_prompt、decorative_elements_prompt、negative_prompt、editable_template.prompt_template、information_layout_template.copy_ready_json_prompt。
 25. negative_prompt 也必须是中文，例如“避免低对比、灰暗配色、细弱字体、杂乱背景、真实阴影过重、小字过多”，不要写成英文 negative prompt。
 26. 如果图片包含清晰可读的文字（图表、表格、资料卡、海报、笔记、清单、UI 界面等），extracted_text.applies 必须为 true，并把所有清晰可读的文字按视觉层级逐字转写进 extracted_text.markdown：画面最大标题用 #，分组或区块标题用 ##，列表条目用 -，表格用 Markdown 表格语法，被强调的数据或结论用 **加粗**。保持原文语言和原始用词，不翻译、不改写、不补全、不总结；看不清的部分写 [无法识别]；extraction_notes 用中文说明模糊、截断或被遮挡的部分。图中没有可读文字时 applies=false，markdown 留空。
+27. generation_guidance.for_text_to_image 必须输出一段可直接用于纯文生图的完整中文说明，覆盖视觉风格、构图与排版系统、文字层级、配色、光影、字体气质、装饰语言和可替换内容槽位；只能使用 [MAIN_TITLE]、[SUBTITLE]、[SUPPORTING_TEXT]、[SUBJECT_GROUP]、[MAIN_OBJECT]、[DATA_CALLOUT] 等抽象占位符，禁止写入原图具体文案、品牌、Logo、价格、型号、日期和数据。
 
 严格通用化：${strictGeneralization ? "开启。必须弱化所有具体内容，只保留风格、排版、配色、光影和视觉系统。" : "关闭。可以保留更具体的主体摘要，但仍然不要照抄品牌、完整文字、价格、型号和具体数据。"}
 `;

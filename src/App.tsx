@@ -50,6 +50,7 @@ import {
 } from "./shared/image-edit-regeneration";
 import { clipboardPasteShortcut, isWindowsPlatform, localDataScopeLabel } from "./shared/platform";
 import { createLocalSourceCapture } from "./shared/schema";
+import { buildDirectTextToImagePrompt } from "./shared/text-to-image-prompt";
 import type {
   FusePromptControls,
   FusePromptMode,
@@ -1146,6 +1147,10 @@ export function App(): JSX.Element {
   const supportsInformationLayoutMode = useMemo(() => hasInformationLayoutMode(analysis), [analysis]);
   const fuseMode = resolveFuseMode(analysis, selectedFuseMode);
   const prompts = useMemo(() => getPromptBlocks(analysis), [analysis]);
+  const directTextToImagePrompt = useMemo(
+    () => (analysis ? buildDirectTextToImagePrompt(analysis, editedTextMarkdown) : ""),
+    [analysis, editedTextMarkdown]
+  );
   const styleTermsText = useMemo(() => formatStyleTerms(analysis), [analysis]);
   const usesInsecureBaseUrl = draftConfig.apiBaseUrl.trim().toLowerCase().startsWith("http://");
   const usesInsecureGenerationBaseUrl =
@@ -1163,6 +1168,7 @@ export function App(): JSX.Element {
   const generationPromptOptions = useMemo<GenerationPromptOption[]>(
     () => {
       const candidates: GenerationPromptOption[] = [
+        { kind: "text_to_image", label: "完整文生图提示词", value: directTextToImagePrompt },
         { kind: "universal", label: "通用风格提示词", value: prompts.universal },
         { kind: "layout", label: "排版布局提示词", value: prompts.layout },
         { kind: "negative", label: "负面提示词", value: prompts.negative },
@@ -1178,7 +1184,7 @@ export function App(): JSX.Element {
       ];
       return candidates.filter((option) => option.value.trim());
     },
-    [fusedPrompt, fusedPromptJson, prompts, styleTermsText]
+    [directTextToImagePrompt, fusedPrompt, fusedPromptJson, prompts, styleTermsText]
   );
 
   useEffect(() => {
@@ -1577,11 +1583,22 @@ export function App(): JSX.Element {
       sourceFileName: sourceImage.fileName,
       importedAt: new Date().toISOString()
     };
-    setGenerationPrompt(option.value);
+    const importedPrompt =
+      option.kind === "text_to_image" && analysis
+        ? buildDirectTextToImagePrompt(analysis, editedTextMarkdown)
+        : option.value;
+    setGenerationPrompt(importedPrompt);
     setGenerationPromptSource(promptSource);
+    if (option.kind === "text_to_image") {
+      setGenerationReferenceImages([]);
+    }
     setGenerationError("");
     setActiveView("generate");
-    setStatus(`已导入${option.label}到生图工作台。`);
+    setStatus(
+      option.kind === "text_to_image"
+        ? "已导入完整文生图提示词，参考图已清空。"
+        : `已导入${option.label}到生图工作台。`
+    );
   };
 
   const syncFusionImageToGenerationReferences = async (
@@ -1850,13 +1867,16 @@ export function App(): JSX.Element {
 
   const createGeneration = async () => {
     if (!generationPrompt.trim()) {
-      setGenerationError("请先从提取结果导入提示词，再在生图工作台编辑。");
+      setGenerationError("请先导入提示词或直接填写完整的生图提示词。");
       return;
     }
-    if (!generationPromptSource?.sourceImageDataUrl && !generationPromptSource?.sourceThumbnailDataUrl) {
-      setGenerationError("当前提示词缺少原始提取图，无法建立生成后左右对比。");
-      return;
-    }
+    const promptSource: GenerationPromptSource =
+      generationPromptSource || {
+        kind: "manual",
+        label: "手动输入提示词",
+        importedAt: new Date().toISOString()
+      };
+    if (!generationPromptSource) setGenerationPromptSource(promptSource);
     let activeGenerationConfig = generationConfigRef.current;
     if (!hasGenerationBackend(activeGenerationConfig)) {
       activeGenerationConfig = await openGenerationConfig();
@@ -1869,7 +1889,7 @@ export function App(): JSX.Element {
 
     await runGenerationRequest({
       prompt: generationPrompt,
-      promptSource: generationPromptSource,
+      promptSource,
       referenceImages: generationReferenceImages,
       settings: {
         ...generationSettings,
@@ -3896,7 +3916,7 @@ function GenerationWorkspace({
         <div className="generation-header">
           <div>
             <h2>生图工作台</h2>
-            <p>从左侧提取结果导入提示词副本，在这里完成出图、任务回看和原图对比。</p>
+            <p>可导入解析结果，也可直接填写提示词；是否发送图片只由参考图列表决定。</p>
           </div>
           <button className="secondary-button" onClick={onOpenConfig} type="button">
             <Settings size={17} />
@@ -3906,7 +3926,7 @@ function GenerationWorkspace({
 
         <div className="import-row">
           {options.length === 0 ? (
-            <p className="empty-text">先在“提示词提取”页完成分析或融合，导入来源会显示在这里。</p>
+            <p className="empty-text">可直接在下方填写完整提示词；完成图片分析后，解析结果导入项会显示在这里。</p>
           ) : (
             options.map((option) => (
               <button
@@ -3922,20 +3942,42 @@ function GenerationWorkspace({
         </div>
 
         {promptSource && (
-          <div className="generation-source-strip">
+          <div
+            className={`generation-source-strip${promptSource.sourceThumbnailDataUrl ? "" : " without-thumbnail"}`}
+          >
             {promptSource.sourceThumbnailDataUrl && <img alt="" src={promptSource.sourceThumbnailDataUrl} />}
             <span>
               <strong>{promptSource.label}</strong>
-              <small>{promptSource.sourceFileName || "来源图片"} · {new Date(promptSource.importedAt).toLocaleString("zh-CN")}</small>
+              <small>
+                {promptSource.sourceFileName
+                  ? `${promptSource.sourceFileName} · `
+                  : promptSource.kind === "manual"
+                    ? ""
+                    : "解析来源图 · "}
+                {new Date(promptSource.importedAt).toLocaleString("zh-CN")}
+              </small>
             </span>
           </div>
         )}
+
+        <div className={`generation-mode-notice${referenceImages.length ? " with-references" : ""}`}>
+          <strong>
+            {referenceImages.length
+              ? `当前模式：参考图生成，将发送 ${referenceImages.length} 张图片给生图模型`
+              : "当前模式：文生图，不发送图片给生图模型"}
+          </strong>
+          <span>
+            {referenceImages.length
+              ? "解析来源图仍只用于来源展示和左右对比。"
+              : "需要指定人物、产品或物体时，再主动添加参考图。"}
+          </span>
+        </div>
 
         <label className="generation-prompt-field">
           <span>生图提示词</span>
           <textarea
             onChange={(event) => setPrompt(event.target.value)}
-            placeholder="从提示词提取页导入后可在这里编辑。编辑只影响生图工作台，不会写回原始分析结果。"
+            placeholder="可直接填写完整提示词，也可从提示词提取页导入。这里的编辑不会写回原始分析结果。"
             value={prompt}
           />
         </label>
@@ -4472,17 +4514,19 @@ function GenerationWorkspace({
                             </div>
                             {output.error && <p className="generation-output-error">{output.error}</p>}
                             <figcaption>
-                              <button
-                                className="secondary-button"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onOpenCompare(task, output);
-                                }}
-                                type="button"
-                              >
-                                <Maximize2 size={16} />
-                                左右对比
-                              </button>
+                              {(task.promptSource.sourceImageDataUrl || task.promptSource.sourceThumbnailDataUrl) && (
+                                <button
+                                  className="secondary-button"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onOpenCompare(task, output);
+                                  }}
+                                  type="button"
+                                >
+                                  <Maximize2 size={16} />
+                                  左右对比
+                                </button>
+                              )}
                               <button
                                 className="secondary-button"
                                 onClick={(event) => {

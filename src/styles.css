@@ -1450,6 +1450,11 @@ button:disabled {
   border-radius: 8px;
 }
 
+.generation-source-strip.without-thumbnail {
+  grid-template-columns: minmax(0, 1fr);
+  padding: 10px 12px;
+}
+
 .generation-source-strip img {
   width: 54px;
   height: 54px;
@@ -1464,6 +1469,36 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.generation-mode-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  color: #18534d;
+  background: #edf7f5;
+  border: 1px solid #b8dcd7;
+  border-radius: 8px;
+}
+
+.generation-mode-notice.with-references {
+  color: #74420f;
+  background: #fff8eb;
+  border-color: #ead2a8;
+}
+
+.generation-mode-notice strong,
+.generation-mode-notice span {
+  display: block;
+}
+
+.generation-mode-notice strong {
+  font-size: 13px;
+}
+
+.generation-mode-notice span {
+  font-size: 12px;
 }
 
 .generation-source-strip small {

@@ -59,6 +59,17 @@ const createGenerationRequest = (prompt: string) => ({
   settings: { ...settings, n: 1 }
 });
 
+const createManualGenerationRequest = (prompt: string) => ({
+  prompt,
+  promptSource: {
+    kind: "manual" as const,
+    label: "手动输入提示词",
+    importedAt: "2026-07-20T00:00:00.000Z"
+  },
+  referenceImages: [],
+  settings: { ...settings, n: 1 }
+});
+
 const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> => {
   const startedAt = Date.now();
   while (!(await predicate())) {
@@ -190,6 +201,36 @@ describe("generation request builders", () => {
       moderation: "auto"
     });
     expect(payload.output_compression).toBeUndefined();
+  });
+
+  it("builds text-only generation payloads without image fields for every JSON protocol", () => {
+    const prompt = "# 全新标题\n- 只使用这些文字";
+    const responsesPayload = buildResponsesPayload(prompt, { ...settings, apiMode: "responses" }, []);
+    expect((responsesPayload.tools as Array<Record<string, unknown>>)[0]).toMatchObject({
+      type: "image_generation",
+      action: "generate"
+    });
+    expect(JSON.stringify(responsesPayload)).not.toContain("input_image");
+
+    const chatPayload = buildChatCompletionsImagePayload(
+      prompt,
+      { ...settings, apiMode: "chat_completions" },
+      []
+    );
+    expect(chatPayload).toMatchObject({
+      messages: [{ role: "user", content: [{ type: "text", text: prompt }] }]
+    });
+    expect(JSON.stringify(chatPayload)).not.toContain("image_url");
+
+    const geminiPayload = buildGeminiImagePayload(prompt, { ...settings, apiMode: "gemini" }, []);
+    expect(geminiPayload).toMatchObject({
+      contents: [{ role: "user", parts: [{ text: prompt }] }]
+    });
+    expect(JSON.stringify(geminiPayload)).not.toContain("inlineData");
+
+    const openRouterPayload = buildOpenRouterImagesPayload(prompt, settings, []);
+    expect(openRouterPayload.prompt).toBe(prompt);
+    expect(openRouterPayload).not.toHaveProperty("input_references");
   });
 
   it("builds Responses API image_generation tool payloads with input images", () => {
@@ -618,6 +659,80 @@ describe("generation config defaults", () => {
 });
 
 describe("generation task queue", () => {
+  it("creates, persists, restores and retries a manual text-only Images API task", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-manual-text-only-"));
+    const responseBody = JSON.stringify({
+      data: [{ b64_json: b64Image(pngBytes(1024, 1024)) }]
+    });
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(responseBody, { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const service = new GenerationService(rootDir);
+      await service.saveConfig({
+        authSource: "api",
+        providerType: "openai_compatible",
+        apiBaseUrl: "https://api.example.com/v1",
+        apiKey: "test-key",
+        apiMode: "images",
+        imageModel: "gpt-image-2",
+        mainModel: "gpt-5.5",
+        saveApiKey: false,
+        imagesConcurrency: 1
+      });
+
+      await expect(
+        service.createTask({
+          ...createManualGenerationRequest("缺少来源图的非手动提示词"),
+          promptSource: {
+            kind: "universal",
+            label: "通用风格提示词",
+            importedAt: "2026-07-20T00:00:00.000Z"
+          }
+        })
+      ).rejects.toThrow("缺少原始提取图来源");
+
+      const task = await service.createTask(createManualGenerationRequest("# 全新标题\n- 轻巧\n- 安静"));
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === task.id && item.status === "succeeded")
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe("https://api.example.com/v1/images/generations");
+      const payload = JSON.parse(String(init.body)) as Record<string, unknown>;
+      expect(payload.prompt).toContain("# 全新标题\n- 轻巧\n- 安静");
+      expect(JSON.stringify(payload)).not.toMatch(/input_image|image_url|inlineData|input_references/);
+
+      const finished = (await service.getTasks()).find((item) => item.id === task.id)!;
+      expect(finished.promptSource).toEqual({
+        kind: "manual",
+        label: "手动输入提示词",
+        importedAt: "2026-07-20T00:00:00.000Z"
+      });
+      expect(finished.referenceImages).toEqual([]);
+
+      const retried = await service.createTask({
+        prompt: finished.prompt,
+        promptSource: { ...finished.promptSource, importedAt: "2026-07-20T00:01:00.000Z" },
+        referenceImages: finished.referenceImages,
+        settings: finished.settings
+      });
+      await waitFor(async () =>
+        (await service.getTasks()).some((item) => item.id === retried.id && item.status === "succeeded")
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      const restoredTasks = await new GenerationService(rootDir).getTasks();
+      expect(restoredTasks.filter((item) => item.promptSource.kind === "manual")).toHaveLength(2);
+      const persisted = JSON.parse(await readFile(join(rootDir, "generation", "tasks.json"), "utf8")) as GenerationTask[];
+      expect(persisted.find((item) => item.id === task.id)?.referenceImages).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("routes Gemini native generation with official Google authentication", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "generation-gemini-native-"));
     const b64 = b64Image(pngBytes(1024, 1024));
