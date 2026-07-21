@@ -217,9 +217,9 @@ try {
   await page.locator('img[alt="待分析图片预览"]').waitFor();
 
   await page.getByRole("button", { name: "生图工作台" }).click();
-  await page.getByRole("heading", { name: "生图工作台" }).waitFor();
+  await page.getByText("当前没有生图流程。").waitFor();
   await page.getByRole("button", { name: "改图工作台" }).click();
-  await page.getByRole("heading", { name: "改图工作台" }).waitFor();
+  await page.getByText("当前没有改图流程。").waitFor();
   await page.getByRole("button", { name: "提示词提取" }).click();
 
   const modelConfig = await page.evaluate(async ({ secret }) => {
