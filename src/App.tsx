@@ -14,6 +14,7 @@ import {
   Loader2,
   Maximize2,
   PenLine,
+  ChevronRight,
   RotateCcw,
   Settings,
   Sparkles,
@@ -51,6 +52,32 @@ import {
 import { clipboardPasteShortcut, isWindowsPlatform, localDataScopeLabel } from "./shared/platform";
 import { createLocalSourceCapture } from "./shared/schema";
 import { buildDirectTextToImagePrompt } from "./shared/text-to-image-prompt";
+import {
+  extractionGenerationHandoffKey,
+  extractionWorkflowLineageKey,
+  generationOutputHandoffKey,
+  generationPromptSourceHandoffKey,
+  generationPromptSourceLineageKey,
+  imageEditSourceHandoffKey,
+  resolveWorkflowLineageKeys
+} from "./shared/workflow-lineage";
+import {
+  admitBatchInputs,
+  countActiveWorkflows,
+  createWorkflowLineageMarkerMap,
+  isWorkflowOperationCurrent,
+  isWorkspaceStatusTerminal,
+  updateWorkflowById,
+  updateWorkflowForOperation,
+  workflowLineageMarkerForKey,
+  WORKSPACE_CONCURRENCY_LIMIT
+} from "./shared/workspace-concurrency";
+import type {
+  WorkflowOperationToken,
+  WorkflowLineageMarker,
+  WorkspaceKind,
+  WorkspaceLifecycleStatus
+} from "./shared/workspace-concurrency";
 import type {
   FusePromptControls,
   FusePromptMode,
@@ -132,7 +159,6 @@ const defaultGenerationConfig: GenerationConfig = {
   saveApiKey: false,
   hasApiKey: false,
   codexOAuthAvailable: false,
-  codexOAuthPath: "",
   imagesConcurrency: 4
 };
 
@@ -173,7 +199,6 @@ type GenerationConfigDraft = GenerationConfigUpdate &
     | "providers"
     | "hasApiKey"
     | "codexOAuthAvailable"
-    | "codexOAuthPath"
     | "codexOAuthAccountId"
     | "codexOAuthLastRefresh"
     | "codexOAuthError"
@@ -256,6 +281,274 @@ type ImageEditAnnotation = {
   start?: { x: number; y: number };
   end?: { x: number; y: number };
 };
+
+type ExtractionWorkflowStage = "preparing" | "analyzing" | "analysis_ready" | "fusing" | "fused";
+
+type ExtractionWorkflow = {
+  id: string;
+  revision: number;
+  status: WorkspaceLifecycleStatus;
+  stage: ExtractionWorkflowStage;
+  operationId?: string;
+  displayName: string;
+  image: ImageState | null;
+  analysis: StyleAnalysis | null;
+  rawText: string;
+  editedTextMarkdown: string;
+  historyItemId?: string;
+  statusMessage: string;
+  error: string;
+  subjectImage: ImageState | null;
+  fusedPrompt: string;
+  fusedPromptJson: FusedPromptJson | null;
+  fuseError: string;
+  fuseControls: FusePromptControls;
+  selectedFuseMode: FusePromptMode | null;
+  productInfoText: string;
+};
+
+type GenerationWorkflowStage = "draft" | "submitting" | "queued" | "running" | "finished";
+
+type GenerationWorkflow = {
+  id: string;
+  revision: number;
+  status: WorkspaceLifecycleStatus;
+  stage: GenerationWorkflowStage;
+  operationId?: string;
+  displayName: string;
+  prompt: string;
+  promptSource: GenerationPromptSource | null;
+  referenceImages: GenerationReferenceImage[];
+  settings: GenerationRequestSettings;
+  sourceWorkflowRevision?: number;
+  promptEditedByUser?: boolean;
+  referencesEditedByUser?: boolean;
+  taskId?: string;
+  statusMessage: string;
+  error: string;
+  readOnly?: boolean;
+};
+
+type ImageEditWorkflowStage =
+  | "preparing"
+  | "annotating"
+  | "resolving"
+  | "confirming"
+  | "queued"
+  | "running"
+  | "finished";
+
+type ImageEditWorkflow = {
+  id: string;
+  revision: number;
+  status: WorkspaceLifecycleStatus;
+  stage: ImageEditWorkflowStage;
+  operationId?: string;
+  displayName: string;
+  source: ImageEditSourceImage | null;
+  annotations: ImageEditAnnotation[];
+  regenerationContext: ImageEditRegenerationContext | null;
+  annotationResolution: ImageEditAnnotationResolution | null;
+  instruction: string;
+  settings: ImageEditRequestSettings;
+  taskId?: string;
+  statusMessage: string;
+  error: string;
+  activeTool: ImageEditTool;
+  annotationColor: string;
+  annotationText: string;
+  readOnly?: boolean;
+};
+
+type WorkspaceDialogState = {
+  workspace: WorkspaceKind;
+  occupied: number;
+  acceptedCount: number;
+  rejectedCount: number;
+  failures?: string[];
+};
+
+type WorkflowNavigatorItem = {
+  id: string;
+  lineageMarker: WorkflowLineageMarker;
+  title: string;
+  subtitle: string;
+  status: WorkspaceLifecycleStatus;
+  thumbnailDataUrl?: string;
+  error?: string;
+  countsTowardCapacity?: boolean;
+  canClose?: boolean;
+  closeLabel?: string;
+  closeTitle?: string;
+};
+
+type HandoffDismissalWorkspace = "generation" | "image_edit";
+
+const handoffDismissalStorageKeys: Record<HandoffDismissalWorkspace, string> = {
+  generation: "image-style-extractor.dismissed-generation-handoffs.v1",
+  image_edit: "image-style-extractor.dismissed-image-edit-handoffs.v1"
+};
+
+const loadDismissedHandoffKeys = (workspace: HandoffDismissalWorkspace): Set<string> => {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(handoffDismissalStorageKeys[workspace]) || "[]");
+    if (!Array.isArray(stored)) return new Set();
+    return new Set(stored.filter((value): value is string => typeof value === "string" && Boolean(value)).slice(-500));
+  } catch {
+    return new Set();
+  }
+};
+
+const saveDismissedHandoffKeys = (workspace: HandoffDismissalWorkspace, keys: Set<string>): void => {
+  try {
+    window.localStorage.setItem(
+      handoffDismissalStorageKeys[workspace],
+      JSON.stringify(Array.from(keys).slice(-500))
+    );
+  } catch {
+    // A storage quota failure must not block removing the current workspace row.
+  }
+};
+
+const workspaceLabelMap: Record<WorkspaceKind, string> = {
+  extraction: "图片解析工作区",
+  generation: "生图工作区",
+  image_edit: "改图工作区"
+};
+
+const applyStateAction = <T,>(current: T, action: SetStateAction<T>): T =>
+  typeof action === "function" ? (action as (value: T) => T)(current) : action;
+
+const runWithConcurrency = async <T, R>(
+  inputs: readonly T[],
+  limit: number,
+  worker: (input: T, index: number) => Promise<R>
+): Promise<R[]> => {
+  const results = new Array<R>(inputs.length);
+  let nextIndex = 0;
+  const runners = Array.from({ length: Math.min(limit, inputs.length) }, async () => {
+    while (nextIndex < inputs.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(inputs[index], index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+};
+
+const lifecycleStatusFromTask = (status: GenerationTask["status"]): WorkspaceLifecycleStatus => status;
+
+const generationStageFromTask = (status: GenerationTask["status"]): GenerationWorkflowStage => {
+  if (status === "queued") return "queued";
+  if (status === "running") return "running";
+  return "finished";
+};
+
+const imageEditStageFromTask = (status: ImageEditTask["status"]): ImageEditWorkflowStage => {
+  if (status === "queued") return "queued";
+  if (status === "running") return "running";
+  return "finished";
+};
+
+const createExtractionWorkflow = (displayName: string): ExtractionWorkflow => ({
+  id: crypto.randomUUID(),
+  revision: 0,
+  status: "setup",
+  stage: "preparing",
+  displayName,
+  image: null,
+  analysis: null,
+  rawText: "",
+  editedTextMarkdown: "",
+  statusMessage: "正在读取图片...",
+  error: "",
+  subjectImage: null,
+  fusedPrompt: "",
+  fusedPromptJson: null,
+  fuseError: "",
+  fuseControls: defaultFuseControls,
+  selectedFuseMode: null,
+  productInfoText: ""
+});
+
+const createGenerationWorkflow = (
+  initial: Partial<
+    Pick<
+      GenerationWorkflow,
+      "prompt" | "promptSource" | "referenceImages" | "settings" | "displayName" | "sourceWorkflowRevision"
+    >
+  > = {}
+): GenerationWorkflow => ({
+  id: crypto.randomUUID(),
+  revision: 0,
+  status: "setup",
+  stage: "draft",
+  displayName: initial.displayName || initial.promptSource?.sourceFileName || initial.promptSource?.label || "未命名生图流程",
+  prompt: initial.prompt || "",
+  promptSource: initial.promptSource || null,
+  referenceImages: initial.referenceImages || [],
+  settings: initial.settings || { ...defaultGenerationSettings },
+  sourceWorkflowRevision: initial.sourceWorkflowRevision,
+  statusMessage: "待配置",
+  error: ""
+});
+
+const createImageEditWorkflow = (displayName: string): ImageEditWorkflow => ({
+  id: crypto.randomUUID(),
+  revision: 0,
+  status: "setup",
+  stage: "preparing",
+  displayName,
+  source: null,
+  annotations: [],
+  regenerationContext: null,
+  annotationResolution: null,
+  instruction: "",
+  settings: { ...defaultImageEditSettings },
+  statusMessage: "正在读取图片...",
+  error: "",
+  activeTool: "brush",
+  annotationColor: "#f04438",
+  annotationText: ""
+});
+
+const generationWorkflowFromTask = (task: GenerationTask): GenerationWorkflow => ({
+  id: task.clientWorkflowId || `task:${task.id}`,
+  revision: 0,
+  status: lifecycleStatusFromTask(task.status),
+  stage: generationStageFromTask(task.status),
+  displayName: task.promptSource.sourceFileName || task.promptSource.label || "生图任务",
+  prompt: task.prompt,
+  promptSource: task.promptSource,
+  referenceImages: task.referenceImages,
+  settings: task.settings,
+  taskId: task.id,
+  statusMessage: formatGenerationTaskStatus(task.status),
+  error: task.error || "",
+  readOnly: !task.clientWorkflowId
+});
+
+const imageEditWorkflowFromTask = (task: ImageEditTask): ImageEditWorkflow => ({
+  id: task.clientWorkflowId || `task:${task.id}`,
+  revision: 0,
+  status: lifecycleStatusFromTask(task.status),
+  stage: imageEditStageFromTask(task.status),
+  displayName: task.sourceImage.name || "改图任务",
+  source: task.sourceImage,
+  annotations: [],
+  regenerationContext: task.regenerationContext || null,
+  annotationResolution: task.annotationResolution || null,
+  instruction: task.instruction,
+  settings: task.settings,
+  taskId: task.id,
+  statusMessage: formatGenerationTaskStatus(task.status),
+  error: task.error || "",
+  activeTool: "brush",
+  annotationColor: "#f04438",
+  annotationText: "",
+  readOnly: !task.clientWorkflowId
+});
 
 const clampValue = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max);
 
@@ -791,7 +1084,7 @@ const renderEditedReferenceDataUrl = async (
 };
 
 const composeReferenceImages = async (references: GenerationReferenceImage[]): Promise<string> => {
-  const images = await Promise.all(references.map((reference) => loadImageElement(reference.dataUrl)));
+  const images = await runWithConcurrency(references, 2, (reference) => loadImageElement(reference.dataUrl));
   const columns = Math.ceil(Math.sqrt(images.length));
   const rows = Math.ceil(images.length / columns);
   const cellSize = Math.max(360, Math.floor(2048 / Math.max(columns, rows)));
@@ -888,6 +1181,21 @@ const historyItemToImageState = (item: HistoryItem): ImageState | null => {
     sourceCapture: item.analysis.source_capture
   };
 };
+
+const extractionWorkflowFromHistory = (item: HistoryItem): ExtractionWorkflow => ({
+  ...createExtractionWorkflow(item.fileName || "历史图片"),
+  id: `history:${item.id}`,
+  status: "succeeded",
+  stage: item.fusedPromptResult ? "fused" : "analysis_ready",
+  image: historyItemToImageState(item),
+  analysis: item.analysis,
+  rawText: "",
+  editedTextMarkdown: item.editedTextMarkdown ?? extractedTextFromAnalysis(item.analysis),
+  historyItemId: item.id,
+  statusMessage: item.fusedPromptResult ? "已完成" : "已解析，可融合",
+  fusedPrompt: item.fusedPromptResult?.fused_prompt || "",
+  fusedPromptJson: item.fusedPromptResult?.fused_prompt_json || null
+});
 
 const historyItemToPromptSourceImage = (item: HistoryItem | undefined, currentImage: ImageState | null): {
   dataUrl: string;
@@ -1071,6 +1379,51 @@ const formatStyleTerms = (analysis: StyleAnalysis | null): string => {
   return [summary, terms.length ? terms.join("、") : ""].filter(Boolean).join("\n");
 };
 
+const generationPromptOptionsForExtraction = (
+  workflow: ExtractionWorkflow | null | undefined
+): GenerationPromptOption[] => {
+  if (!workflow?.analysis) return [];
+  const prompts = getPromptBlocks(workflow.analysis);
+  const candidates: GenerationPromptOption[] = [
+    {
+      kind: "text_to_image",
+      label: "完整文生图提示词",
+      value: buildDirectTextToImagePrompt(workflow.analysis, workflow.editedTextMarkdown)
+    },
+    { kind: "universal", label: "通用风格提示词", value: prompts.universal },
+    { kind: "layout", label: "排版布局提示词", value: prompts.layout },
+    { kind: "negative", label: "负面提示词", value: prompts.negative },
+    { kind: "template", label: "封面模板提示词", value: prompts.template },
+    {
+      kind: "information_layout",
+      label: "表格/卡片信息布局提示词",
+      value: prompts.informationLayout
+    },
+    { kind: "style_terms", label: "网页设计风格词", value: formatStyleTerms(workflow.analysis) },
+    { kind: "fused_prompt", label: "最终融合提示词", value: workflow.fusedPrompt },
+    {
+      kind: "fused_copy_ready",
+      label: "融合 JSON 可复制提示词",
+      value: fusedJsonText(workflow.fusedPromptJson)
+    }
+  ];
+  return candidates.filter((option) => option.value.trim());
+};
+
+const preferredGenerationPromptOption = (
+  workflow: ExtractionWorkflow,
+  currentKind?: GenerationPromptSourceKind
+): GenerationPromptOption | undefined => {
+  const options = generationPromptOptionsForExtraction(workflow);
+  const fusedOption = options.find((option) => option.kind === "fused_prompt");
+  if (currentKind === "text_to_image" && fusedOption) return fusedOption;
+  if (currentKind) {
+    const currentOption = options.find((option) => option.kind === currentKind);
+    if (currentOption) return currentOption;
+  }
+  return fusedOption || options.find((option) => option.kind === "text_to_image") || options[0];
+};
+
 export function App(): JSX.Element {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const subjectFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1079,78 +1432,324 @@ export function App(): JSX.Element {
   const configRef = useRef<ModelConfig>(defaultConfig);
   const generationConfigRef = useRef<GenerationConfig>(defaultGenerationConfig);
   const strictGeneralizationRef = useRef(true);
-  const analyzeCanceledRef = useRef(false);
-  const fuseCanceledRef = useRef(false);
-  const imageEditResolutionVersionRef = useRef(0);
+  const extractionWorkflowsRef = useRef<ExtractionWorkflow[]>([]);
+  const generationWorkflowsRef = useRef<GenerationWorkflow[]>([]);
+  const imageEditWorkflowsRef = useRef<ImageEditWorkflow[]>([]);
+  const historyEpochRef = useRef(0);
+  const generationPollSequenceRef = useRef(0);
+  const imageEditPollSequenceRef = useRef(0);
+  const generationTaskEpochRef = useRef(0);
+  const imageEditTaskEpochRef = useRef(0);
+  const deletedGenerationTaskIdsRef = useRef(new Set<string>());
+  const deletedImageEditTaskIdsRef = useRef(new Set<string>());
+  const generationRetrySourceIdsRef = useRef(new Set<string>());
+  const generationHandoffsInFlightRef = useRef(new Set<string>());
+  const generationSourceSyncSequenceRef = useRef(new Map<string, number>());
+  const imageEditHandoffsInFlightRef = useRef(new Set<string>());
+  const generationTasksRef = useRef<GenerationTask[]>([]);
+  const imageEditTasksRef = useRef<ImageEditTask[]>([]);
+  const workflowLineageMarkerRegistryRef = useRef(new Map<string, WorkflowLineageMarker>());
   const [config, setConfig] = useState<ModelConfig>(defaultConfig);
   const [draftConfig, setDraftConfig] = useState<ConfigDraft>(defaultDraftConfig);
   const [generationConfig, setGenerationConfig] = useState<GenerationConfig>(defaultGenerationConfig);
   const [generationDraft, setGenerationDraft] = useState<GenerationConfigDraft>(defaultGenerationDraft);
-  const [generationSettings, setGenerationSettings] =
-    useState<GenerationRequestSettings>(defaultGenerationSettings);
   const [showGenerationConfig, setShowGenerationConfig] = useState(false);
   const [activeView, setActiveView] = useState<"extract" | "generate" | "edit">("extract");
   const [showConfig, setShowConfig] = useState(false);
-  const [image, setImage] = useState<ImageState | null>(null);
-  const [analysis, setAnalysis] = useState<StyleAnalysis | null>(null);
-  const [rawText, setRawText] = useState("");
+  const [extractionWorkflows, setExtractionWorkflowsState] = useState<ExtractionWorkflow[]>([]);
+  const [generationWorkflows, setGenerationWorkflowsState] = useState<GenerationWorkflow[]>([]);
+  const [imageEditWorkflows, setImageEditWorkflowsState] = useState<ImageEditWorkflow[]>([]);
+  const [activeExtractionWorkflowId, setActiveExtractionWorkflowId] = useState("");
+  const [activeGenerationWorkflowId, setActiveGenerationWorkflowId] = useState("");
+  const [activeImageEditWorkflowId, setActiveImageEditWorkflowId] = useState("");
+  const [capacityDialog, setCapacityDialog] = useState<WorkspaceDialogState | null>(null);
+  const [collapseCompletedExtraction, setCollapseCompletedExtraction] = useState(true);
+  const [collapseCompletedGeneration, setCollapseCompletedGeneration] = useState(true);
+  const [collapseCompletedImageEdit, setCollapseCompletedImageEdit] = useState(true);
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [activeHistoryId, setActiveHistoryId] = useState("");
+  const [, setHistoryEpoch] = useState(0);
   const [strictGeneralization, setStrictGeneralization] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [status, setStatus] = useState("");
-  const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
   const [showFuseModal, setShowFuseModal] = useState(false);
-  const [subjectImage, setSubjectImage] = useState<ImageState | null>(null);
   const [isSubjectDragging, setIsSubjectDragging] = useState(false);
-  const [isFusing, setIsFusing] = useState(false);
-  const [fusedPrompt, setFusedPrompt] = useState("");
-  const [fusedPromptJson, setFusedPromptJson] = useState<FusedPromptJson | null>(null);
-  const [fuseError, setFuseError] = useState("");
   const [fuseCopied, setFuseCopied] = useState("");
-  const [fuseControls, setFuseControls] = useState<FusePromptControls>(defaultFuseControls);
-  const [selectedFuseMode, setSelectedFuseMode] = useState<FusePromptMode | null>(null);
-  const [productInfoText, setProductInfoText] = useState("");
-  const [editedTextMarkdown, setEditedTextMarkdown] = useState("");
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null);
   const [imagePreviewZoom, setImagePreviewZoom] = useState<ImagePreviewZoomState>(defaultImagePreviewZoom);
   const [comparePreview, setComparePreview] = useState<ComparePreviewState | null>(null);
-  const [generationPrompt, setGenerationPrompt] = useState("");
-  const [generationPromptSource, setGenerationPromptSource] = useState<GenerationPromptSource | null>(null);
-  const [generationReferenceImages, setGenerationReferenceImages] = useState<GenerationReferenceImage[]>([]);
   const [editingGenerationReferenceId, setEditingGenerationReferenceId] = useState("");
   const [generationTasks, setGenerationTasks] = useState<GenerationTask[]>([]);
   const [selectedGenerationTaskId, setSelectedGenerationTaskId] = useState("");
   const [restoreOnGenerationTaskClick, setRestoreOnGenerationTaskClick] = useState(false);
   const [collapsedGenerationTaskIds, setCollapsedGenerationTaskIds] = useState<string[]>([]);
-  const [isGeneratingImage, setIsGeneratingImage] = useState(false);
-  const [generationError, setGenerationError] = useState("");
   const [generationCopied, setGenerationCopied] = useState("");
-  const [imageEditSource, setImageEditSource] = useState<ImageEditSourceImage | null>(null);
-  const [imageEditAnnotations, setImageEditAnnotations] = useState<ImageEditAnnotation[]>([]);
-  const [imageEditRegenerationContext, setImageEditRegenerationContext] =
-    useState<ImageEditRegenerationContext | null>(null);
-  const [imageEditAnnotationResolution, setImageEditAnnotationResolution] =
-    useState<ImageEditAnnotationResolution | null>(null);
-  const [isResolvingImageEditAnnotations, setIsResolvingImageEditAnnotations] = useState(false);
-  const [imageEditInstruction, setImageEditInstruction] = useState("");
-  const [imageEditSettings, setImageEditSettings] = useState<ImageEditRequestSettings>(defaultImageEditSettings);
   const [imageEditTasks, setImageEditTasks] = useState<ImageEditTask[]>([]);
   const [selectedImageEditTaskId, setSelectedImageEditTaskId] = useState("");
   const [collapsedImageEditTaskIds, setCollapsedImageEditTaskIds] = useState<string[]>([]);
   const [isImageEditDragging, setIsImageEditDragging] = useState(false);
-  const [isCreatingImageEdit, setIsCreatingImageEdit] = useState(false);
-  const [imageEditError, setImageEditError] = useState("");
+  const [dismissedGenerationHandoffKeys, setDismissedGenerationHandoffKeys] = useState<Set<string>>(() =>
+    loadDismissedHandoffKeys("generation")
+  );
+  const [dismissedImageEditHandoffKeys, setDismissedImageEditHandoffKeys] = useState<Set<string>>(() =>
+    loadDismissedHandoffKeys("image_edit")
+  );
+
+  const dismissHandoffs = useCallback((workspace: HandoffDismissalWorkspace, keys: Iterable<string>) => {
+    const additions = Array.from(keys).filter(Boolean);
+    if (!additions.length) return;
+    const update = (current: Set<string>): Set<string> => {
+      const next = new Set(current);
+      additions.forEach((key) => next.add(key));
+      saveDismissedHandoffKeys(workspace, next);
+      return next;
+    };
+    if (workspace === "generation") {
+      setDismissedGenerationHandoffKeys(update);
+    } else {
+      setDismissedImageEditHandoffKeys(update);
+    }
+  }, []);
+
+  const resetDismissedHandoffs = useCallback(() => {
+    setDismissedGenerationHandoffKeys(new Set());
+    setDismissedImageEditHandoffKeys(new Set());
+    try {
+      window.localStorage.removeItem(handoffDismissalStorageKeys.generation);
+      window.localStorage.removeItem(handoffDismissalStorageKeys.image_edit);
+    } catch {
+      // The main-process data wipe remains authoritative if renderer storage is unavailable.
+    }
+  }, []);
+
+  const commitExtractionWorkflows = useCallback((updater: (current: ExtractionWorkflow[]) => ExtractionWorkflow[]) => {
+    const next = updater(extractionWorkflowsRef.current);
+    extractionWorkflowsRef.current = next;
+    setExtractionWorkflowsState(next);
+  }, []);
+
+  const commitGenerationWorkflows = useCallback((updater: (current: GenerationWorkflow[]) => GenerationWorkflow[]) => {
+    const next = updater(generationWorkflowsRef.current);
+    generationWorkflowsRef.current = next;
+    setGenerationWorkflowsState(next);
+  }, []);
+
+  const commitImageEditWorkflows = useCallback((updater: (current: ImageEditWorkflow[]) => ImageEditWorkflow[]) => {
+    const next = updater(imageEditWorkflowsRef.current);
+    imageEditWorkflowsRef.current = next;
+    setImageEditWorkflowsState(next);
+  }, []);
+
+  const showWorkspaceLimit = useCallback(
+    (workspace: WorkspaceKind, occupied: number, rejectedCount = 1, acceptedCount = 0, failures?: string[]) => {
+      setCapacityDialog({ workspace, occupied, rejectedCount, acceptedCount, failures });
+    },
+    []
+  );
+
+  const reserveGenerationWorkflow = useCallback(
+    (workflow: GenerationWorkflow): GenerationWorkflow | null => {
+      const admission = admitBatchInputs([workflow], generationWorkflowsRef.current);
+      if (!admission.accepted.length) {
+        showWorkspaceLimit("generation", admission.occupied);
+        return null;
+      }
+      const next = [workflow, ...generationWorkflowsRef.current];
+      generationWorkflowsRef.current = next;
+      setGenerationWorkflowsState(next);
+      setActiveGenerationWorkflowId(workflow.id);
+      return workflow;
+    },
+    [showWorkspaceLimit]
+  );
+
+  const activeExtractionWorkflow =
+    extractionWorkflows.find((workflow) => workflow.id === activeExtractionWorkflowId) || null;
+  const activeGenerationWorkflow =
+    generationWorkflows.find((workflow) => workflow.id === activeGenerationWorkflowId) || null;
+  const activeImageEditWorkflow =
+    imageEditWorkflows.find((workflow) => workflow.id === activeImageEditWorkflowId) || null;
+
+  const image = activeExtractionWorkflow?.image || null;
+  const analysis = activeExtractionWorkflow?.analysis || null;
+  const rawText = activeExtractionWorkflow?.rawText || "";
+  const activeHistoryId = activeExtractionWorkflow?.historyItemId || "";
+  const error = activeExtractionWorkflow?.error || "";
+  const editedTextMarkdown = activeExtractionWorkflow?.editedTextMarkdown || "";
+  const subjectImage = activeExtractionWorkflow?.subjectImage || null;
+  const fusedPrompt = activeExtractionWorkflow?.fusedPrompt || "";
+  const fusedPromptJson = activeExtractionWorkflow?.fusedPromptJson || null;
+  const fuseError = activeExtractionWorkflow?.fuseError || "";
+  const fuseControls = activeExtractionWorkflow?.fuseControls || defaultFuseControls;
+  const selectedFuseMode = activeExtractionWorkflow?.selectedFuseMode || null;
+  const productInfoText = activeExtractionWorkflow?.productInfoText || "";
+  const isAnalyzing = activeExtractionWorkflow?.stage === "analyzing" && activeExtractionWorkflow.status === "running";
+  const isFusing = activeExtractionWorkflow?.stage === "fusing" && activeExtractionWorkflow.status === "running";
+
+  const generationPrompt = activeGenerationWorkflow?.prompt || "";
+  const generationPromptSource = activeGenerationWorkflow?.promptSource || null;
+  const generationReferenceImages = activeGenerationWorkflow?.referenceImages || [];
+  const generationSettings = activeGenerationWorkflow?.settings || defaultGenerationSettings;
+  const generationError = activeGenerationWorkflow?.error || "";
+  const isGeneratingImage = activeGenerationWorkflow?.stage === "submitting";
+
+  const imageEditSource = activeImageEditWorkflow?.source || null;
+  const imageEditAnnotations = activeImageEditWorkflow?.annotations || [];
+  const imageEditRegenerationContext = activeImageEditWorkflow?.regenerationContext || null;
+  const imageEditAnnotationResolution = activeImageEditWorkflow?.annotationResolution || null;
+  const imageEditInstruction = activeImageEditWorkflow?.instruction || "";
+  const imageEditSettings = activeImageEditWorkflow?.settings || defaultImageEditSettings;
+  const imageEditError = activeImageEditWorkflow?.error || "";
+  const isResolvingImageEditAnnotations = activeImageEditWorkflow?.stage === "resolving";
+  const isCreatingImageEdit = activeImageEditWorkflow?.stage === "queued";
+
+  const updateActiveExtraction = useCallback(
+    (updater: (workflow: ExtractionWorkflow) => ExtractionWorkflow) => {
+      if (!activeExtractionWorkflowId) return;
+      commitExtractionWorkflows((current) => updateWorkflowById(current, activeExtractionWorkflowId, updater));
+    },
+    [activeExtractionWorkflowId, commitExtractionWorkflows]
+  );
+
+  const updateActiveGeneration = useCallback(
+    (updater: (workflow: GenerationWorkflow) => GenerationWorkflow) => {
+      if (!activeGenerationWorkflowId) return;
+      commitGenerationWorkflows((current) => updateWorkflowById(current, activeGenerationWorkflowId, updater));
+    },
+    [activeGenerationWorkflowId, commitGenerationWorkflows]
+  );
+
+  const updateActiveImageEdit = useCallback(
+    (updater: (workflow: ImageEditWorkflow) => ImageEditWorkflow) => {
+      if (!activeImageEditWorkflowId) return;
+      commitImageEditWorkflows((current) => updateWorkflowById(current, activeImageEditWorkflowId, updater));
+    },
+    [activeImageEditWorkflowId, commitImageEditWorkflows]
+  );
+
+  const setError = useCallback((value: string) => updateActiveExtraction((workflow) => ({ ...workflow, error: value })), [updateActiveExtraction]);
+  const setEditedTextMarkdown = useCallback(
+    (value: string) => updateActiveExtraction((workflow) => ({ ...workflow, editedTextMarkdown: value, revision: workflow.revision + 1 })),
+    [updateActiveExtraction]
+  );
+  const setFusedPrompt = useCallback((value: string) => updateActiveExtraction((workflow) => ({ ...workflow, fusedPrompt: value })), [updateActiveExtraction]);
+  const setFusedPromptJson = useCallback(
+    (value: FusedPromptJson | null) => updateActiveExtraction((workflow) => ({ ...workflow, fusedPromptJson: value })),
+    [updateActiveExtraction]
+  );
+  const setFuseError = useCallback((value: string) => updateActiveExtraction((workflow) => ({ ...workflow, fuseError: value })), [updateActiveExtraction]);
+  const setFuseControls: Dispatch<SetStateAction<FusePromptControls>> = useCallback(
+    (action) => updateActiveExtraction((workflow) => ({
+      ...workflow,
+      fuseControls: applyStateAction(workflow.fuseControls, action),
+      revision: workflow.revision + 1
+    })),
+    [updateActiveExtraction]
+  );
+  const setSelectedFuseMode = useCallback(
+    (value: FusePromptMode | null) => updateActiveExtraction((workflow) => ({ ...workflow, selectedFuseMode: value, revision: workflow.revision + 1 })),
+    [updateActiveExtraction]
+  );
+  const setProductInfoText = useCallback(
+    (value: string) => updateActiveExtraction((workflow) => ({ ...workflow, productInfoText: value, revision: workflow.revision + 1 })),
+    [updateActiveExtraction]
+  );
+
+  const setGenerationPrompt = useCallback(
+    (value: string) => {
+      if (!activeGenerationWorkflowId) {
+        if (!value) return;
+        reserveGenerationWorkflow(createGenerationWorkflow({ prompt: value, displayName: "手动生图" }));
+        return;
+      }
+      updateActiveGeneration((workflow) => ({
+        ...workflow,
+        prompt: value,
+        promptEditedByUser: true,
+        revision: workflow.revision + 1,
+        error: ""
+      }));
+    },
+    [activeGenerationWorkflowId, reserveGenerationWorkflow, updateActiveGeneration]
+  );
+  const setGenerationPromptSource = useCallback(
+    (value: GenerationPromptSource | null) => updateActiveGeneration((workflow) => ({ ...workflow, promptSource: value })),
+    [updateActiveGeneration]
+  );
+  const setGenerationReferenceImages: Dispatch<SetStateAction<GenerationReferenceImage[]>> = useCallback(
+    (action) => updateActiveGeneration((workflow) => ({
+      ...workflow,
+      referenceImages: applyStateAction(workflow.referenceImages, action),
+      referencesEditedByUser: true,
+      revision: workflow.revision + 1,
+      error: ""
+    })),
+    [updateActiveGeneration]
+  );
+  const setGenerationSettings: Dispatch<SetStateAction<GenerationRequestSettings>> = useCallback(
+    (action) => {
+      if (!activeGenerationWorkflowId) {
+        const settings = applyStateAction({ ...defaultGenerationSettings }, action);
+        reserveGenerationWorkflow(createGenerationWorkflow({ settings, displayName: "手动生图" }));
+        return;
+      }
+      updateActiveGeneration((workflow) => ({
+        ...workflow,
+        settings: applyStateAction(workflow.settings, action),
+        revision: workflow.revision + 1
+      }));
+    },
+    [activeGenerationWorkflowId, reserveGenerationWorkflow, updateActiveGeneration]
+  );
+  const setGenerationError = useCallback((value: string) => updateActiveGeneration((workflow) => ({ ...workflow, error: value })), [updateActiveGeneration]);
+
+  const invalidateActiveImageEdit = useCallback(
+    (updater: (workflow: ImageEditWorkflow) => ImageEditWorkflow) =>
+      updateActiveImageEdit((workflow) => ({
+        ...updater(workflow),
+        revision: workflow.revision + 1,
+        annotationResolution: null,
+        error: ""
+      })),
+    [updateActiveImageEdit]
+  );
+  const setImageEditAnnotations: Dispatch<SetStateAction<ImageEditAnnotation[]>> = useCallback(
+    (action) => invalidateActiveImageEdit((workflow) => ({ ...workflow, annotations: applyStateAction(workflow.annotations, action) })),
+    [invalidateActiveImageEdit]
+  );
+  const setImageEditRegenerationContext: Dispatch<SetStateAction<ImageEditRegenerationContext | null>> = useCallback(
+    (action) => invalidateActiveImageEdit((workflow) => ({
+      ...workflow,
+      regenerationContext: applyStateAction(workflow.regenerationContext, action)
+    })),
+    [invalidateActiveImageEdit]
+  );
+  const setImageEditAnnotationResolution: Dispatch<SetStateAction<ImageEditAnnotationResolution | null>> = useCallback(
+    (action) => updateActiveImageEdit((workflow) => ({
+      ...workflow,
+      annotationResolution: applyStateAction(workflow.annotationResolution, action),
+      stage: "confirming",
+      revision: workflow.revision + 1
+    })),
+    [updateActiveImageEdit]
+  );
+  const setImageEditInstruction = useCallback(
+    (value: string) => invalidateActiveImageEdit((workflow) => ({ ...workflow, instruction: value })),
+    [invalidateActiveImageEdit]
+  );
+  const setImageEditSettings: Dispatch<SetStateAction<ImageEditRequestSettings>> = useCallback(
+    (action) => updateActiveImageEdit((workflow) => ({
+      ...workflow,
+      settings: applyStateAction(workflow.settings, action),
+      revision: workflow.revision + 1
+    })),
+    [updateActiveImageEdit]
+  );
+  const setImageEditError = useCallback((value: string) => updateActiveImageEdit((workflow) => ({ ...workflow, error: value })), [updateActiveImageEdit]);
 
   const supportsInformationLayoutMode = useMemo(() => hasInformationLayoutMode(analysis), [analysis]);
   const fuseMode = resolveFuseMode(analysis, selectedFuseMode);
   const prompts = useMemo(() => getPromptBlocks(analysis), [analysis]);
-  const directTextToImagePrompt = useMemo(
-    () => (analysis ? buildDirectTextToImagePrompt(analysis, editedTextMarkdown) : ""),
-    [analysis, editedTextMarkdown]
-  );
   const styleTermsText = useMemo(() => formatStyleTerms(analysis), [analysis]);
   const usesInsecureBaseUrl = draftConfig.apiBaseUrl.trim().toLowerCase().startsWith("http://");
   const usesInsecureGenerationBaseUrl =
@@ -1166,49 +1765,25 @@ export function App(): JSX.Element {
     [imageEditTasks]
   );
   const generationPromptOptions = useMemo<GenerationPromptOption[]>(
-    () => {
-      const candidates: GenerationPromptOption[] = [
-        { kind: "text_to_image", label: "完整文生图提示词", value: directTextToImagePrompt },
-        { kind: "universal", label: "通用风格提示词", value: prompts.universal },
-        { kind: "layout", label: "排版布局提示词", value: prompts.layout },
-        { kind: "negative", label: "负面提示词", value: prompts.negative },
-        { kind: "template", label: "封面模板提示词", value: prompts.template },
-        { kind: "information_layout", label: "表格/卡片信息布局提示词", value: prompts.informationLayout },
-        { kind: "style_terms", label: "网页设计风格词", value: styleTermsText },
-        { kind: "fused_prompt", label: "最终融合提示词", value: fusedPrompt },
-        {
-          kind: "fused_copy_ready",
-          label: "融合 JSON 可复制提示词",
-          value: fusedJsonText(fusedPromptJson)
-        }
-      ];
-      return candidates.filter((option) => option.value.trim());
-    },
-    [directTextToImagePrompt, fusedPrompt, fusedPromptJson, prompts, styleTermsText]
+    () => generationPromptOptionsForExtraction(activeExtractionWorkflow),
+    [activeExtractionWorkflow]
   );
 
-  useEffect(() => {
-    imageEditResolutionVersionRef.current += 1;
-    setImageEditAnnotationResolution(null);
-  }, [
-    imageEditSource?.id,
-    imageEditAnnotations,
-    imageEditInstruction,
-    imageEditRegenerationContext?.basePrompt
-  ]);
-
   const resetFusionState = useCallback((closeModal = false) => {
-    setSubjectImage(null);
+    updateActiveExtraction((workflow) => ({
+      ...workflow,
+      subjectImage: null,
+      fusedPrompt: "",
+      fusedPromptJson: null,
+      fuseError: "",
+      fuseControls: defaultFuseControls,
+      selectedFuseMode: null,
+      productInfoText: ""
+    }));
     setIsSubjectDragging(false);
-    setFusedPrompt("");
-    setFusedPromptJson(null);
-    setFuseError("");
     setFuseCopied("");
-    setFuseControls(defaultFuseControls);
-    setSelectedFuseMode(null);
-    setProductInfoText("");
     if (closeModal) setShowFuseModal(false);
-  }, []);
+  }, [updateActiveExtraction]);
 
   const openImagePreview = (preview: ImagePreviewState) => {
     setImagePreview(preview);
@@ -1248,6 +1823,14 @@ export function App(): JSX.Element {
     strictGeneralizationRef.current = strictGeneralization;
   }, [strictGeneralization]);
 
+  useEffect(() => {
+    generationTasksRef.current = generationTasks;
+  }, [generationTasks]);
+
+  useEffect(() => {
+    imageEditTasksRef.current = imageEditTasks;
+  }, [imageEditTasks]);
+
   const applyGenerationConfig = useCallback((nextConfig: GenerationConfig) => {
     const activeProvider =
       nextConfig.providers.find((provider) => provider.id === nextConfig.activeProviderId) || nextConfig.providers[0];
@@ -1259,13 +1842,22 @@ export function App(): JSX.Element {
       apiMode: activeProvider?.apiMode || nextConfig.apiMode,
       apiKey: ""
     });
-    setGenerationSettings((current) => ({
-      ...current,
-      apiMode: nextConfig.apiMode,
-      imageModel: nextConfig.imageModel,
-      mainModel: nextConfig.mainModel
-    }));
-  }, []);
+    commitGenerationWorkflows((current) =>
+      current.map((workflow) =>
+        workflow.taskId
+          ? workflow
+          : {
+              ...workflow,
+              settings: {
+                ...workflow.settings,
+                apiMode: nextConfig.apiMode,
+                imageModel: nextConfig.imageModel,
+                mainModel: nextConfig.mainModel
+              }
+            }
+      )
+    );
+  }, [commitGenerationWorkflows]);
 
   useEffect(() => {
     if (!imagePreview && !comparePreview) return;
@@ -1279,9 +1871,10 @@ export function App(): JSX.Element {
   }, [comparePreview, imagePreview]);
 
   useEffect(() => {
-    if (!showConfig && !showFuseModal && !showGenerationConfig) return;
+    if (!capacityDialog && !showConfig && !showFuseModal && !showGenerationConfig) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      if (capacityDialog) setCapacityDialog(null);
       if (showConfig) setShowConfig(false);
       if (showGenerationConfig) setShowGenerationConfig(false);
       if (showFuseModal && !isFusing) setShowFuseModal(false);
@@ -1289,44 +1882,256 @@ export function App(): JSX.Element {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isFusing, showConfig, showFuseModal, showGenerationConfig]);
+  }, [capacityDialog, isFusing, showConfig, showFuseModal, showGenerationConfig]);
 
   useEffect(() => {
-    window.styleExtractor.getConfig().then((nextConfig) => {
+    let disposed = false;
+    void (async () => {
+      const [nextConfig, nextGenerationConfig, historySnapshot, nextGenerationTasks, nextImageEditTasks] =
+        await Promise.all([
+          window.styleExtractor.getConfig(),
+          window.styleExtractor.getGenerationConfig(),
+          window.styleExtractor.getHistorySnapshot(),
+          window.styleExtractor.getGenerationTasks(),
+          window.styleExtractor.getImageEditTasks()
+        ]);
+      if (disposed) return;
       setConfig(nextConfig);
       setDraftConfig({ ...nextConfig, apiKey: "" });
+      applyGenerationConfig(nextGenerationConfig);
+      setHistory(historySnapshot.items);
+      historyEpochRef.current = historySnapshot.epoch;
+      setHistoryEpoch(historySnapshot.epoch);
+      generationTasksRef.current = nextGenerationTasks;
+      imageEditTasksRef.current = nextImageEditTasks;
+      setGenerationTasks(nextGenerationTasks);
+      setImageEditTasks(nextImageEditTasks);
+
+      const extractionViews = historySnapshot.items.map(extractionWorkflowFromHistory);
+      commitExtractionWorkflows((current) => {
+        const existingIds = new Set(current.map((workflow) => workflow.id));
+        return [...current, ...extractionViews.filter((workflow) => !existingIds.has(workflow.id))];
+      });
+      const seenGenerationWorkflowIds = new Set<string>();
+      const generationViews = nextGenerationTasks
+        .map(generationWorkflowFromTask)
+        .filter((workflow) => {
+          if (seenGenerationWorkflowIds.has(workflow.id)) return false;
+          seenGenerationWorkflowIds.add(workflow.id);
+          return true;
+        });
+      commitGenerationWorkflows((current) => {
+        const existingIds = new Set(current.map((workflow) => workflow.id));
+        return [...current, ...generationViews.filter((workflow) => !existingIds.has(workflow.id))];
+      });
+      const seenImageEditWorkflowIds = new Set<string>();
+      const imageEditViews = nextImageEditTasks
+        .map(imageEditWorkflowFromTask)
+        .filter((workflow) => {
+          if (seenImageEditWorkflowIds.has(workflow.id)) return false;
+          seenImageEditWorkflowIds.add(workflow.id);
+          return true;
+        });
+      commitImageEditWorkflows((current) => {
+        const existingIds = new Set(current.map((workflow) => workflow.id));
+        return [...current, ...imageEditViews.filter((workflow) => !existingIds.has(workflow.id))];
+      });
+      setActiveExtractionWorkflowId((current) => current || extractionViews[0]?.id || "");
+      setActiveGenerationWorkflowId((current) => current || generationViews[0]?.id || "");
+      setActiveImageEditWorkflowId((current) => current || imageEditViews[0]?.id || "");
+    })().catch((loadError) => {
+      if (!disposed) setStatus(loadError instanceof Error ? loadError.message : String(loadError));
     });
-    window.styleExtractor.getGenerationConfig().then(applyGenerationConfig);
-    window.styleExtractor.getHistory().then(setHistory);
-    window.styleExtractor.getGenerationTasks().then(setGenerationTasks);
-    window.styleExtractor.getImageEditTasks().then(setImageEditTasks);
-  }, [applyGenerationConfig]);
+    return () => {
+      disposed = true;
+    };
+  }, [applyGenerationConfig, commitExtractionWorkflows, commitGenerationWorkflows, commitImageEditWorkflows]);
 
   useEffect(() => {
     if (!hasActiveGenerationTasks) return;
-    const refreshGenerationTasks = async () => {
-      const nextTasks = await window.styleExtractor.getGenerationTasks();
-      setGenerationTasks(nextTasks);
+    let disposed = false;
+    let timer = 0;
+    const poll = async () => {
+      const sequence = ++generationPollSequenceRef.current;
+      try {
+        const summaries = await window.styleExtractor.getGenerationTaskSummaries();
+        if (disposed || sequence !== generationPollSequenceRef.current) return;
+        const currentById = new Map(generationTasksRef.current.map((task) => [task.id, task]));
+        const changedIds = summaries
+          .filter((summary) => {
+            const current = currentById.get(summary.id);
+            return !current || current.updatedAt !== summary.updatedAt || current.status !== summary.status || current.outputs.length !== summary.outputCount;
+          })
+          .map((summary) => summary.id);
+        const changedTasks = await runWithConcurrency(changedIds, 3, (id) => window.styleExtractor.getGenerationTask(id));
+        if (disposed || sequence !== generationPollSequenceRef.current) return;
+        const changedById = new Map(changedTasks.filter((task): task is GenerationTask => Boolean(task)).map((task) => [task.id, task]));
+        const nextTasks = summaries
+          .map((summary) => changedById.get(summary.id) || currentById.get(summary.id))
+          .filter((task): task is GenerationTask => Boolean(task));
+        generationTasksRef.current = nextTasks;
+        setGenerationTasks(nextTasks);
+        const summariesById = new Map(summaries.map((summary) => [summary.id, summary]));
+        commitGenerationWorkflows((current) =>
+          current.map((workflow) => {
+            if (!workflow.taskId) return workflow;
+            const summary = summariesById.get(workflow.taskId);
+            if (!summary) return workflow;
+            return {
+              ...workflow,
+              status: lifecycleStatusFromTask(summary.status),
+              stage: generationStageFromTask(summary.status),
+              statusMessage: formatGenerationTaskStatus(summary.status),
+              error: summary.error || ""
+            };
+          })
+        );
+      } catch {
+        // A transient summary failure is retried without replacing the last good task snapshot.
+      } finally {
+        if (!disposed) timer = window.setTimeout(() => void poll(), 1500);
+      }
     };
-    const timer = window.setInterval(() => {
-      void refreshGenerationTasks();
-    }, 1500);
-    void refreshGenerationTasks();
-    return () => window.clearInterval(timer);
-  }, [hasActiveGenerationTasks]);
+    void poll();
+    return () => {
+      disposed = true;
+      generationPollSequenceRef.current += 1;
+      window.clearTimeout(timer);
+    };
+  }, [commitGenerationWorkflows, hasActiveGenerationTasks]);
 
   useEffect(() => {
     if (!hasActiveImageEditTasks) return;
-    const refreshImageEditTasks = async () => {
-      const nextTasks = await window.styleExtractor.getImageEditTasks();
-      setImageEditTasks(nextTasks);
+    let disposed = false;
+    let timer = 0;
+    const poll = async () => {
+      const sequence = ++imageEditPollSequenceRef.current;
+      try {
+        const summaries = await window.styleExtractor.getImageEditTaskSummaries();
+        if (disposed || sequence !== imageEditPollSequenceRef.current) return;
+        const currentById = new Map(imageEditTasksRef.current.map((task) => [task.id, task]));
+        const changedIds = summaries
+          .filter((summary) => {
+            const current = currentById.get(summary.id);
+            return !current || current.updatedAt !== summary.updatedAt || current.status !== summary.status || current.outputs.length !== summary.outputCount;
+          })
+          .map((summary) => summary.id);
+        const changedTasks = await runWithConcurrency(changedIds, 3, (id) => window.styleExtractor.getImageEditTask(id));
+        if (disposed || sequence !== imageEditPollSequenceRef.current) return;
+        const changedById = new Map(changedTasks.filter((task): task is ImageEditTask => Boolean(task)).map((task) => [task.id, task]));
+        const nextTasks = summaries
+          .map((summary) => changedById.get(summary.id) || currentById.get(summary.id))
+          .filter((task): task is ImageEditTask => Boolean(task));
+        imageEditTasksRef.current = nextTasks;
+        setImageEditTasks(nextTasks);
+        const summariesById = new Map(summaries.map((summary) => [summary.id, summary]));
+        commitImageEditWorkflows((current) =>
+          current.map((workflow) => {
+            if (!workflow.taskId) return workflow;
+            const summary = summariesById.get(workflow.taskId);
+            if (!summary) return workflow;
+            return {
+              ...workflow,
+              status: lifecycleStatusFromTask(summary.status),
+              stage: imageEditStageFromTask(summary.status),
+              statusMessage: formatGenerationTaskStatus(summary.status),
+              error: summary.error || ""
+            };
+          })
+        );
+      } catch {
+        // Keep the previous complete task snapshots and retry after the normal delay.
+      } finally {
+        if (!disposed) timer = window.setTimeout(() => void poll(), 1500);
+      }
     };
-    const timer = window.setInterval(() => {
-      void refreshImageEditTasks();
-    }, 1500);
-    void refreshImageEditTasks();
-    return () => window.clearInterval(timer);
-  }, [hasActiveImageEditTasks]);
+    void poll();
+    return () => {
+      disposed = true;
+      imageEditPollSequenceRef.current += 1;
+      window.clearTimeout(timer);
+    };
+  }, [commitImageEditWorkflows, hasActiveImageEditTasks]);
+
+  const reserveImageEditPlaceholders = useCallback(
+    (displayNames: string[]): { accepted: ImageEditWorkflow[]; rejectedCount: number; occupied: number } => {
+      const candidates = displayNames.map(createImageEditWorkflow);
+      const admission = admitBatchInputs(candidates, imageEditWorkflowsRef.current);
+      if (admission.accepted.length) {
+        const next = [...admission.accepted, ...imageEditWorkflowsRef.current];
+        imageEditWorkflowsRef.current = next;
+        setImageEditWorkflowsState(next);
+        setActiveImageEditWorkflowId(admission.accepted[0].id);
+      }
+      return { accepted: admission.accepted, rejectedCount: admission.rejected.length, occupied: admission.occupied };
+    },
+    []
+  );
+
+  const populateImageEditWorkflow = useCallback(
+    async (
+      workflowId: string,
+      imageState: ImageState,
+      sourceKind: ImageEditSourceKind,
+      pointer?: Partial<ImageEditSourceImage["sourcePointer"]>,
+      regenerationContext?: ImageEditRegenerationContext
+    ) => {
+      try {
+        assertImageEditSourceLimits(imageState.dataUrl);
+        const dimensions = await imageDimensionsFromDataUrl(imageState.dataUrl);
+        assertImageEditSourceLimits(imageState.dataUrl, dimensions.width, dimensions.height);
+        const sourceImage: ImageEditSourceImage = {
+          id: crypto.randomUUID(),
+          name: imageState.fileName,
+          mimeType: getMimeTypeFromDataUrl(imageState.dataUrl, imageState.mimeType),
+          dataUrl: imageState.dataUrl,
+          thumbnailDataUrl: imageState.thumbnailDataUrl || (await createThumbnail(imageState.dataUrl)),
+          width: dimensions.width,
+          height: dimensions.height,
+          createdAt: new Date().toISOString(),
+          sourcePointer: {
+            kind: sourceKind,
+            importedAt: new Date().toISOString(),
+            ...pointer
+          }
+        };
+        commitImageEditWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (workflow) => ({
+            ...workflow,
+            displayName: sourceImage.name,
+            source: sourceImage,
+            regenerationContext:
+              regenerationContext || {
+                basePrompt: "",
+                sourceLabel: "手动导入源图",
+                importedAt: new Date().toISOString(),
+                inputStrategy: "text_only",
+                originalReferences: []
+              },
+            settings: imageEditSettingsForDimensions(dimensions.width, dimensions.height, generationConfigRef.current),
+            status: "setup",
+            stage: "annotating",
+            statusMessage: "待标注",
+            error: ""
+          }))
+        );
+        return "";
+      } catch (sourceError) {
+        const message = sourceError instanceof Error ? sourceError.message : String(sourceError);
+        commitImageEditWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (workflow) => ({
+            ...workflow,
+            status: "failed",
+            stage: "preparing",
+            statusMessage: "读取失败",
+            error: message
+          }))
+        );
+        return `${imageState.fileName}：${message}`;
+      }
+    },
+    [commitImageEditWorkflows]
+  );
 
   const loadImageEditSource = useCallback(
     async (
@@ -1334,125 +2139,263 @@ export function App(): JSX.Element {
       sourceKind: ImageEditSourceKind,
       pointer?: Partial<ImageEditSourceImage["sourcePointer"]>,
       regenerationContext?: ImageEditRegenerationContext
-    ) => {
-      assertImageEditSourceLimits(imageState.dataUrl);
-      const dimensions = await imageDimensionsFromDataUrl(imageState.dataUrl);
-      assertImageEditSourceLimits(imageState.dataUrl, dimensions.width, dimensions.height);
-      const sourceImage: ImageEditSourceImage = {
-        id: crypto.randomUUID(),
-        name: imageState.fileName,
-        mimeType: getMimeTypeFromDataUrl(imageState.dataUrl, imageState.mimeType),
-        dataUrl: imageState.dataUrl,
-        thumbnailDataUrl: imageState.thumbnailDataUrl || (await createThumbnail(imageState.dataUrl)),
-        width: dimensions.width,
-        height: dimensions.height,
-        createdAt: new Date().toISOString(),
-        sourcePointer: {
-          kind: sourceKind,
-          importedAt: new Date().toISOString(),
-          ...pointer
-        }
-      };
-      setImageEditSource(sourceImage);
-      setImageEditAnnotations([]);
-      setImageEditRegenerationContext(
-        regenerationContext || {
-          basePrompt: "",
-          sourceLabel: "手动导入源图",
-          importedAt: new Date().toISOString(),
-          inputStrategy: "text_only",
-          originalReferences: []
-        }
-      );
-      setImageEditAnnotationResolution(null);
-      setImageEditSettings(imageEditSettingsForDimensions(dimensions.width, dimensions.height, generationConfigRef.current));
-      setImageEditError("");
+    ): Promise<ImageEditWorkflow | null> => {
+      const reservation = reserveImageEditPlaceholders([imageState.fileName]);
+      const workflow = reservation.accepted[0];
+      if (!workflow) {
+        showWorkspaceLimit("image_edit", reservation.occupied);
+        return null;
+      }
+      await populateImageEditWorkflow(workflow.id, imageState, sourceKind, pointer, regenerationContext);
+      return imageEditWorkflowsRef.current.find((item) => item.id === workflow.id) || null;
     },
-    []
+    [populateImageEditWorkflow, reserveImageEditPlaceholders, showWorkspaceLimit]
+  );
+
+  const handleFiles = useCallback(
+    async (files: FileList | File[], sourceType: "uploaded_image" | "clipboard_image" = "uploaded_image") => {
+      const allFiles = Array.from(files);
+      if (!allFiles.length) return;
+      const inputFiles = allFiles.filter((file) => file.type.startsWith("image/"));
+      const invalidFileMessages = allFiles
+        .filter((file) => !file.type.startsWith("image/"))
+        .map((file) => `${file.name || "未命名文件"}：不是受支持的图片文件。`);
+      const candidates = inputFiles.map((file) => createExtractionWorkflow(file.name || "剪贴板图片"));
+      const admission = admitBatchInputs(candidates, extractionWorkflowsRef.current);
+      if (admission.accepted.length) {
+        const next = [...admission.accepted, ...extractionWorkflowsRef.current];
+        extractionWorkflowsRef.current = next;
+        setExtractionWorkflowsState(next);
+        setActiveExtractionWorkflowId(admission.accepted[0].id);
+      }
+      const acceptedFiles = inputFiles.slice(0, admission.accepted.length);
+      const failures = await runWithConcurrency(acceptedFiles, 2, async (file, index) => {
+        const workflow = admission.accepted[index];
+        try {
+          const nextImage = await fileToImageState(file, sourceType);
+          commitExtractionWorkflows((current) =>
+            updateWorkflowById(current, workflow.id, (item) => ({
+              ...item,
+              image: nextImage,
+              displayName: nextImage.fileName,
+              status: "setup",
+              stage: "preparing",
+              statusMessage: "已载入，待分析",
+              error: ""
+            }))
+          );
+          return "";
+        } catch (uploadError) {
+          const message = uploadError instanceof Error ? uploadError.message : String(uploadError);
+          commitExtractionWorkflows((current) =>
+            updateWorkflowById(current, workflow.id, (item) => ({
+              ...item,
+              status: "failed",
+              stage: "preparing",
+              statusMessage: "读取失败",
+              error: message
+            }))
+          );
+          return `${file.name}：${message}`;
+        }
+      });
+      const failureMessages = [...invalidFileMessages, ...failures.filter(Boolean)];
+      if (admission.rejected.length || failureMessages.length) {
+        showWorkspaceLimit(
+          "extraction",
+          admission.occupied,
+          admission.rejected.length,
+          admission.accepted.length,
+          failureMessages
+        );
+      }
+      if (admission.accepted.length) setStatus(`已加入 ${admission.accepted.length} 张图片。`);
+    },
+    [commitExtractionWorkflows, showWorkspaceLimit]
+  );
+
+  const handleImageEditSourceFiles = useCallback(
+    async (files: FileList | File[], sourceType: "uploaded_image" | "clipboard_image" = "uploaded_image") => {
+      const allFiles = Array.from(files);
+      if (!allFiles.length) return;
+      const inputFiles = allFiles.filter((file) => file.type.startsWith("image/"));
+      const invalidFileMessages = allFiles
+        .filter((file) => !file.type.startsWith("image/"))
+        .map((file) => `${file.name || "未命名文件"}：不是受支持的图片文件。`);
+      const reservation = reserveImageEditPlaceholders(inputFiles.map((file) => file.name || "剪贴板图片"));
+      const acceptedFiles = inputFiles.slice(0, reservation.accepted.length);
+      const failures = await runWithConcurrency(acceptedFiles, 2, async (file, index) => {
+        try {
+          const imageState = await fileToImageState(file, sourceType);
+          return await populateImageEditWorkflow(
+            reservation.accepted[index].id,
+            imageState,
+            sourceType === "clipboard_image" ? "clipboard_image" : "uploaded_image"
+          );
+        } catch (uploadError) {
+          const message = uploadError instanceof Error ? uploadError.message : String(uploadError);
+          const workflowId = reservation.accepted[index].id;
+          commitImageEditWorkflows((current) =>
+            updateWorkflowById(current, workflowId, (workflow) => ({
+              ...workflow,
+              status: "failed",
+              statusMessage: "读取失败",
+              error: message
+            }))
+          );
+          return `${file.name}：${message}`;
+        }
+      });
+      const failureMessages = [...invalidFileMessages, ...failures.filter(Boolean)];
+      if (reservation.rejectedCount || failureMessages.length) {
+        showWorkspaceLimit(
+          "image_edit",
+          reservation.occupied,
+          reservation.rejectedCount,
+          reservation.accepted.length,
+          failureMessages
+        );
+      }
+      if (reservation.accepted.length) setStatus(`已加入 ${reservation.accepted.length} 个改图流程。`);
+    },
+    [commitImageEditWorkflows, populateImageEditWorkflow, reserveImageEditPlaceholders, showWorkspaceLimit]
+  );
+
+  const handleGenerationReferenceFiles = useCallback(
+    async (files: FileList | File[], sourceType: "uploaded_image" | "clipboard_image" = "uploaded_image") => {
+      const allFiles = Array.from(files);
+      const invalidFileMessages = allFiles
+        .filter((file) => !file.type.startsWith("image/"))
+        .map((file) => `${file.name || "未命名文件"}：不是受支持的图片文件。`);
+      const nextFiles = allFiles.filter((file) => file.type.startsWith("image/")).slice(0, 8);
+      if (!nextFiles.length) {
+        if (invalidFileMessages.length) {
+          showWorkspaceLimit(
+            "generation",
+            countActiveWorkflows(generationWorkflowsRef.current),
+            0,
+            0,
+            invalidFileMessages
+          );
+        }
+        return;
+      }
+      let workflow = generationWorkflowsRef.current.find((item) => item.id === activeGenerationWorkflowId) || null;
+      if (!workflow || workflow.taskId || workflow.status === "queued" || workflow.status === "running") {
+        workflow = reserveGenerationWorkflow(createGenerationWorkflow({ displayName: "参考图生图" }));
+      }
+      if (!workflow) return;
+      const targetWorkflowId = workflow.id;
+      const processed = await runWithConcurrency(nextFiles, 2, async (file) => {
+        try {
+          return {
+            image: await imageStateToGenerationReference(await fileToImageState(file, sourceType)),
+            error: ""
+          };
+        } catch (uploadError) {
+          const message = uploadError instanceof Error ? uploadError.message : String(uploadError);
+          return { image: null, error: `${file.name}：${message}` };
+        }
+      });
+      const nextImages = processed
+        .map((result) => result.image)
+        .filter((image): image is GenerationReferenceImage => Boolean(image));
+      const failureMessages = [...invalidFileMessages, ...processed.map((result) => result.error).filter(Boolean)];
+      if (nextImages.length) {
+        commitGenerationWorkflows((current) =>
+          updateWorkflowById(current, targetWorkflowId, (item) => ({
+            ...item,
+            referenceImages: [...item.referenceImages, ...nextImages].slice(0, 8),
+            referencesEditedByUser: true,
+            revision: item.revision + 1,
+            statusMessage: "待配置",
+            error: ""
+          }))
+        );
+        setStatus(`已加入 ${nextImages.length} 张生图参考图。`);
+      }
+      if (failureMessages.length) {
+        commitGenerationWorkflows((current) =>
+          updateWorkflowById(current, targetWorkflowId, (item) => ({ ...item, error: failureMessages.join("\n") }))
+        );
+        showWorkspaceLimit(
+          "generation",
+          countActiveWorkflows(generationWorkflowsRef.current),
+          0,
+          0,
+          failureMessages
+        );
+      }
+    },
+    [activeGenerationWorkflowId, commitGenerationWorkflows, reserveGenerationWorkflow, showWorkspaceLimit]
+  );
+
+  const handleSubjectFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const file = Array.from(files)[0];
+      const workflow = extractionWorkflowsRef.current.find((item) => item.id === activeExtractionWorkflowId);
+      if (!file || !workflow || workflow.operationId) return;
+      const workflowId = workflow.id;
+      const revision = workflow.revision + 1;
+      const activeFuseMode = resolveFuseMode(workflow.analysis, workflow.selectedFuseMode);
+      commitExtractionWorkflows((current) =>
+        updateWorkflowById(current, workflowId, (item) => ({ ...item, revision, fuseError: "" }))
+      );
+      try {
+        const nextImage = await fileToImageState(file);
+        commitExtractionWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (item) =>
+            item.revision === revision
+              ? {
+                  ...item,
+                  subjectImage: nextImage,
+                  fusedPrompt: "",
+                  fusedPromptJson: null,
+                  fuseError: ""
+                }
+              : item
+          )
+        );
+        setFuseCopied("");
+        setStatus(activeFuseMode === "information_layout" ? "产品信息图已载入。" : "主体参考图已载入。");
+      } catch (uploadError) {
+        const message = uploadError instanceof Error ? uploadError.message : String(uploadError);
+        commitExtractionWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (item) =>
+            item.revision === revision ? { ...item, fuseError: message } : item
+          )
+        );
+      }
+    },
+    [activeExtractionWorkflowId, commitExtractionWorkflows]
   );
 
   useEffect(() => {
     const onPaste = async (event: ClipboardEvent) => {
-      const item = Array.from(event.clipboardData?.items ?? []).find((entry) =>
-        entry.type.startsWith("image/")
-      );
-      const file = item?.getAsFile();
-      if (!file) return;
-
+      const files = Array.from(event.clipboardData?.items ?? [])
+        .filter((entry) => entry.type.startsWith("image/"))
+        .map((entry) => entry.getAsFile())
+        .filter((file): file is File => Boolean(file));
+      if (!files.length) return;
       event.preventDefault();
-      try {
-        setError("");
-        const nextImage = await fileToImageState(file, "clipboard_image");
-        if (activeView === "generate") {
-          const generationReference = await imageStateToGenerationReference(nextImage);
-          setGenerationReferenceImages((current) => [...current, generationReference].slice(0, 8));
-          setGenerationError("");
-          setStatus("已把剪贴板图片加入生图参考图。");
-          return;
-        }
-        if (activeView === "edit") {
-          await loadImageEditSource(nextImage, "clipboard_image");
-          setStatus("已把剪贴板图片设为改图源图。");
-          return;
-        }
-        if (showFuseModal) {
-          setSubjectImage(nextImage);
-          setFusedPrompt("");
-          setFusedPromptJson(null);
-          setFuseError("");
-          setFuseCopied("");
-          setStatus(fuseMode === "information_layout" ? "已读取产品信息图。" : "已读取主体参考图。");
-          return;
-        }
-        setImage(nextImage);
-        setAnalysis(null);
-        setRawText("");
-        setActiveHistoryId("");
-        setEditedTextMarkdown("");
-        resetFusionState(true);
-        setStatus("已读取剪贴板图片。");
-      } catch (pasteError) {
-        setError(pasteError instanceof Error ? pasteError.message : String(pasteError));
+      if (activeView === "generate") {
+        await handleGenerationReferenceFiles(files, "clipboard_image");
+        return;
       }
+      if (activeView === "edit") {
+        await handleImageEditSourceFiles(files, "clipboard_image");
+        return;
+      }
+      if (showFuseModal) {
+        await handleSubjectFiles(files);
+        return;
+      }
+      await handleFiles(files, "clipboard_image");
     };
 
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, [activeView, fuseMode, loadImageEditSource, resetFusionState, showFuseModal]);
-
-  const handleFiles = useCallback(async (files: FileList | File[]) => {
-    const file = Array.from(files)[0];
-    if (!file) return;
-    try {
-      setError("");
-      const nextImage = await fileToImageState(file);
-      setImage(nextImage);
-      setAnalysis(null);
-      setRawText("");
-      setActiveHistoryId("");
-      setEditedTextMarkdown("");
-      resetFusionState(true);
-      setStatus("图片已载入，可以开始分析。");
-    } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : String(uploadError));
-    }
-  }, [resetFusionState]);
-
-  const handleSubjectFiles = useCallback(async (files: FileList | File[]) => {
-    const file = Array.from(files)[0];
-    if (!file) return;
-    try {
-      setFuseError("");
-      const nextImage = await fileToImageState(file);
-      setSubjectImage(nextImage);
-      setFusedPrompt("");
-      setFusedPromptJson(null);
-      setFuseCopied("");
-      setStatus(fuseMode === "information_layout" ? "产品信息图已载入。" : "主体参考图已载入。");
-    } catch (uploadError) {
-      setFuseError(uploadError instanceof Error ? uploadError.message : String(uploadError));
-    }
-  }, [fuseMode]);
+  }, [activeView, handleFiles, handleGenerationReferenceFiles, handleImageEditSourceFiles, handleSubjectFiles, showFuseModal]);
 
   const onDrop = async (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -1567,32 +2510,238 @@ export function App(): JSX.Element {
     }
   };
 
-  const importPromptToGeneration = (option: GenerationPromptOption) => {
-    if (!analysis && !fusedPrompt) {
-      setGenerationError("请先完成提示词提取或融合提示词生成。");
-      return;
-    }
-    const activeHistoryItem = history.find((item) => item.id === activeHistoryId);
-    const sourceImage = historyItemToPromptSourceImage(activeHistoryItem, image);
+  const createGenerationFromExtraction = async (
+    sourceWorkflow: ExtractionWorkflow,
+    option: GenerationPromptOption
+  ): Promise<GenerationWorkflow> => {
+    const sourceHistoryItem = history.find((item) => item.id === sourceWorkflow.historyItemId);
+    const sourceImage = historyItemToPromptSourceImage(sourceHistoryItem, sourceWorkflow.image);
     const promptSource: GenerationPromptSource = {
       kind: option.kind,
       label: option.label,
-      historyItemId: activeHistoryId || undefined,
+      historyItemId: sourceWorkflow.historyItemId,
+      sourceExtractionWorkflowId: sourceWorkflow.id,
       sourceImageDataUrl: sourceImage.dataUrl,
       sourceThumbnailDataUrl: sourceImage.thumbnailDataUrl,
       sourceFileName: sourceImage.fileName,
       importedAt: new Date().toISOString()
     };
     const importedPrompt =
-      option.kind === "text_to_image" && analysis
-        ? buildDirectTextToImagePrompt(analysis, editedTextMarkdown)
+      option.kind === "text_to_image" && sourceWorkflow.analysis
+        ? buildDirectTextToImagePrompt(sourceWorkflow.analysis, sourceWorkflow.editedTextMarkdown)
         : option.value;
-    setGenerationPrompt(importedPrompt);
-    setGenerationPromptSource(promptSource);
-    if (option.kind === "text_to_image") {
-      setGenerationReferenceImages([]);
+    const referenceImages: GenerationReferenceImage[] = [];
+    if (
+      (option.kind === "fused_prompt" || option.kind === "fused_copy_ready") &&
+      resolveFuseMode(sourceWorkflow.analysis, sourceWorkflow.selectedFuseMode) === "subject_reference" &&
+      sourceWorkflow.subjectImage
+    ) {
+      const modelDataUrl = await createModelImage(sourceWorkflow.subjectImage.dataUrl);
+      referenceImages.push({
+        id: crypto.randomUUID(),
+        name: `主体参考图 · ${sourceWorkflow.subjectImage.fileName}`,
+        mimeType: getMimeTypeFromDataUrl(modelDataUrl, sourceWorkflow.subjectImage.mimeType),
+        dataUrl: modelDataUrl,
+        thumbnailDataUrl: sourceWorkflow.subjectImage.thumbnailDataUrl || (await createThumbnail(modelDataUrl)),
+        createdAt: new Date().toISOString()
+      });
     }
-    setGenerationError("");
+    return createGenerationWorkflow({
+      prompt: importedPrompt,
+      promptSource,
+      referenceImages,
+      sourceWorkflowRevision: sourceWorkflow.revision,
+      displayName: sourceImage.fileName || option.label
+    });
+  };
+
+  const syncGenerationDraftFromExtraction = async (
+    sourceWorkflow: ExtractionWorkflow,
+    option: GenerationPromptOption,
+    {
+      activate = true,
+      createIfMissing = true,
+      forceSourceRefresh = true
+    }: { activate?: boolean; createIfMissing?: boolean; forceSourceRefresh?: boolean } = {}
+  ): Promise<GenerationWorkflow | null> => {
+    const sourceLineageKey = extractionWorkflowLineageKey(sourceWorkflow);
+    const sequence = (generationSourceSyncSequenceRef.current.get(sourceLineageKey) || 0) + 1;
+    generationSourceSyncSequenceRef.current.set(sourceLineageKey, sequence);
+    const preparedWorkflow = await createGenerationFromExtraction(sourceWorkflow, option);
+    if (generationSourceSyncSequenceRef.current.get(sourceLineageKey) !== sequence) return null;
+
+    const latestSourceWorkflow = extractionWorkflowsRef.current.find(
+      (workflow) => workflow.id === sourceWorkflow.id
+    );
+    if (!latestSourceWorkflow?.analysis) return null;
+    if (latestSourceWorkflow.revision !== sourceWorkflow.revision) {
+      const latestOption = preferredGenerationPromptOption(latestSourceWorkflow, option.kind);
+      return latestOption
+        ? syncGenerationDraftFromExtraction(latestSourceWorkflow, latestOption, {
+            activate,
+            createIfMissing,
+            forceSourceRefresh
+          })
+        : null;
+    }
+
+    const sameSourceDrafts = generationWorkflowsRef.current.filter(
+      (workflow) =>
+        !workflow.taskId &&
+        generationPromptSourceLineageKey(workflow.promptSource) === sourceLineageKey
+    );
+    const refreshableDrafts = sameSourceDrafts.filter(
+      (workflow) =>
+        !workflow.operationId &&
+        workflow.stage !== "submitting" &&
+        workflow.status !== "queued" &&
+        workflow.status !== "running"
+    );
+    const targetWorkflow =
+      refreshableDrafts.find((workflow) => workflow.id === activeGenerationWorkflowId) ||
+      refreshableDrafts[0];
+
+    if (targetWorkflow) {
+      const duplicateIds = new Set(
+        refreshableDrafts
+          .filter(
+            (workflow) =>
+              workflow.id !== targetWorkflow.id &&
+              !workflow.promptEditedByUser &&
+              !workflow.referencesEditedByUser
+          )
+          .map((workflow) => workflow.id)
+      );
+      const remainingActiveCount = countActiveWorkflows(
+        generationWorkflowsRef.current.filter(
+          (workflow) => workflow.id !== targetWorkflow.id && !duplicateIds.has(workflow.id)
+        )
+      );
+      const targetIsTerminal = isWorkspaceStatusTerminal(targetWorkflow.status);
+      const reactivateTarget = forceSourceRefresh || !targetIsTerminal;
+      if (reactivateTarget && targetIsTerminal && remainingActiveCount >= WORKSPACE_CONCURRENCY_LIMIT) {
+        showWorkspaceLimit("generation", remainingActiveCount);
+        return null;
+      }
+      const preservePrompt = !forceSourceRefresh && Boolean(targetWorkflow.promptEditedByUser);
+      const preserveReferences = !forceSourceRefresh && Boolean(targetWorkflow.referencesEditedByUser);
+      const preservedManualEdits = preservePrompt || preserveReferences;
+      const refreshedWorkflow: GenerationWorkflow = {
+        ...targetWorkflow,
+        revision: targetWorkflow.revision + 1,
+        status: reactivateTarget ? "setup" : targetWorkflow.status,
+        stage: reactivateTarget ? "draft" : targetWorkflow.stage,
+        operationId: undefined,
+        displayName: preparedWorkflow.displayName,
+        prompt: preservePrompt ? targetWorkflow.prompt : preparedWorkflow.prompt,
+        promptSource: preservePrompt ? targetWorkflow.promptSource : preparedWorkflow.promptSource,
+        referenceImages: preserveReferences
+          ? targetWorkflow.referenceImages
+          : preparedWorkflow.referenceImages,
+        sourceWorkflowRevision: sourceWorkflow.revision,
+        promptEditedByUser: preservePrompt,
+        referencesEditedByUser: preserveReferences,
+        statusMessage: targetIsTerminal && !reactivateTarget
+          ? "解析结果已刷新，等待重试"
+          : preservedManualEdits
+            ? "解析结果有更新，已保留生图手动修改"
+            : "已同步最新解析结果",
+        error: reactivateTarget ? "" : targetWorkflow.error,
+        readOnly: false
+      };
+      commitGenerationWorkflows((current) =>
+        current
+          .filter((workflow) => !duplicateIds.has(workflow.id))
+          .map((workflow) => (workflow.id === targetWorkflow.id ? refreshedWorkflow : workflow))
+      );
+      if (activate) setActiveGenerationWorkflowId(refreshedWorkflow.id);
+      return refreshedWorkflow;
+    }
+
+    const lockedDraft = sameSourceDrafts[0];
+    if (lockedDraft) {
+      if (activate) {
+        setActiveGenerationWorkflowId(lockedDraft.id);
+        setActiveView("generate");
+        setStatus("对应生图流程正在提交，本次没有创建重复流程。");
+      }
+      return null;
+    }
+    if (!createIfMissing) return null;
+    return reserveGenerationWorkflow(preparedWorkflow);
+  };
+
+  const refreshGenerationDraftsFromExtractions = async (): Promise<number> => {
+    const draftByLineage = new Map<string, GenerationWorkflow>();
+    for (const workflow of generationWorkflowsRef.current) {
+      if (workflow.taskId) continue;
+      const lineageKey = generationPromptSourceLineageKey(workflow.promptSource);
+      if (!lineageKey) continue;
+      const current = draftByLineage.get(lineageKey);
+      if (!current || workflow.id === activeGenerationWorkflowId) {
+        draftByLineage.set(lineageKey, workflow);
+      }
+    }
+
+    const refreshTargets = Array.from(draftByLineage.entries()).flatMap(([lineageKey, draft]) => {
+      const sourceWorkflow =
+        extractionWorkflowsRef.current.find(
+          (workflow) => workflow.id === draft.promptSource?.sourceExtractionWorkflowId
+        ) ||
+        extractionWorkflowsRef.current.find(
+          (workflow) => extractionWorkflowLineageKey(workflow) === lineageKey
+        );
+      if (!sourceWorkflow?.analysis) return [];
+      const option = preferredGenerationPromptOption(sourceWorkflow, draft.promptSource?.kind);
+      if (!option) return [];
+      const hasRemovableDuplicate = generationWorkflowsRef.current.some(
+        (workflow) =>
+          workflow.id !== draft.id &&
+          !workflow.taskId &&
+          !workflow.promptEditedByUser &&
+          !workflow.referencesEditedByUser &&
+          generationPromptSourceLineageKey(workflow.promptSource) === lineageKey
+      );
+      const needsRefresh =
+        draft.sourceWorkflowRevision !== sourceWorkflow.revision ||
+        (!draft.promptEditedByUser && draft.promptSource?.kind !== option.kind) ||
+        hasRemovableDuplicate;
+      return needsRefresh ? [{ sourceWorkflow, option }] : [];
+    });
+
+    const refreshed = await runWithConcurrency(refreshTargets, 2, async ({ sourceWorkflow, option }) =>
+      syncGenerationDraftFromExtraction(sourceWorkflow, option, {
+        activate: false,
+        createIfMissing: false,
+        forceSourceRefresh: false
+      })
+    );
+    return refreshed.filter(Boolean).length;
+  };
+
+  const openGenerationWorkspace = async () => {
+    try {
+      const refreshedCount = await refreshGenerationDraftsFromExtractions();
+      if (refreshedCount > 0) {
+        setStatus(`已自动刷新 ${refreshedCount} 个生图流程的最新解析结果。`);
+      }
+    } catch (syncError) {
+      setStatus(syncError instanceof Error ? `生图流程自动刷新失败：${syncError.message}` : String(syncError));
+    } finally {
+      setActiveView("generate");
+    }
+  };
+
+  const importPromptToGeneration = async (option: GenerationPromptOption) => {
+    const sourceWorkflow = extractionWorkflowsRef.current.find(
+      (workflow) => workflow.id === activeExtractionWorkflowId
+    );
+    if (!sourceWorkflow?.analysis && !sourceWorkflow?.fusedPrompt) {
+      setStatus("请先完成提示词提取或融合提示词生成。");
+      return;
+    }
+    const workflow = await syncGenerationDraftFromExtraction(sourceWorkflow, option);
+    if (!workflow) return;
     setActiveView("generate");
     setStatus(
       option.kind === "text_to_image"
@@ -1601,53 +2750,41 @@ export function App(): JSX.Element {
     );
   };
 
-  const syncFusionImageToGenerationReferences = async (
-    fusionImage: ImageState | null,
-    mode: FusePromptMode,
-    modelDataUrl?: string
-  ): Promise<boolean> => {
-    if (mode !== "subject_reference" || !fusionImage || !modelDataUrl?.startsWith("data:image/")) return false;
-    const reference: GenerationReferenceImage = {
-      id: crypto.randomUUID(),
-      name: `主体参考图 · ${fusionImage.fileName}`,
-      mimeType: getMimeTypeFromDataUrl(modelDataUrl, fusionImage.mimeType),
-      dataUrl: modelDataUrl,
-      thumbnailDataUrl: fusionImage.thumbnailDataUrl || (await createThumbnail(modelDataUrl)),
-      createdAt: new Date().toISOString()
-    };
-    setGenerationReferenceImages((current) => {
-      const withoutSameImage = current.filter((item) => item.dataUrl !== reference.dataUrl);
-      return [reference, ...withoutSameImage].slice(0, 8);
-    });
-    return true;
-  };
+  const openPendingGenerationHandoff = async (sourceWorkflowId: string) => {
+    if (generationHandoffsInFlightRef.current.has(sourceWorkflowId)) return;
+    const sourceWorkflow = extractionWorkflowsRef.current.find(
+      (workflow) => workflow.id === sourceWorkflowId
+    );
+    if (!sourceWorkflow?.analysis) return;
 
-  const handleGenerationReferenceFiles = useCallback(async (files: FileList | File[]) => {
-    const nextFiles = Array.from(files).filter((file) => file.type.startsWith("image/")).slice(0, 8);
-    if (!nextFiles.length) return;
+    generationHandoffsInFlightRef.current.add(sourceWorkflowId);
     try {
-      setGenerationError("");
-      const nextImages = await Promise.all(
-        nextFiles.map(async (file) => imageStateToGenerationReference(await fileToImageState(file)))
+      const option: GenerationPromptOption = sourceWorkflow.fusedPrompt.trim()
+        ? {
+            kind: "fused_prompt",
+            label: "最终融合提示词",
+            value: sourceWorkflow.fusedPrompt
+          }
+        : {
+            kind: "text_to_image",
+            label: "完整文生图提示词",
+            value: buildDirectTextToImagePrompt(
+              sourceWorkflow.analysis,
+              sourceWorkflow.editedTextMarkdown
+            )
+          };
+      const workflow = await syncGenerationDraftFromExtraction(sourceWorkflow, option);
+      if (!workflow) return;
+      setActiveView("generate");
+      setStatus(
+        option.kind === "text_to_image"
+          ? "已导入完整文生图提示词，参考图已清空。"
+          : "已导入最终融合提示词到生图工作台。"
       );
-      setGenerationReferenceImages((current) => [...current, ...nextImages].slice(0, 8));
-      setStatus("已加入生图参考图。");
-    } catch (uploadError) {
-      setGenerationError(uploadError instanceof Error ? uploadError.message : String(uploadError));
+    } finally {
+      generationHandoffsInFlightRef.current.delete(sourceWorkflowId);
     }
-  }, []);
-
-  const handleImageEditSourceFiles = useCallback(async (files: FileList | File[]) => {
-    const file = Array.from(files)[0];
-    if (!file) return;
-    try {
-      setImageEditError("");
-      await loadImageEditSource(await fileToImageState(file), "uploaded_image");
-      setStatus("改图源图已载入。");
-    } catch (uploadError) {
-      setImageEditError(uploadError instanceof Error ? uploadError.message : String(uploadError));
-    }
-  }, [loadImageEditSource]);
+  };
 
   const onImageEditSourceChange = async (event: ChangeEvent<HTMLInputElement>) => {
     await handleImageEditSourceFiles(event.target.files ?? []);
@@ -1665,6 +2802,10 @@ export function App(): JSX.Element {
   };
 
   const saveEditedGenerationReference = async (reference: GenerationReferenceImage, editedDataUrl: string) => {
+    const targetWorkflow = generationWorkflowsRef.current.find((workflow) =>
+      workflow.referenceImages.some((item) => item.id === reference.id)
+    );
+    if (!targetWorkflow) return;
     const modelDataUrl = await createModelImage(editedDataUrl);
     const nextReference: GenerationReferenceImage = {
       ...reference,
@@ -1674,21 +2815,39 @@ export function App(): JSX.Element {
       thumbnailDataUrl: await createThumbnail(modelDataUrl),
       createdAt: new Date().toISOString()
     };
-    setGenerationReferenceImages((current) =>
-      current.map((item) => (item.id === reference.id ? nextReference : item))
+    commitGenerationWorkflows((current) =>
+      updateWorkflowById(current, targetWorkflow.id, (workflow) => ({
+        ...workflow,
+        referenceImages: workflow.referenceImages.map((item) =>
+          item.id === reference.id ? nextReference : item
+        ),
+        referencesEditedByUser: true,
+        revision: workflow.revision + 1,
+        error: ""
+      }))
     );
     setEditingGenerationReferenceId("");
     setStatus("已保存编辑后的生图参考图。");
   };
 
   const composeGenerationReferences = async () => {
-    if (generationReferenceImages.length < 2) {
-      setGenerationError("至少需要两张参考图才能合成为一张。");
+    const workflow = generationWorkflowsRef.current.find((item) => item.id === activeGenerationWorkflowId);
+    if (!workflow) return;
+    if (workflow.referenceImages.length < 2) {
+      commitGenerationWorkflows((current) =>
+        updateWorkflowById(current, workflow.id, (item) => ({
+          ...item,
+          error: "至少需要两张参考图才能合成为一张。"
+        }))
+      );
       return;
     }
+    const revision = workflow.revision;
     try {
-      setGenerationError("");
-      const composedDataUrl = await composeReferenceImages(generationReferenceImages);
+      commitGenerationWorkflows((current) =>
+        updateWorkflowById(current, workflow.id, (item) => ({ ...item, error: "" }))
+      );
+      const composedDataUrl = await composeReferenceImages(workflow.referenceImages);
       const modelDataUrl = await createModelImage(composedDataUrl);
       const reference: GenerationReferenceImage = {
         id: crypto.randomUUID(),
@@ -1698,149 +2857,304 @@ export function App(): JSX.Element {
         thumbnailDataUrl: await createThumbnail(modelDataUrl),
         createdAt: new Date().toISOString()
       };
-      setGenerationReferenceImages((current) => [reference, ...current].slice(0, 8));
+      if (generationWorkflowsRef.current.find((item) => item.id === workflow.id)?.revision !== revision) return;
+      commitGenerationWorkflows((current) =>
+        updateWorkflowById(current, workflow.id, (item) =>
+          item.revision === revision
+            ? {
+                ...item,
+                referenceImages: [reference, ...item.referenceImages].slice(0, 8),
+                referencesEditedByUser: true,
+                revision: item.revision + 1,
+                error: ""
+              }
+            : item
+        )
+      );
       setStatus("已把多张参考图合成为一张。");
     } catch (composeError) {
-      setGenerationError(composeError instanceof Error ? composeError.message : String(composeError));
+      const message = composeError instanceof Error ? composeError.message : String(composeError);
+      commitGenerationWorkflows((current) =>
+        updateWorkflowById(current, workflow.id, (item) =>
+          item.revision === revision ? { ...item, error: message } : item
+        )
+      );
     }
   };
 
-  const runGenerationRequest = async (request: GenerationCreateRequest) => {
+  const runGenerationRequest = async (
+    workflowId: string,
+    request: GenerationCreateRequest,
+    submissionToken?: WorkflowOperationToken
+  ) => {
+    const workflow = generationWorkflowsRef.current.find((item) => item.id === workflowId);
+    if (!workflow) return;
+    const token: WorkflowOperationToken =
+      submissionToken || {
+        workflowId,
+        operationId: crypto.randomUUID(),
+        revision: workflow.revision
+      };
+    if (submissionToken && !isWorkflowOperationCurrent(workflow, token)) return;
+    setEditingGenerationReferenceId("");
+    commitGenerationWorkflows((current) =>
+      submissionToken
+        ? updateWorkflowForOperation(current, token, (item) => ({
+            ...item,
+            status: "running",
+            stage: "submitting",
+            statusMessage: "正在提交...",
+            error: ""
+          }))
+        : updateWorkflowById(current, workflowId, (item) => ({
+            ...item,
+            operationId: token.operationId,
+            status: "running",
+            stage: "submitting",
+            statusMessage: "正在提交...",
+            error: ""
+          }))
+    );
+    const taskEpoch = generationTaskEpochRef.current;
     try {
-      setIsGeneratingImage(true);
-      setGenerationError("");
-      setStatus("正在提交生图任务...");
-      const task = await window.styleExtractor.createGenerationTask(request);
-      const nextTasks = await window.styleExtractor.getGenerationTasks();
+      const task = await window.styleExtractor.createGenerationTask({ ...request, clientWorkflowId: workflowId });
+      if (
+        generationTaskEpochRef.current !== taskEpoch ||
+        !isWorkflowOperationCurrent(
+          generationWorkflowsRef.current.find((item) => item.id === token.workflowId),
+          token
+        )
+      ) return;
+      const nextTasks = [task, ...generationTasksRef.current.filter((item) => item.id !== task.id)];
+      generationPollSequenceRef.current += 1;
+      generationTasksRef.current = nextTasks;
       setGenerationTasks(nextTasks);
       setSelectedGenerationTaskId(task.id);
-      if (task.status === "queued") {
-        setStatus("生图任务已加入队列。");
-        return;
-      }
-      if (task.status === "running") {
-        setStatus("生图任务已开始生成。");
-        return;
-      }
-      if (task.status === "failed" || task.status === "canceled") {
-        setGenerationError(task.error || "生图任务未完成。");
-        setStatus("");
-        return;
-      }
-      setStatus(task.status === "partial_failed" ? "生图任务部分完成。" : "生图任务已完成。");
+      commitGenerationWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          operationId: undefined,
+          taskId: task.id,
+          status: lifecycleStatusFromTask(task.status),
+          stage: generationStageFromTask(task.status),
+          statusMessage: formatGenerationTaskStatus(task.status),
+          error: task.error || ""
+        }))
+      );
+      setStatus(task.status === "queued" ? "生图任务已加入队列。" : "生图任务已提交。");
     } catch (generateError) {
-      setGenerationError(generateError instanceof Error ? generateError.message : String(generateError));
-      setStatus("");
-    } finally {
-      setIsGeneratingImage(false);
+      if (generationTaskEpochRef.current !== taskEpoch) return;
+      const message = generateError instanceof Error ? generateError.message : String(generateError);
+      commitGenerationWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          operationId: undefined,
+          status: "failed",
+          stage: "finished",
+          statusMessage: "提交失败",
+          error: message
+        }))
+      );
+      if (message.includes("最多同时") || message.includes("WORKSPACE_CAPACITY_REACHED")) {
+        showWorkspaceLimit("generation", WORKSPACE_CONCURRENCY_LIMIT);
+      }
     }
   };
 
   const resolveImageEditAnnotations = async () => {
-    if (!imageEditSource || !imageEditRegenerationContext?.basePrompt.trim()) {
+    const workflow = imageEditWorkflowsRef.current.find((item) => item.id === activeImageEditWorkflowId);
+    if (!workflow?.source || !workflow.regenerationContext?.basePrompt.trim()) {
       setImageEditError("请先导入源图并填写重生成基础提示词。");
       return;
     }
+    if (workflow.operationId || workflow.taskId || workflow.status === "queued" || workflow.status === "running") return;
+    if (isWorkspaceStatusTerminal(workflow.status)) {
+      const occupied = countActiveWorkflows(imageEditWorkflowsRef.current);
+      if (occupied >= WORKSPACE_CONCURRENCY_LIMIT) {
+        showWorkspaceLimit("image_edit", occupied);
+        return;
+      }
+    }
+    const token: WorkflowOperationToken = {
+      workflowId: workflow.id,
+      operationId: crypto.randomUUID(),
+      revision: workflow.revision
+    };
+    commitImageEditWorkflows((current) =>
+      updateWorkflowById(current, workflow.id, (item) => ({
+        ...item,
+        operationId: token.operationId,
+        status: "running",
+        stage: "resolving",
+        statusMessage: "修改意图解析中",
+        error: ""
+      }))
+    );
     try {
-      const resolutionVersion = imageEditResolutionVersionRef.current;
-      setIsResolvingImageEditAnnotations(true);
-      setImageEditError("");
-      setStatus("正在解析编号修改清单...");
-      const annotationItems = buildImageEditAnnotationItems(imageEditAnnotations);
+      const annotationItems = buildImageEditAnnotationItems(workflow.annotations);
       const annotationImageDataUrl = await renderImageEditAnnotationImage(
-        imageEditSource.dataUrl,
-        imageEditAnnotations
+        workflow.source.dataUrl,
+        workflow.annotations
       );
-      setStatus("正在压缩源图和编号定位图...");
       const [sourceImageDataUrl, modelAnnotationImageDataUrl] = await Promise.all([
-        createImageEditAnnotationModelImage(imageEditSource.dataUrl),
+        createImageEditAnnotationModelImage(workflow.source.dataUrl),
         createImageEditAnnotationModelImage(annotationImageDataUrl)
       ]);
-      setStatus("正在解析编号修改清单...");
       const response = await window.styleExtractor.resolveImageEditAnnotations({
-        sourceImageDataUrl: imageEditSource.dataUrl,
+        workflowId: token.workflowId,
+        operationId: token.operationId,
+        revision: token.revision,
+        sourceImageDataUrl: workflow.source.dataUrl,
         sourceImageModelDataUrl: sourceImageDataUrl,
         annotationImageDataUrl: modelAnnotationImageDataUrl,
         annotationItems,
-        instruction: imageEditInstruction,
-        basePrompt: imageEditRegenerationContext.basePrompt
+        instruction: workflow.instruction,
+        basePrompt: workflow.regenerationContext.basePrompt
       });
-      if (imageEditResolutionVersionRef.current !== resolutionVersion) {
-        setStatus("源图、标注、说明或基础提示词已变化，旧解析结果已丢弃。");
-        return;
-      }
-      setImageEditAnnotationResolution(response.resolution);
-      setStatus(
-        response.resolution.source === "manual_fallback"
-          ? "视觉解析不可用，已生成手动确认清单。"
-          : "修改清单已解析，请逐项检查并确认。"
+      if (
+        response.workflowId !== token.workflowId ||
+        response.operationId !== token.operationId ||
+        response.revision !== token.revision
+      ) return;
+      commitImageEditWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          operationId: undefined,
+          status: "setup",
+          stage: "confirming",
+          annotationResolution: response.resolution,
+          statusMessage: response.resolution.source === "manual_fallback" ? "手动清单待确认" : "修改清单待确认",
+          error: ""
+        }))
       );
     } catch (resolveError) {
-      setImageEditError(resolveError instanceof Error ? resolveError.message : String(resolveError));
-      setStatus("");
-    } finally {
-      setIsResolvingImageEditAnnotations(false);
+      const message = resolveError instanceof Error ? resolveError.message : String(resolveError);
+      commitImageEditWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          operationId: undefined,
+          status: "failed",
+          stage: "resolving",
+          statusMessage: "解析失败",
+          error: message
+        }))
+      );
     }
   };
 
+  const cancelImageEditAnnotationResolution = async () => {
+    const workflow = imageEditWorkflowsRef.current.find((item) => item.id === activeImageEditWorkflowId);
+    if (!workflow?.operationId || workflow.stage !== "resolving") return;
+    const operationId = workflow.operationId;
+    await window.styleExtractor.cancelImageEditAnnotationResolution(operationId);
+    commitImageEditWorkflows((current) =>
+      updateWorkflowById(current, workflow.id, (item) =>
+        item.operationId === operationId
+          ? { ...item, operationId: undefined, status: "canceled", statusMessage: "已取消", error: "" }
+          : item
+      )
+    );
+  };
+
   const createImageEditTask = async () => {
-    if (!imageEditSource) {
+    const workflow = imageEditWorkflowsRef.current.find((item) => item.id === activeImageEditWorkflowId);
+    if (!workflow?.source) {
       setImageEditError("请先导入一张改图源图。");
       return;
     }
-    const annotationItems = buildImageEditAnnotationItems(imageEditAnnotations);
+    if (workflow.operationId || workflow.taskId || workflow.status === "queued" || workflow.status === "running") return;
+    const annotationItems = buildImageEditAnnotationItems(workflow.annotations);
     const hasLocalEditNotes = annotationItems.some((item) => item.note !== "按总体改图说明处理此处。");
-    if (!imageEditInstruction.trim() && !hasLocalEditNotes) {
+    if (!workflow.instruction.trim() && !hasLocalEditNotes) {
       setImageEditError("请填写总体改图说明，或至少为一处标注填写修改要求。");
       return;
     }
-    if (!imageEditAnnotations.length) {
+    if (!workflow.annotations.length) {
       setImageEditError("至少需要 1 个带明确要求的编号标注。");
       return;
     }
-    if (!imageEditRegenerationContext?.basePrompt.trim()) {
+    if (!workflow.regenerationContext?.basePrompt.trim()) {
       setImageEditError("缺少第一次生图的基础提示词；手动导入时请填写完整基础提示词。");
       return;
     }
-    if (imageEditAnnotationResolution?.status !== "confirmed") {
+    if (workflow.annotationResolution?.status !== "confirmed") {
       setImageEditError("请先解析并确认修改清单，再生成修订版。");
       return;
     }
+    if (isWorkspaceStatusTerminal(workflow.status)) {
+      const occupied = countActiveWorkflows(imageEditWorkflowsRef.current);
+      if (occupied >= WORKSPACE_CONCURRENCY_LIMIT) {
+        showWorkspaceLimit("image_edit", occupied);
+        return;
+      }
+      commitImageEditWorkflows((current) =>
+        updateWorkflowById(current, workflow.id, (item) => ({
+          ...item,
+          status: "setup",
+          stage: "confirming",
+          statusMessage: "准备提交",
+          error: ""
+        }))
+      );
+    }
+    const token: WorkflowOperationToken = {
+      workflowId: workflow.id,
+      operationId: crypto.randomUUID(),
+      revision: workflow.revision
+    };
+    commitImageEditWorkflows((current) =>
+      updateWorkflowById(current, workflow.id, (item) => ({
+        ...item,
+        operationId: token.operationId,
+        status: "queued",
+        stage: "queued",
+        statusMessage: "正在提交...",
+        error: ""
+      }))
+    );
     let activeGenerationConfig = generationConfigRef.current;
     if (!hasGenerationBackend(activeGenerationConfig)) {
       activeGenerationConfig = await openGenerationConfig();
       if (!hasGenerationBackend(activeGenerationConfig)) {
-        setImageEditError(generationBackendError(activeGenerationConfig));
+        commitImageEditWorkflows((current) =>
+          updateWorkflowForOperation(current, token, (item) => ({
+            ...item,
+            operationId: undefined,
+            status: "failed",
+            stage: "finished",
+            statusMessage: "配置不可用",
+            error: generationBackendError(activeGenerationConfig)
+          }))
+        );
         return;
       }
     }
+    const taskEpoch = imageEditTaskEpochRef.current;
     try {
-      setIsCreatingImageEdit(true);
-      setImageEditError("");
-      setStatus("正在提交改图任务...");
-      const sourceDataUrl = imageEditSource.dataUrl;
+      const sourceDataUrl = workflow.source.dataUrl;
       const sourceDimensions = await imageDimensionsFromDataUrl(sourceDataUrl);
       assertImageEditSourceLimits(sourceDataUrl, sourceDimensions.width, sourceDimensions.height);
-      const annotationDataUrl = await renderImageEditAnnotationImage(sourceDataUrl, imageEditAnnotations);
+      const annotationDataUrl = await renderImageEditAnnotationImage(sourceDataUrl, workflow.annotations);
       const annotationImage: ImageEditAnnotationImage = {
         mimeType: "image/png",
         dataUrl: annotationDataUrl,
         thumbnailDataUrl: await createThumbnail(annotationDataUrl),
-        itemCount: imageEditAnnotations.length,
+        itemCount: workflow.annotations.length,
         createdAt: new Date().toISOString()
       };
-      const normalizedSize = normalizeGenerationSizeSettings(imageEditSettings);
+      const normalizedSize = normalizeGenerationSizeSettings(workflow.settings);
       const request: ImageEditCreateRequest = {
-        sourceImage: imageEditSource,
+        clientWorkflowId: workflow.id,
+        sourceImage: workflow.source,
         annotationImage,
         annotationItems,
-        annotationResolution: imageEditAnnotationResolution || undefined,
+        annotationResolution: workflow.annotationResolution || undefined,
         regenerationContext:
-          imageEditRegenerationContext?.basePrompt.trim() ? imageEditRegenerationContext : undefined,
+          workflow.regenerationContext?.basePrompt.trim() ? workflow.regenerationContext : undefined,
         fidelityMode: "origin_regenerate",
-        instruction: imageEditInstruction,
+        instruction: workflow.instruction,
         settings: {
-          ...imageEditSettings,
+          ...workflow.settings,
           ...normalizedSize,
           apiMode:
             activeGenerationConfig.authSource === "codex_oauth"
@@ -1853,46 +3167,124 @@ export function App(): JSX.Element {
         }
       };
       const task = await window.styleExtractor.createImageEditTask(request);
-      const nextTasks = await window.styleExtractor.getImageEditTasks();
+      if (
+        imageEditTaskEpochRef.current !== taskEpoch ||
+        !isWorkflowOperationCurrent(
+          imageEditWorkflowsRef.current.find((item) => item.id === token.workflowId),
+          token
+        )
+      ) return;
+      const nextTasks = [task, ...imageEditTasksRef.current.filter((item) => item.id !== task.id)];
+      imageEditPollSequenceRef.current += 1;
+      imageEditTasksRef.current = nextTasks;
       setImageEditTasks(nextTasks);
       setSelectedImageEditTaskId(task.id);
+      commitImageEditWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          operationId: undefined,
+          taskId: task.id,
+          status: lifecycleStatusFromTask(task.status),
+          stage: imageEditStageFromTask(task.status),
+          statusMessage: formatGenerationTaskStatus(task.status),
+          error: task.error || ""
+        }))
+      );
       setStatus("改图任务已加入队列。");
     } catch (editError) {
-      setImageEditError(editError instanceof Error ? editError.message : String(editError));
-      setStatus("");
-    } finally {
-      setIsCreatingImageEdit(false);
+      if (imageEditTaskEpochRef.current !== taskEpoch) return;
+      const message = editError instanceof Error ? editError.message : String(editError);
+      commitImageEditWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          operationId: undefined,
+          status: "failed",
+          stage: "finished",
+          statusMessage: "提交失败",
+          error: message
+        }))
+      );
+      if (message.includes("最多同时") || message.includes("WORKSPACE_CAPACITY_REACHED")) {
+        showWorkspaceLimit("image_edit", WORKSPACE_CONCURRENCY_LIMIT);
+      }
     }
   };
 
   const createGeneration = async () => {
-    if (!generationPrompt.trim()) {
+    const workflow = generationWorkflowsRef.current.find((item) => item.id === activeGenerationWorkflowId);
+    if (!workflow?.prompt.trim()) {
       setGenerationError("请先导入提示词或直接填写完整的生图提示词。");
       return;
     }
+    if (workflow.operationId || workflow.taskId || workflow.status === "queued" || workflow.status === "running") return;
+    if (isWorkspaceStatusTerminal(workflow.status)) {
+      const occupied = countActiveWorkflows(generationWorkflowsRef.current);
+      if (occupied >= WORKSPACE_CONCURRENCY_LIMIT) {
+        showWorkspaceLimit("generation", occupied);
+        return;
+      }
+      commitGenerationWorkflows((current) =>
+        updateWorkflowById(current, workflow.id, (item) => ({
+          ...item,
+          status: "setup",
+          stage: "draft",
+          statusMessage: "准备提交",
+          error: ""
+        }))
+      );
+    }
     const promptSource: GenerationPromptSource =
-      generationPromptSource || {
+      workflow.promptSource || {
         kind: "manual",
         label: "手动输入提示词",
         importedAt: new Date().toISOString()
       };
-    if (!generationPromptSource) setGenerationPromptSource(promptSource);
+    if (!workflow.promptSource) {
+      commitGenerationWorkflows((current) =>
+        updateWorkflowById(current, workflow.id, (item) => ({ ...item, promptSource }))
+      );
+    }
+    const token: WorkflowOperationToken = {
+      workflowId: workflow.id,
+      operationId: crypto.randomUUID(),
+      revision: workflow.revision
+    };
+    commitGenerationWorkflows((current) =>
+      updateWorkflowById(current, workflow.id, (item) => ({
+        ...item,
+        operationId: token.operationId,
+        status: "running",
+        stage: "submitting",
+        statusMessage: "正在提交...",
+        error: ""
+      }))
+    );
     let activeGenerationConfig = generationConfigRef.current;
     if (!hasGenerationBackend(activeGenerationConfig)) {
       activeGenerationConfig = await openGenerationConfig();
       if (!hasGenerationBackend(activeGenerationConfig)) {
-        setGenerationError(generationBackendError(activeGenerationConfig));
+        commitGenerationWorkflows((current) =>
+          updateWorkflowForOperation(current, token, (item) => ({
+            ...item,
+            operationId: undefined,
+            status: "failed",
+            stage: "finished",
+            statusMessage: "配置不可用",
+            error: generationBackendError(activeGenerationConfig)
+          }))
+        );
         return;
       }
     }
-    const normalizedSize = normalizeGenerationSizeSettings(generationSettings);
+    const normalizedSize = normalizeGenerationSizeSettings(workflow.settings);
 
-    await runGenerationRequest({
-      prompt: generationPrompt,
+    await runGenerationRequest(workflow.id, {
+      clientWorkflowId: workflow.id,
+      prompt: workflow.prompt,
       promptSource,
-      referenceImages: generationReferenceImages,
+      referenceImages: workflow.referenceImages.map((reference) => ({ ...reference })),
       settings: {
-        ...generationSettings,
+        ...workflow.settings,
         ...normalizedSize,
         apiMode:
           activeGenerationConfig.authSource === "codex_oauth"
@@ -1903,82 +3295,236 @@ export function App(): JSX.Element {
         imageModel: activeGenerationConfig.imageModel,
         mainModel: activeGenerationConfig.mainModel
       }
-    });
+    }, token);
   };
 
   const retryGenerationTask = async (task: GenerationTask) => {
-    let activeGenerationConfig = generationConfigRef.current;
-    if (!hasGenerationBackend(activeGenerationConfig)) {
-      activeGenerationConfig = await openGenerationConfig();
+    if (generationRetrySourceIdsRef.current.has(task.id)) return;
+    generationRetrySourceIdsRef.current.add(task.id);
+    try {
+      const workflow = reserveGenerationWorkflow(
+        createGenerationWorkflow({
+          prompt: task.prompt,
+          promptSource: { ...task.promptSource, importedAt: new Date().toISOString() },
+          referenceImages: task.referenceImages.map((reference) => ({ ...reference })),
+          settings: { ...task.settings },
+          displayName: task.promptSource.sourceFileName || task.promptSource.label
+        })
+      );
+      if (!workflow) return;
+      const token: WorkflowOperationToken = {
+        workflowId: workflow.id,
+        operationId: crypto.randomUUID(),
+        revision: workflow.revision
+      };
+      commitGenerationWorkflows((current) =>
+        updateWorkflowById(current, workflow.id, (item) => ({
+          ...item,
+          operationId: token.operationId,
+          status: "running",
+          stage: "submitting",
+          statusMessage: "正在提交...",
+          error: ""
+        }))
+      );
+      let activeGenerationConfig = generationConfigRef.current;
       if (!hasGenerationBackend(activeGenerationConfig)) {
-        setGenerationError(generationBackendError(activeGenerationConfig));
-        return;
+        activeGenerationConfig = await openGenerationConfig();
+        if (!hasGenerationBackend(activeGenerationConfig)) {
+          commitGenerationWorkflows((current) =>
+            updateWorkflowForOperation(current, token, (item) => ({
+              ...item,
+              operationId: undefined,
+              status: "failed",
+              stage: "finished",
+              statusMessage: "配置不可用",
+              error: generationBackendError(activeGenerationConfig)
+            }))
+          );
+          return;
+        }
       }
+      const normalizedSize = normalizeGenerationSizeSettings(task.settings);
+      await runGenerationRequest(workflow.id, {
+        clientWorkflowId: workflow.id,
+        prompt: task.prompt,
+        promptSource: {
+          ...task.promptSource,
+          importedAt: new Date().toISOString()
+        },
+        referenceImages: task.referenceImages,
+        settings: {
+          ...task.settings,
+          ...normalizedSize,
+          apiMode:
+            activeGenerationConfig.authSource === "codex_oauth"
+              ? "responses"
+              : activeGenerationConfig.providerType === "openrouter"
+                ? "images"
+                : activeGenerationConfig.apiMode,
+          imageModel: activeGenerationConfig.imageModel,
+          mainModel: activeGenerationConfig.mainModel
+        }
+      }, token);
+    } finally {
+      generationRetrySourceIdsRef.current.delete(task.id);
     }
-    const normalizedSize = normalizeGenerationSizeSettings(task.settings);
-    await runGenerationRequest({
-      prompt: task.prompt,
-      promptSource: {
-        ...task.promptSource,
-        importedAt: new Date().toISOString()
-      },
-      referenceImages: task.referenceImages,
-      settings: {
-        ...task.settings,
-        ...normalizedSize,
-        apiMode:
-          activeGenerationConfig.authSource === "codex_oauth"
-            ? "responses"
-            : activeGenerationConfig.providerType === "openrouter"
-              ? "images"
-              : activeGenerationConfig.apiMode,
-        imageModel: activeGenerationConfig.imageModel,
-        mainModel: activeGenerationConfig.mainModel
-      }
-    });
   };
 
   const cancelGenerationTask = async (id: string) => {
+    const taskEpoch = generationTaskEpochRef.current;
     const canceledTask = await window.styleExtractor.cancelGenerationTask(id);
-    const nextTasks = await window.styleExtractor.getGenerationTasks();
-    setGenerationTasks(nextTasks);
+    if (generationTaskEpochRef.current !== taskEpoch || deletedGenerationTaskIdsRef.current.has(id)) return;
+    if (canceledTask) {
+      const nextTasks = [canceledTask, ...generationTasksRef.current.filter((task) => task.id !== id)];
+      generationPollSequenceRef.current += 1;
+      generationTasksRef.current = nextTasks;
+      setGenerationTasks(nextTasks);
+      commitGenerationWorkflows((current) =>
+        current.map((workflow) =>
+          workflow.taskId === id
+            ? { ...workflow, status: "canceled", stage: "finished", statusMessage: "已取消", error: "" }
+            : workflow
+        )
+      );
+    }
     if (canceledTask?.status === "canceled") {
       setStatus("已取消生图任务。");
     }
   };
 
   const cancelImageEditTask = async (id: string) => {
+    const taskEpoch = imageEditTaskEpochRef.current;
     const canceledTask = await window.styleExtractor.cancelImageEditTask(id);
-    const nextTasks = await window.styleExtractor.getImageEditTasks();
-    setImageEditTasks(nextTasks);
+    if (imageEditTaskEpochRef.current !== taskEpoch || deletedImageEditTaskIdsRef.current.has(id)) return;
+    if (canceledTask) {
+      const nextTasks = [canceledTask, ...imageEditTasksRef.current.filter((task) => task.id !== id)];
+      imageEditPollSequenceRef.current += 1;
+      imageEditTasksRef.current = nextTasks;
+      setImageEditTasks(nextTasks);
+      commitImageEditWorkflows((current) =>
+        current.map((workflow) =>
+          workflow.taskId === id
+            ? { ...workflow, status: "canceled", stage: "finished", statusMessage: "已取消", error: "" }
+            : workflow
+        )
+      );
+    }
     if (canceledTask?.status === "canceled") setStatus("已取消改图任务。");
   };
 
   const retryImageEditTask = async (task: ImageEditTask) => {
+    const workflowId = task.clientWorkflowId || `task:${task.id}`;
+    let workflow = imageEditWorkflowsRef.current.find((item) => item.id === workflowId);
+    if (workflow && !isWorkspaceStatusTerminal(workflow.status)) return;
+    const occupied = countActiveWorkflows(imageEditWorkflowsRef.current);
+    if (occupied >= WORKSPACE_CONCURRENCY_LIMIT) {
+      showWorkspaceLimit("image_edit", occupied);
+      return;
+    }
+    const baseWorkflow = workflow || imageEditWorkflowFromTask(task);
+    const token: WorkflowOperationToken = {
+      workflowId: baseWorkflow.id,
+      operationId: crypto.randomUUID(),
+      revision: baseWorkflow.revision
+    };
+    if (workflow) {
+      commitImageEditWorkflows((current) =>
+        updateWorkflowById(current, workflowId, (item) => ({
+          ...item,
+          operationId: token.operationId,
+          status: "queued",
+          stage: "queued",
+          statusMessage: "重试提交中",
+          error: ""
+        }))
+      );
+    } else {
+      workflow = {
+        ...baseWorkflow,
+        operationId: token.operationId,
+        status: "queued",
+        stage: "queued",
+        statusMessage: "重试提交中",
+        error: ""
+      };
+      const next = [workflow, ...imageEditWorkflowsRef.current];
+      imageEditWorkflowsRef.current = next;
+      setImageEditWorkflowsState(next);
+    }
+    setActiveImageEditWorkflowId(workflowId);
+    const taskEpoch = imageEditTaskEpochRef.current;
     try {
-      setImageEditError("");
       const retried = await window.styleExtractor.retryImageEditTask(task.id);
-      const nextTasks = await window.styleExtractor.getImageEditTasks();
+      if (
+        imageEditTaskEpochRef.current !== taskEpoch ||
+        !isWorkflowOperationCurrent(
+          imageEditWorkflowsRef.current.find((item) => item.id === token.workflowId),
+          token
+        )
+      ) return;
+      const nextTasks = [retried, ...imageEditTasksRef.current.filter((item) => item.id !== retried.id)];
+      imageEditPollSequenceRef.current += 1;
+      imageEditTasksRef.current = nextTasks;
       setImageEditTasks(nextTasks);
       setSelectedImageEditTaskId(retried.id);
+      commitImageEditWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          operationId: undefined,
+          taskId: retried.id,
+          status: lifecycleStatusFromTask(retried.status),
+          stage: imageEditStageFromTask(retried.status),
+          statusMessage: formatGenerationTaskStatus(retried.status),
+          error: retried.error || ""
+        }))
+      );
       setStatus("已重新提交改图任务。");
     } catch (retryError) {
-      setImageEditError(retryError instanceof Error ? retryError.message : String(retryError));
+      if (imageEditTaskEpochRef.current !== taskEpoch) return;
+      const message = retryError instanceof Error ? retryError.message : String(retryError);
+      commitImageEditWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          operationId: undefined,
+          status: "failed",
+          stage: "finished",
+          statusMessage: "重试失败",
+          error: message
+        }))
+      );
+      if (message.includes("最多同时") || message.includes("WORKSPACE_CAPACITY_REACHED")) {
+        showWorkspaceLimit("image_edit", WORKSPACE_CONCURRENCY_LIMIT);
+      }
     }
   };
 
   const deleteImageEditTask = async (id: string) => {
     if (!window.confirm("确定删除这条改图任务吗？")) return;
+    const sourceHandoffKey = imageEditSourceHandoffKey(
+      imageEditTasksRef.current.find((task) => task.id === id)?.sourceImage
+    );
     const nextTasks = await window.styleExtractor.deleteImageEditTask(id);
+    dismissHandoffs("image_edit", [sourceHandoffKey]);
+    deletedImageEditTaskIdsRef.current.add(id);
+    imageEditPollSequenceRef.current += 1;
+    imageEditTasksRef.current = nextTasks;
     setImageEditTasks(nextTasks);
+    commitImageEditWorkflows((current) => current.filter((workflow) => workflow.taskId !== id));
+    if (activeImageEditWorkflow?.taskId === id) setActiveImageEditWorkflowId("");
     if (selectedImageEditTaskId === id) setSelectedImageEditTaskId("");
     setCollapsedImageEditTaskIds((current) => current.filter((taskId) => taskId !== id));
     setStatus("已删除改图任务。");
   };
 
   const updateImageEditTaskVisibility = async (id: string, visibility: ImageEditTaskVisibility) => {
+    const workflowId = imageEditWorkflowsRef.current.find((workflow) => workflow.taskId === id)?.id;
     try {
+      const taskEpoch = imageEditTaskEpochRef.current;
       const nextTasks = await window.styleExtractor.updateImageEditTaskVisibility({ id, visibility });
+      if (imageEditTaskEpochRef.current !== taskEpoch || deletedImageEditTaskIdsRef.current.has(id)) return;
+      imageEditPollSequenceRef.current += 1;
+      imageEditTasksRef.current = nextTasks;
       setImageEditTasks(nextTasks);
       if (visibility !== "active" && selectedImageEditTaskId === id) setSelectedImageEditTaskId("");
       setStatus(
@@ -1989,22 +3535,44 @@ export function App(): JSX.Element {
             : "已恢复改图任务显示。"
       );
     } catch (visibilityError) {
-      setImageEditError(visibilityError instanceof Error ? visibilityError.message : String(visibilityError));
+      const message = visibilityError instanceof Error ? visibilityError.message : String(visibilityError);
+      if (workflowId) {
+        commitImageEditWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (workflow) => ({ ...workflow, error: message }))
+        );
+      }
     }
   };
 
   const clearImageEditTasks = async () => {
     if (imageEditTasks.length > 0 && !window.confirm("确定清空全部改图任务吗？")) return;
+    const sourceHandoffKeys = imageEditTasksRef.current.map((task) => imageEditSourceHandoffKey(task.sourceImage));
+    imageEditTaskEpochRef.current += 1;
     await window.styleExtractor.clearImageEditTasks();
+    dismissHandoffs("image_edit", sourceHandoffKeys);
+    deletedImageEditTaskIdsRef.current.clear();
+    imageEditPollSequenceRef.current += 1;
+    imageEditTasksRef.current = [];
     setImageEditTasks([]);
+    commitImageEditWorkflows((current) =>
+      current.filter((workflow) => !workflow.taskId && workflow.stage !== "queued")
+    );
+    if (activeImageEditWorkflow?.taskId || activeImageEditWorkflow?.stage === "queued") {
+      setActiveImageEditWorkflowId("");
+    }
     setSelectedImageEditTaskId("");
     setCollapsedImageEditTaskIds([]);
     setStatus("改图任务已清空。");
   };
 
   const updateGenerationTaskVisibility = async (id: string, visibility: GenerationTaskVisibility) => {
+    const workflowId = generationWorkflowsRef.current.find((workflow) => workflow.taskId === id)?.id;
     try {
+      const taskEpoch = generationTaskEpochRef.current;
       const nextTasks = await window.styleExtractor.updateGenerationTaskVisibility({ id, visibility });
+      if (generationTaskEpochRef.current !== taskEpoch || deletedGenerationTaskIdsRef.current.has(id)) return;
+      generationPollSequenceRef.current += 1;
+      generationTasksRef.current = nextTasks;
       setGenerationTasks(nextTasks);
       setStatus(
         visibility === "archived"
@@ -2014,22 +3582,50 @@ export function App(): JSX.Element {
             : "已恢复生图任务显示。"
       );
     } catch (visibilityError) {
-      setGenerationError(visibilityError instanceof Error ? visibilityError.message : String(visibilityError));
+      const message = visibilityError instanceof Error ? visibilityError.message : String(visibilityError);
+      if (workflowId) {
+        commitGenerationWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (workflow) => ({ ...workflow, error: message }))
+        );
+      }
     }
   };
 
   const deleteGenerationTask = async (id: string) => {
     if (!window.confirm("确定删除这条生图任务吗？")) return;
+    const sourceHandoffKey = generationPromptSourceHandoffKey(
+      generationTasksRef.current.find((task) => task.id === id)?.promptSource
+    );
     const nextTasks = await window.styleExtractor.deleteGenerationTask(id);
+    dismissHandoffs("generation", [sourceHandoffKey]);
+    deletedGenerationTaskIdsRef.current.add(id);
+    generationPollSequenceRef.current += 1;
+    generationTasksRef.current = nextTasks;
     setGenerationTasks(nextTasks);
+    commitGenerationWorkflows((current) => current.filter((workflow) => workflow.taskId !== id));
+    if (activeGenerationWorkflow?.taskId === id) setActiveGenerationWorkflowId("");
     if (selectedGenerationTaskId === id) setSelectedGenerationTaskId("");
     setStatus("已删除生图任务。");
   };
 
   const clearGenerationTasks = async () => {
     if (generationTasks.length > 0 && !window.confirm("确定清空全部生图任务吗？")) return;
+    const sourceHandoffKeys = generationTasksRef.current.map((task) =>
+      generationPromptSourceHandoffKey(task.promptSource)
+    );
+    generationTaskEpochRef.current += 1;
     await window.styleExtractor.clearGenerationTasks();
+    dismissHandoffs("generation", sourceHandoffKeys);
+    deletedGenerationTaskIdsRef.current.clear();
+    generationPollSequenceRef.current += 1;
+    generationTasksRef.current = [];
     setGenerationTasks([]);
+    commitGenerationWorkflows((current) =>
+      current.filter((workflow) => !workflow.taskId && workflow.stage !== "submitting")
+    );
+    if (activeGenerationWorkflow?.taskId || activeGenerationWorkflow?.stage === "submitting") {
+      setActiveGenerationWorkflowId("");
+    }
     setSelectedGenerationTaskId("");
     setCollapsedGenerationTaskIds([]);
     setStatus("生图任务已清空。");
@@ -2047,8 +3643,13 @@ export function App(): JSX.Element {
 
   const saveGenerationOutputs = async (task: GenerationTask, outputs: GenerationOutput[]) => {
     if (!outputs.length) return;
+    const workflowId = generationWorkflowsRef.current.find((workflow) => workflow.taskId === task.id)?.id;
     try {
-      setGenerationError("");
+      if (workflowId) {
+        commitGenerationWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (workflow) => ({ ...workflow, error: "" }))
+        );
+      }
       const result = await window.styleExtractor.saveGenerationOutputs({
         outputs: outputs.map((output) => {
           const index = Math.max(task.outputs.findIndex((item) => item.id === output.id), 0);
@@ -2071,7 +3672,12 @@ export function App(): JSX.Element {
           : `生成图已保存：${result.filePaths[0] || ""}`
       );
     } catch (downloadError) {
-      setGenerationError(downloadError instanceof Error ? downloadError.message : String(downloadError));
+      const message = downloadError instanceof Error ? downloadError.message : String(downloadError);
+      if (workflowId) {
+        commitGenerationWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (workflow) => ({ ...workflow, error: message }))
+        );
+      }
     }
   };
 
@@ -2080,8 +3686,13 @@ export function App(): JSX.Element {
 
   const saveImageEditOutputs = async (task: ImageEditTask, outputs: ImageEditOutput[]) => {
     if (!outputs.length) return;
+    const workflowId = imageEditWorkflowsRef.current.find((workflow) => workflow.taskId === task.id)?.id;
     try {
-      setImageEditError("");
+      if (workflowId) {
+        commitImageEditWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (workflow) => ({ ...workflow, error: "" }))
+        );
+      }
       const result = await window.styleExtractor.saveImageEditOutputs({
         outputs: outputs.map((output) => {
           const index = Math.max(task.outputs.findIndex((item) => item.id === output.id), 0);
@@ -2104,7 +3715,12 @@ export function App(): JSX.Element {
           : `改图输出已保存：${result.filePaths[0] || ""}`
       );
     } catch (downloadError) {
-      setImageEditError(downloadError instanceof Error ? downloadError.message : String(downloadError));
+      const message = downloadError instanceof Error ? downloadError.message : String(downloadError);
+      if (workflowId) {
+        commitImageEditWorkflows((current) =>
+          updateWorkflowById(current, workflowId, (workflow) => ({ ...workflow, error: message }))
+        );
+      }
     }
   };
 
@@ -2117,14 +3733,22 @@ export function App(): JSX.Element {
       thumbnailDataUrl: await createThumbnail(output.dataUrl),
       createdAt: new Date().toISOString()
     };
-    setGenerationReferenceImages((current) => [...current, reference].slice(0, 8));
+    const workflow = reserveGenerationWorkflow(
+      createGenerationWorkflow({ referenceImages: [reference], displayName: "生成图参考流程" })
+    );
+    if (!workflow) return;
+    setActiveView("generate");
     setStatus("已把生成图加入下一轮参考图。");
   };
 
   const sendGenerationOutputToImageEdit = async (task: GenerationTask, output: GenerationOutput, index: number) => {
+    const handoffKey = generationOutputHandoffKey(task.id, output.id);
+    if (imageEditHandoffsInFlightRef.current.has(handoffKey)) return;
+    imageEditHandoffsInFlightRef.current.add(handoffKey);
+    const sourceWorkflowId = generationWorkflowsRef.current.find((workflow) => workflow.taskId === task.id)?.id;
     try {
       const thumbnailDataUrl = await createThumbnail(output.dataUrl);
-      await loadImageEditSource(
+      const workflow = await loadImageEditSource(
         {
           fileName: `generated-${task.id.slice(0, 8)}-${String(index + 1).padStart(2, "0")}`,
           mimeType: output.mimeType,
@@ -2134,6 +3758,7 @@ export function App(): JSX.Element {
         },
         "generation_output",
         {
+          historyItemId: task.promptSource.historyItemId,
           generationTaskId: task.id,
           generationOutputId: output.id
         },
@@ -2147,25 +3772,33 @@ export function App(): JSX.Element {
           originalReferences: task.referenceImages.map((reference) => ({ ...reference }))
         }
       );
-      setImageEditInstruction("");
+      if (!workflow) return;
       setActiveView("edit");
       setStatus("已把这张生成图送入改图工作台。");
     } catch (editSourceError) {
-      setGenerationError(editSourceError instanceof Error ? editSourceError.message : String(editSourceError));
+      const message = editSourceError instanceof Error ? editSourceError.message : String(editSourceError);
+      if (sourceWorkflowId) {
+        commitGenerationWorkflows((current) =>
+          updateWorkflowById(current, sourceWorkflowId, (workflow) => ({ ...workflow, error: message }))
+        );
+      }
+    } finally {
+      imageEditHandoffsInFlightRef.current.delete(handoffKey);
     }
   };
 
   const restoreGenerationTask = (task: GenerationTask) => {
-    setGenerationPrompt(task.prompt);
-    setGenerationPromptSource(task.promptSource);
-    setGenerationReferenceImages(task.referenceImages);
-    setGenerationSettings((current) => ({
-      ...current,
-      ...task.settings,
-      ...normalizeGenerationSizeSettings(task.settings)
-    }));
+    const workflow = reserveGenerationWorkflow(
+      createGenerationWorkflow({
+        prompt: task.prompt,
+        promptSource: { ...task.promptSource, importedAt: new Date().toISOString() },
+        referenceImages: task.referenceImages.map((reference) => ({ ...reference })),
+        settings: { ...task.settings, ...normalizeGenerationSizeSettings(task.settings) },
+        displayName: task.promptSource.sourceFileName || task.promptSource.label
+      })
+    );
+    if (!workflow) return;
     setSelectedGenerationTaskId(task.id);
-    setGenerationError("");
     setActiveView("generate");
     setStatus("已从生图历史恢复任务，可继续编辑、重试或打开对比。");
   };
@@ -2246,9 +3879,10 @@ export function App(): JSX.Element {
   };
 
   const continueImageEditFromOutput = async (task: ImageEditTask, output: ImageEditOutput, index: number) => {
+    const sourceWorkflowId = imageEditWorkflowsRef.current.find((workflow) => workflow.taskId === task.id)?.id;
     try {
       const thumbnailDataUrl = await createThumbnail(output.dataUrl);
-      await loadImageEditSource(
+      const workflow = await loadImageEditSource(
         {
           fileName: `edited-${task.id.slice(0, 8)}-${String(index + 1).padStart(2, "0")}`,
           mimeType: output.mimeType,
@@ -2258,6 +3892,7 @@ export function App(): JSX.Element {
         },
         "restored_edit_output",
         {
+          historyItemId: task.sourceImage.sourcePointer.historyItemId,
           imageEditTaskId: task.id,
           imageEditOutputId: output.id
         },
@@ -2269,11 +3904,16 @@ export function App(): JSX.Element {
             }
           : undefined
       );
-      setImageEditInstruction("");
+      if (!workflow) return;
       setActiveView("edit");
       setStatus("已把改图输出作为新一轮源图。");
     } catch (continueError) {
-      setImageEditError(continueError instanceof Error ? continueError.message : String(continueError));
+      const message = continueError instanceof Error ? continueError.message : String(continueError);
+      if (sourceWorkflowId) {
+        commitImageEditWorkflows((current) =>
+          updateWorkflowById(current, sourceWorkflowId, (workflow) => ({ ...workflow, error: message }))
+        );
+      }
     }
   };
 
@@ -2314,44 +3954,81 @@ export function App(): JSX.Element {
     });
   };
 
-  const analyze = async (targetImage: ImageState | null = image) => {
-    if (!targetImage) {
+  const analyze = async (workflowId = activeExtractionWorkflowId) => {
+    const workflow = extractionWorkflowsRef.current.find((item) => item.id === workflowId);
+    if (!workflow?.image) {
       setError("请先上传图片，或直接粘贴截图。");
       return;
     }
+    if (workflow.operationId || workflow.status === "queued" || workflow.status === "running") return;
     const activeConfig = configRef.current;
     if (!activeConfig.hasApiKey) {
       setShowConfig(true);
       setError("请先填写模型 API Key。");
       return;
     }
-
+    if (isWorkspaceStatusTerminal(workflow.status)) {
+      const occupied = countActiveWorkflows(extractionWorkflowsRef.current);
+      if (occupied >= WORKSPACE_CONCURRENCY_LIMIT) {
+        showWorkspaceLimit("extraction", occupied);
+        return;
+      }
+    }
+    const targetImage = workflow.image;
+    const token: WorkflowOperationToken = {
+      workflowId: workflow.id,
+      operationId: crypto.randomUUID(),
+      revision: workflow.revision
+    };
+    commitExtractionWorkflows((current) =>
+      updateWorkflowById(current, workflow.id, (item) => ({
+        ...item,
+        operationId: token.operationId,
+        status: "running",
+        stage: "analyzing",
+        statusMessage: "准备分析",
+        error: "",
+        subjectImage: null,
+        fusedPrompt: "",
+        fusedPromptJson: null,
+        fuseError: "",
+        fuseControls: defaultFuseControls,
+        selectedFuseMode: null,
+        productInfoText: ""
+      }))
+    );
+    setShowFuseModal(false);
     try {
-      analyzeCanceledRef.current = false;
-      setIsAnalyzing(true);
-      setError("");
-      resetFusionState(true);
-      setStatus("正在压缩图片并准备分析...");
       const modelImageDataUrl = await createModelImage(targetImage.dataUrl);
-      setStatus("正在分析图片风格，并抽象为通用 JSON...");
+      commitExtractionWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({ ...item, statusMessage: "图片解析中" }))
+      );
       const response = await window.styleExtractor.analyzeImage({
+        workflowId: token.workflowId,
+        operationId: token.operationId,
+        revision: token.revision,
         imageDataUrl: modelImageDataUrl,
         mimeType: getMimeTypeFromDataUrl(modelImageDataUrl),
         strictGeneralization: strictGeneralizationRef.current,
         sourceCapture: targetImage.sourceCapture
       });
-      setAnalysis(response.analysis);
-      setRawText(response.rawText);
+      if (
+        response.workflowId !== token.workflowId ||
+        response.operationId !== token.operationId ||
+        response.revision !== token.revision ||
+        !isWorkflowOperationCurrent(
+          extractionWorkflowsRef.current.find((item) => item.id === token.workflowId),
+          token
+        )
+      ) return;
       const initialExtractedText = extractedTextFromAnalysis(response.analysis);
-      setEditedTextMarkdown(initialExtractedText);
-      setStatus(response.repaired ? "分析完成，已自动提取模型返回中的 JSON。" : "分析完成。");
       const historyImageDataUrl = await createHistoryImage(targetImage.dataUrl);
       const historyThumbnailDataUrl = await createThumbnail(historyImageDataUrl);
 
-      const itemId = crypto.randomUUID();
+      const itemId = workflow.historyItemId || crypto.randomUUID();
       const item: HistoryItem = {
         id: itemId,
-        createdAt: new Date().toISOString(),
+        createdAt: history.find((entry) => entry.id === itemId)?.createdAt || new Date().toISOString(),
         imageDataUrl: historyImageDataUrl,
         mimeType: getMimeTypeFromDataUrl(historyImageDataUrl),
         fileName: targetImage.fileName,
@@ -2361,25 +4038,64 @@ export function App(): JSX.Element {
         analysis: response.analysis,
         editedTextMarkdown: initialExtractedText || undefined
       };
-      const nextHistory = await window.styleExtractor.saveHistoryItem(item);
-      setActiveHistoryId(itemId);
+      const expectedHistoryEpoch = response.historyEpochAtStart ?? historyEpochRef.current;
+      const nextHistory = await window.styleExtractor.saveHistoryItem({
+        item,
+        expectedHistoryEpoch
+      });
+      if (historyEpochRef.current !== expectedHistoryEpoch) return;
       setHistory(nextHistory);
+      commitExtractionWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (entry) => ({
+          ...entry,
+          revision: entry.revision + 1,
+          operationId: undefined,
+          status: "succeeded",
+          stage: "analysis_ready",
+          statusMessage: "已解析，可融合",
+          analysis: response.analysis,
+          rawText: response.rawText,
+          editedTextMarkdown: initialExtractedText,
+          historyItemId: itemId,
+          error: ""
+        }))
+      );
     } catch (analyzeError) {
-      if (analyzeCanceledRef.current) return;
-      setError(analyzeError instanceof Error ? analyzeError.message : String(analyzeError));
-      setStatus("");
-    } finally {
-      setIsAnalyzing(false);
-      analyzeCanceledRef.current = false;
+      const message = analyzeError instanceof Error ? analyzeError.message : String(analyzeError);
+      commitExtractionWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          revision: item.revision + 1,
+          operationId: undefined,
+          status: "failed",
+          stage: "analyzing",
+          statusMessage: "分析失败",
+          error: message
+        }))
+      );
     }
   };
 
   const cancelAnalyze = async () => {
-    analyzeCanceledRef.current = true;
-    await window.styleExtractor.cancelAnalyzeImage();
-    setIsAnalyzing(false);
+    const workflow = extractionWorkflowsRef.current.find((item) => item.id === activeExtractionWorkflowId);
+    if (!workflow?.operationId || workflow.stage !== "analyzing") return;
+    const operationId = workflow.operationId;
+    await window.styleExtractor.cancelAnalyzeImage(operationId);
+    commitExtractionWorkflows((current) =>
+      updateWorkflowById(current, workflow.id, (item) =>
+        item.operationId === operationId
+          ? {
+              ...item,
+              revision: item.revision + 1,
+              operationId: undefined,
+              status: "canceled",
+              statusMessage: "已取消",
+              error: ""
+            }
+          : item
+      )
+    );
     setStatus("已取消图片分析。");
-    setError("");
   };
 
   const exportJson = async () => {
@@ -2403,15 +4119,19 @@ export function App(): JSX.Element {
   };
 
   const persistEditedText = async () => {
-    if (!activeHistoryId) return;
-    const targetHistoryItem = history.find((item) => item.id === activeHistoryId);
+    const workflow = extractionWorkflowsRef.current.find((item) => item.id === activeExtractionWorkflowId);
+    if (!workflow?.historyItemId) return;
+    const targetHistoryItem = history.find((item) => item.id === workflow.historyItemId);
     if (!targetHistoryItem) return;
-    if ((targetHistoryItem.editedTextMarkdown ?? "") === editedTextMarkdown) return;
+    if ((targetHistoryItem.editedTextMarkdown ?? "") === workflow.editedTextMarkdown) return;
     try {
-      const nextHistory = await window.styleExtractor.saveHistoryItem({
-        ...targetHistoryItem,
-        editedTextMarkdown: editedTextMarkdown || undefined
+      const expectedHistoryEpoch = historyEpochRef.current;
+      const nextHistory = await window.styleExtractor.patchHistoryItem({
+        id: workflow.historyItemId,
+        expectedHistoryEpoch,
+        editedTextMarkdown: workflow.editedTextMarkdown
       });
+      if (historyEpochRef.current !== expectedHistoryEpoch) return;
       setHistory(nextHistory);
     } catch {
       // 编辑稿保存失败不打断编辑；下次失焦或生成融合提示词时会再尝试保存。
@@ -2424,102 +4144,148 @@ export function App(): JSX.Element {
   };
 
   const generateFusionPrompt = async () => {
-    if (!analysis) {
+    const workflow = extractionWorkflowsRef.current.find((item) => item.id === activeExtractionWorkflowId);
+    if (!workflow?.analysis) {
       setFuseError("请先完成参考图的提示词解析。");
       return;
     }
-    const activeFuseMode = fuseMode;
-    if (activeFuseMode === "subject_reference" && !subjectImage) {
+    if (workflow.operationId || workflow.status === "queued" || workflow.status === "running") return;
+    const activeFuseMode = resolveFuseMode(workflow.analysis, workflow.selectedFuseMode);
+    if (activeFuseMode === "subject_reference" && !workflow.subjectImage) {
       setFuseError("请先上传主体参考图。");
       return;
     }
-    if (activeFuseMode === "information_layout" && !subjectImage && !productInfoText.trim()) {
+    if (activeFuseMode === "information_layout" && !workflow.subjectImage && !workflow.productInfoText.trim()) {
       setFuseError("请先输入新产品信息，或上传一张产品信息图。");
       return;
     }
-    const activeSubjectImage = subjectImage;
+    if (isWorkspaceStatusTerminal(workflow.status)) {
+      const occupied = countActiveWorkflows(extractionWorkflowsRef.current);
+      if (occupied >= WORKSPACE_CONCURRENCY_LIMIT) {
+        showWorkspaceLimit("extraction", occupied);
+        return;
+      }
+    }
     const activeConfig = configRef.current;
     if (!activeConfig.hasApiKey) {
       setShowConfig(true);
       setFuseError("请先填写模型 API Key。");
       return;
     }
-
+    const token: WorkflowOperationToken = {
+      workflowId: workflow.id,
+      operationId: crypto.randomUUID(),
+      revision: workflow.revision
+    };
+    commitExtractionWorkflows((current) =>
+      updateWorkflowById(current, workflow.id, (item) => ({
+        ...item,
+        operationId: token.operationId,
+        status: "running",
+        stage: "fusing",
+        statusMessage: "融合中",
+        fusedPrompt: "",
+        fusedPromptJson: null,
+        fuseError: ""
+      }))
+    );
     try {
-      fuseCanceledRef.current = false;
-      setIsFusing(true);
-      setFuseError("");
-      setFusedPrompt("");
-      setFusedPromptJson(null);
-      setStatus(activeFuseMode === "information_layout" ? "正在准备产品信息布局输入..." : "正在准备主体融合输入...");
-      const subjectImageDataUrl = activeSubjectImage ? await createModelImage(activeSubjectImage.dataUrl) : undefined;
-      setStatus(activeFuseMode === "information_layout" ? "正在生成产品信息布局提示词..." : "正在生成主体融合提示词...");
+      const subjectImageDataUrl = workflow.subjectImage ? await createModelImage(workflow.subjectImage.dataUrl) : undefined;
       const response = await window.styleExtractor.fusePrompt({
-        styleAnalysis: analysis,
+        workflowId: token.workflowId,
+        operationId: token.operationId,
+        revision: token.revision,
+        styleAnalysis: workflow.analysis,
         mode: activeFuseMode,
         subjectImageDataUrl,
-        productInfoText,
-        editedTextMarkdown: fuseControls.useExtractedText ? editedTextMarkdown : undefined,
-        controls: fuseControls
+        productInfoText: workflow.productInfoText,
+        editedTextMarkdown: workflow.fuseControls.useExtractedText ? workflow.editedTextMarkdown : undefined,
+        controls: workflow.fuseControls
       });
-      setFusedPrompt(response.result.fused_prompt);
-      setFusedPromptJson(response.result.fused_prompt_json);
-      if (activeHistoryId) {
-        const targetHistoryItem = history.find((item) => item.id === activeHistoryId);
-        if (targetHistoryItem) {
-          const nextHistory = await window.styleExtractor.saveHistoryItem({
-            ...targetHistoryItem,
-            analysis,
-            editedTextMarkdown: editedTextMarkdown || undefined,
-            fusedPromptResult: response.result,
-            fusedPromptCreatedAt: new Date().toISOString()
-          });
-          setHistory(nextHistory);
-        }
-      }
-      const referenceSynced = await syncFusionImageToGenerationReferences(
-        activeSubjectImage,
-        activeFuseMode,
-        subjectImageDataUrl
+      if (
+        response.workflowId !== token.workflowId ||
+        response.operationId !== token.operationId ||
+        response.revision !== token.revision ||
+        !isWorkflowOperationCurrent(
+          extractionWorkflowsRef.current.find((item) => item.id === token.workflowId),
+          token
+        )
+      ) return;
+      if (!workflow.historyItemId) throw new Error("关联历史已变更，融合结果未保存。");
+      const expectedHistoryEpoch = response.historyEpochAtStart ?? historyEpochRef.current;
+      const nextHistory = await window.styleExtractor.patchHistoryItem({
+        id: workflow.historyItemId,
+        expectedHistoryEpoch,
+        editedTextMarkdown: workflow.editedTextMarkdown,
+        fusedPromptResult: response.result,
+        fusedPromptCreatedAt: new Date().toISOString()
+      });
+      if (historyEpochRef.current !== expectedHistoryEpoch) return;
+      setHistory(nextHistory);
+      commitExtractionWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          revision: item.revision + 1,
+          operationId: undefined,
+          status: "succeeded",
+          stage: "fused",
+          statusMessage: "已完成",
+          fusedPrompt: response.result.fused_prompt,
+          fusedPromptJson: response.result.fused_prompt_json,
+          fuseError: ""
+        }))
       );
-      const doneText = activeFuseMode === "information_layout" ? "产品信息布局提示词已生成。" : "融合提示词已生成。";
-      const referenceText = referenceSynced ? "用于融合的图片已同步到生图工作台参考图。" : "";
-      setStatus(response.repaired ? `${doneText}并已自动修正为完整中文。${referenceText}` : `${doneText}${referenceText}`);
     } catch (fusePromptError) {
-      if (fuseCanceledRef.current) return;
-      setFuseError(fusePromptError instanceof Error ? fusePromptError.message : String(fusePromptError));
-      setStatus("");
-    } finally {
-      setIsFusing(false);
-      fuseCanceledRef.current = false;
+      const message = fusePromptError instanceof Error ? fusePromptError.message : String(fusePromptError);
+      commitExtractionWorkflows((current) =>
+        updateWorkflowForOperation(current, token, (item) => ({
+          ...item,
+          revision: item.revision + 1,
+          operationId: undefined,
+          status: "failed",
+          stage: "fusing",
+          statusMessage: "融合失败",
+          fuseError: message
+        }))
+      );
     }
   };
 
   const cancelFusionPrompt = async () => {
-    fuseCanceledRef.current = true;
-    await window.styleExtractor.cancelFusePrompt();
-    setIsFusing(false);
+    const workflow = extractionWorkflowsRef.current.find((item) => item.id === activeExtractionWorkflowId);
+    if (!workflow?.operationId || workflow.stage !== "fusing") return;
+    const operationId = workflow.operationId;
+    await window.styleExtractor.cancelFusePrompt(operationId);
+    commitExtractionWorkflows((current) =>
+      updateWorkflowById(current, workflow.id, (item) =>
+        item.operationId === operationId
+          ? {
+              ...item,
+              revision: item.revision + 1,
+              operationId: undefined,
+              status: "canceled",
+              statusMessage: "已取消",
+              fuseError: ""
+            }
+          : item
+      )
+    );
     setStatus("已取消提示词生成。");
-    setFuseError("");
   };
 
   const loadHistory = (item: HistoryItem) => {
-    const historyImage = historyItemToImageState(item);
-    if (historyImage) setImage(historyImage);
-    setAnalysis(item.analysis);
-    setRawText("");
-    setActiveHistoryId(item.id);
-    setError("");
-    setEditedTextMarkdown(item.editedTextMarkdown ?? extractedTextFromAnalysis(item.analysis));
-    setSubjectImage(null);
+    const existing = extractionWorkflowsRef.current.find((workflow) => workflow.historyItemId === item.id);
+    if (existing) {
+      setActiveExtractionWorkflowId(existing.id);
+      return;
+    }
+    const workflow = extractionWorkflowFromHistory(item);
+    const next = [workflow, ...extractionWorkflowsRef.current];
+    extractionWorkflowsRef.current = next;
+    setExtractionWorkflowsState(next);
+    setActiveExtractionWorkflowId(workflow.id);
     setIsSubjectDragging(false);
-    setFusedPrompt(item.fusedPromptResult?.fused_prompt ?? "");
-    setFusedPromptJson(item.fusedPromptResult?.fused_prompt_json ?? null);
-    setFuseError("");
     setFuseCopied("");
-    setFuseControls(defaultFuseControls);
-    setSelectedFuseMode(null);
-    setProductInfoText("");
     setShowFuseModal(false);
     const historyStatus = item.imageDataUrl
       ? "已载入历史图片和分析结果，可重新分析。"
@@ -2529,17 +4295,58 @@ export function App(): JSX.Element {
 
   const clearHistory = async () => {
     if (history.length > 0 && !window.confirm("确定清空全部图片分析历史记录吗？")) return;
-    await window.styleExtractor.clearHistory();
-    setHistory([]);
-    setActiveHistoryId("");
+    const operations = extractionWorkflowsRef.current
+      .filter((workflow) => Boolean(workflow.operationId))
+      .map((workflow) => ({ operationId: workflow.operationId as string, stage: workflow.stage }));
+    const clearRequest = window.styleExtractor.clearHistory();
+    commitExtractionWorkflows((current) =>
+      current
+        .filter((workflow) => !workflow.historyItemId)
+        .map((workflow) => ({
+          ...workflow,
+          ...(workflow.operationId
+            ? {
+                revision: workflow.revision + 1,
+                operationId: undefined,
+                status: "canceled" as const,
+                statusMessage: "历史已清空，操作已取消"
+              }
+            : {})
+        }))
+    );
+    if (activeExtractionWorkflow?.historyItemId) setActiveExtractionWorkflowId("");
+    setShowFuseModal(false);
+    const cancelRequest = runWithConcurrency(operations, 2, async (operation) => {
+      try {
+        if (operation.stage === "analyzing") {
+          await window.styleExtractor.cancelAnalyzeImage(operation.operationId);
+        } else if (operation.stage === "fusing") {
+          await window.styleExtractor.cancelFusePrompt(operation.operationId);
+        }
+      } catch {
+        // Epoch and operation-token invalidation remain authoritative if cancellation races completion.
+      }
+    });
+    await clearRequest;
+    await cancelRequest;
+    const snapshot = await window.styleExtractor.getHistorySnapshot();
+    setHistory(snapshot.items);
+    historyEpochRef.current = snapshot.epoch;
+    setHistoryEpoch(snapshot.epoch);
     setStatus("历史记录已清空。");
   };
 
   const deleteHistoryItem = async (item: HistoryItem) => {
     if (!window.confirm("确定删除这条图片分析历史记录吗？")) return;
-    const nextHistory = await window.styleExtractor.deleteHistoryItem(item.id);
+    const expectedHistoryEpoch = historyEpochRef.current;
+    const nextHistory = await window.styleExtractor.deleteHistoryItem({
+      id: item.id,
+      expectedHistoryEpoch
+    });
+    if (historyEpochRef.current !== expectedHistoryEpoch) return;
     setHistory(nextHistory);
-    if (activeHistoryId === item.id) setActiveHistoryId("");
+    commitExtractionWorkflows((current) => current.filter((workflow) => workflow.historyItemId !== item.id));
+    if (activeExtractionWorkflow?.historyItemId === item.id) setActiveExtractionWorkflowId("");
     setStatus("已删除此条历史记录。");
   };
 
@@ -2554,30 +4361,38 @@ export function App(): JSX.Element {
   const clearAllLocalData = async () => {
     const windowsDataNotice = isWindows ? "、Cookie、Local Storage 和 Electron 运行时缓存" : "";
     if (!window.confirm(`确定抹除模型配置、API Key、图片分析历史、生图任务、改图任务${windowsDataNotice}吗？这个操作不可恢复。`)) return;
+    generationTaskEpochRef.current += 1;
+    imageEditTaskEpochRef.current += 1;
+    deletedGenerationTaskIdsRef.current.clear();
+    deletedImageEditTaskIdsRef.current.clear();
     const cleared = await window.styleExtractor.clearAllLocalData();
+    const historySnapshot = await window.styleExtractor.getHistorySnapshot();
     setConfig(cleared);
     setDraftConfig({ ...cleared, apiKey: "" });
-    setHistory([]);
-    setAnalysis(null);
-    setRawText("");
-    setActiveHistoryId("");
-    setEditedTextMarkdown("");
-    setGenerationPrompt("");
-    setGenerationPromptSource(null);
-    setGenerationReferenceImages([]);
+    setHistory(historySnapshot.items);
+    historyEpochRef.current = historySnapshot.epoch;
+    setHistoryEpoch(historySnapshot.epoch);
+    extractionWorkflowsRef.current = [];
+    generationWorkflowsRef.current = [];
+    imageEditWorkflowsRef.current = [];
+    setExtractionWorkflowsState([]);
+    setGenerationWorkflowsState([]);
+    setImageEditWorkflowsState([]);
+    setActiveExtractionWorkflowId("");
+    setActiveGenerationWorkflowId("");
+    setActiveImageEditWorkflowId("");
+    generationPollSequenceRef.current += 1;
+    imageEditPollSequenceRef.current += 1;
+    generationTasksRef.current = [];
+    imageEditTasksRef.current = [];
+    workflowLineageMarkerRegistryRef.current.clear();
+    resetDismissedHandoffs();
     setGenerationTasks([]);
     setCollapsedGenerationTaskIds([]);
     setGenerationConfig(defaultGenerationConfig);
     setGenerationDraft(defaultGenerationDraft);
-    setGenerationSettings(defaultGenerationSettings);
-    setImageEditSource(null);
-    setImageEditAnnotations([]);
-    setImageEditRegenerationContext(null);
-    setImageEditAnnotationResolution(null);
-    setImageEditInstruction("");
-    setImageEditSettings(defaultImageEditSettings);
     setImageEditTasks([]);
-    resetFusionState(true);
+    setShowFuseModal(false);
     setStatus(
       isWindows
         ? "本机模型配置、API Key、图片历史记录、生图任务、改图任务和 Windows 运行时浏览数据已全部抹除。"
@@ -2585,6 +4400,334 @@ export function App(): JSX.Element {
     );
     setShowConfig(false);
   };
+
+  const workflowLineageMarkers = useMemo(() => {
+    const lineageKeys = resolveWorkflowLineageKeys({
+      extractionWorkflows,
+      generationTasks,
+      generationWorkflows,
+      imageEditTasks,
+      imageEditWorkflows
+    });
+    const markerByKey = createWorkflowLineageMarkerMap(
+      [
+        ...lineageKeys.extraction.values(),
+        ...lineageKeys.generation.values(),
+        ...lineageKeys.imageEdit.values(),
+        ...lineageKeys.generationTasks.values(),
+        ...lineageKeys.imageEditTasks.values()
+      ],
+      workflowLineageMarkerRegistryRef.current
+    );
+    workflowLineageMarkerRegistryRef.current = markerByKey;
+    const markersFor = (keys: ReadonlyMap<string, string>): Map<string, WorkflowLineageMarker> =>
+      new Map(
+        Array.from(keys, ([workflowId, key]) => [
+          workflowId,
+          workflowLineageMarkerForKey(markerByKey, key)
+        ])
+      );
+
+    return {
+      extraction: markersFor(lineageKeys.extraction),
+      generation: markersFor(lineageKeys.generation),
+      generationTasks: markersFor(lineageKeys.generationTasks),
+      imageEdit: markersFor(lineageKeys.imageEdit),
+      imageEditTasks: markersFor(lineageKeys.imageEditTasks)
+    };
+  }, [extractionWorkflows, generationTasks, generationWorkflows, imageEditTasks, imageEditWorkflows]);
+
+  const extractionNavigationItems: WorkflowNavigatorItem[] = extractionWorkflows.map((workflow) => ({
+    id: workflow.id,
+    lineageMarker: workflowLineageMarkers.extraction.get(workflow.id) || 1,
+    title: workflow.displayName,
+    subtitle: workflow.statusMessage,
+    status: workflow.status,
+    thumbnailDataUrl: workflow.image?.thumbnailDataUrl,
+    error: workflow.error || workflow.fuseError
+  }));
+  const representedExtractionDraftLineageKeys = new Set(
+    generationWorkflows
+      .filter((workflow) => !workflow.taskId)
+      .map((workflow) => generationPromptSourceLineageKey(workflow.promptSource))
+      .filter(Boolean)
+  );
+  const representedExtractionTaskHandoffKeys = new Set(
+    [
+      ...generationWorkflows.filter((workflow) => workflow.taskId).map((workflow) => workflow.promptSource),
+      ...generationTasks.map((task) => task.promptSource)
+    ]
+      .map(generationPromptSourceHandoffKey)
+      .filter(Boolean)
+  );
+  const pendingGenerationHandoffs = extractionWorkflows
+    .filter(
+      (workflow) => {
+        const handoffKey = extractionGenerationHandoffKey(
+          workflow,
+          workflow.fusedPrompt.trim() ? "fused" : "text_to_image"
+        );
+        return (
+          Boolean(workflow.analysis) &&
+          isWorkspaceStatusTerminal(workflow.status) &&
+          !representedExtractionDraftLineageKeys.has(extractionWorkflowLineageKey(workflow)) &&
+          !representedExtractionTaskHandoffKeys.has(handoffKey) &&
+          !dismissedGenerationHandoffKeys.has(handoffKey)
+        );
+      }
+    )
+    .map((sourceWorkflow) => {
+      const handoffKey = extractionGenerationHandoffKey(
+        sourceWorkflow,
+        sourceWorkflow.fusedPrompt.trim() ? "fused" : "text_to_image"
+      );
+      return {
+        id: `pending-generation:${sourceWorkflow.id}`,
+        handoffKey,
+        sourceWorkflow
+      };
+    });
+  const pendingGenerationHandoffById = new Map(
+    pendingGenerationHandoffs.map((handoff) => [handoff.id, handoff.sourceWorkflow])
+  );
+  const generationNavigationItems: WorkflowNavigatorItem[] = [
+    ...generationWorkflows.map((workflow) => ({
+      id: workflow.id,
+      lineageMarker: workflowLineageMarkers.generation.get(workflow.id) || 1,
+      title: workflow.displayName,
+      subtitle: workflow.statusMessage,
+      status: workflow.status,
+      thumbnailDataUrl:
+        workflow.promptSource?.sourceThumbnailDataUrl || workflow.referenceImages[0]?.thumbnailDataUrl,
+      error: workflow.error
+    })),
+    ...pendingGenerationHandoffs.map(({ id, sourceWorkflow }) => ({
+      id,
+      lineageMarker: workflowLineageMarkers.extraction.get(sourceWorkflow.id) || 1,
+      title: sourceWorkflow.displayName,
+      subtitle: "待处理",
+      status: "setup" as const,
+      thumbnailDataUrl: sourceWorkflow.image?.thumbnailDataUrl,
+      countsTowardCapacity: false,
+      closeLabel: `移除记录 ${sourceWorkflow.displayName}`,
+      closeTitle: "移除此条记录"
+    }))
+  ];
+  const representedGenerationOutputKeys = new Set(
+    [
+      ...imageEditWorkflows.map((workflow) => imageEditSourceHandoffKey(workflow.source)),
+      ...imageEditTasks.map((task) => imageEditSourceHandoffKey(task.sourceImage))
+    ].filter(Boolean)
+  );
+  const pendingImageEditHandoffs = generationTasks
+    .filter(
+      (task) =>
+        isWorkspaceStatusTerminal(task.status) && generationTaskVisibility(task) === "active"
+    )
+    .flatMap((task) =>
+      task.outputs.flatMap((output, index) => {
+        const outputKey = generationOutputHandoffKey(task.id, output.id);
+        if (
+          representedGenerationOutputKeys.has(outputKey) ||
+          dismissedImageEditHandoffKeys.has(outputKey)
+        ) return [];
+        return [{
+          id: `pending-image-edit:${task.id}:${output.id}`,
+          handoffKey: outputKey,
+          task,
+          output,
+          index
+        }];
+      })
+    );
+  const pendingImageEditHandoffById = new Map(
+    pendingImageEditHandoffs.map((handoff) => [handoff.id, handoff])
+  );
+  const imageEditNavigationItems: WorkflowNavigatorItem[] = [
+    ...imageEditWorkflows.map((workflow) => ({
+      id: workflow.id,
+      lineageMarker: workflowLineageMarkers.imageEdit.get(workflow.id) || 1,
+      title: workflow.displayName,
+      subtitle: workflow.statusMessage,
+      status: workflow.status,
+      thumbnailDataUrl: workflow.source?.thumbnailDataUrl,
+      error: workflow.error
+    })),
+    ...pendingImageEditHandoffs.map(({ id, index, output, task }) => ({
+      id,
+      lineageMarker: workflowLineageMarkers.generationTasks.get(task.id) || 1,
+      title: `${task.promptSource.sourceFileName || task.promptSource.label} · ${String(index + 1).padStart(2, "0")}`,
+      subtitle: "待处理",
+      status: "setup" as const,
+      thumbnailDataUrl: output.dataUrl,
+      countsTowardCapacity: false,
+      closeLabel: `移除记录 ${task.promptSource.sourceFileName || task.promptSource.label}`,
+      closeTitle: "移除此条记录"
+    }))
+  ];
+  const visibleGenerationTasks = activeGenerationWorkflow?.taskId
+    ? generationTasks.filter((task) => task.id === activeGenerationWorkflow.taskId)
+    : [];
+  const visibleImageEditTasks = activeImageEditWorkflow?.taskId
+    ? imageEditTasks.filter((task) => task.id === activeImageEditWorkflow.taskId)
+    : [];
+  const activeExtractionLineageMarker = activeExtractionWorkflow
+    ? workflowLineageMarkers.extraction.get(activeExtractionWorkflow.id) || 1
+    : 1;
+  const activeGenerationLineageMarker = activeGenerationWorkflow
+    ? workflowLineageMarkers.generation.get(activeGenerationWorkflow.id) || 1
+    : 1;
+  const activeImageEditLineageMarker = activeImageEditWorkflow
+    ? workflowLineageMarkers.imageEdit.get(activeImageEditWorkflow.id) || 1
+    : 1;
+
+  const clearGenerationWorkspaceHistory = async () => {
+    const terminalTasks = generationTasksRef.current.filter((task) => isWorkspaceStatusTerminal(task.status));
+    if (!terminalTasks.length && !pendingGenerationHandoffs.length) return;
+    if (!window.confirm("确定清空生图工作区的历史记录吗？")) return;
+
+    dismissHandoffs(
+      "generation",
+      pendingGenerationHandoffs.map((handoff) => handoff.handoffKey)
+    );
+    let nextTasks = generationTasksRef.current;
+    const deletedIds = new Set<string>();
+    const deletedSourceKeys: string[] = [];
+    let failure = "";
+    for (const task of terminalTasks) {
+      try {
+        nextTasks = await window.styleExtractor.deleteGenerationTask(task.id);
+        deletedIds.add(task.id);
+        deletedGenerationTaskIdsRef.current.add(task.id);
+        deletedSourceKeys.push(generationPromptSourceHandoffKey(task.promptSource));
+      } catch (deleteError) {
+        failure = deleteError instanceof Error ? deleteError.message : String(deleteError);
+        break;
+      }
+    }
+    dismissHandoffs("generation", deletedSourceKeys);
+    generationPollSequenceRef.current += 1;
+    generationTasksRef.current = nextTasks;
+    setGenerationTasks(nextTasks);
+    commitGenerationWorkflows((current) => current.filter((workflow) => !workflow.taskId || !deletedIds.has(workflow.taskId)));
+    if (activeGenerationWorkflow?.taskId && deletedIds.has(activeGenerationWorkflow.taskId)) {
+      setActiveGenerationWorkflowId("");
+    }
+    if (selectedGenerationTaskId && deletedIds.has(selectedGenerationTaskId)) setSelectedGenerationTaskId("");
+    setCollapsedGenerationTaskIds((current) => current.filter((id) => !deletedIds.has(id)));
+    setStatus(failure ? `部分生图历史未能删除：${failure}` : "生图工作区历史已清空。");
+  };
+
+  const clearImageEditWorkspaceHistory = async () => {
+    const terminalTasks = imageEditTasksRef.current.filter((task) => isWorkspaceStatusTerminal(task.status));
+    if (!terminalTasks.length && !pendingImageEditHandoffs.length) return;
+    if (!window.confirm("确定清空改图工作区的历史记录吗？")) return;
+
+    dismissHandoffs(
+      "image_edit",
+      pendingImageEditHandoffs.map((handoff) => handoff.handoffKey)
+    );
+    let nextTasks = imageEditTasksRef.current;
+    const deletedIds = new Set<string>();
+    const deletedSourceKeys: string[] = [];
+    let failure = "";
+    for (const task of terminalTasks) {
+      try {
+        nextTasks = await window.styleExtractor.deleteImageEditTask(task.id);
+        deletedIds.add(task.id);
+        deletedImageEditTaskIdsRef.current.add(task.id);
+        deletedSourceKeys.push(imageEditSourceHandoffKey(task.sourceImage));
+      } catch (deleteError) {
+        failure = deleteError instanceof Error ? deleteError.message : String(deleteError);
+        break;
+      }
+    }
+    dismissHandoffs("image_edit", deletedSourceKeys);
+    imageEditPollSequenceRef.current += 1;
+    imageEditTasksRef.current = nextTasks;
+    setImageEditTasks(nextTasks);
+    commitImageEditWorkflows((current) => current.filter((workflow) => !workflow.taskId || !deletedIds.has(workflow.taskId)));
+    if (activeImageEditWorkflow?.taskId && deletedIds.has(activeImageEditWorkflow.taskId)) {
+      setActiveImageEditWorkflowId("");
+    }
+    if (selectedImageEditTaskId && deletedIds.has(selectedImageEditTaskId)) setSelectedImageEditTaskId("");
+    setCollapsedImageEditTaskIds((current) => current.filter((id) => !deletedIds.has(id)));
+    setStatus(failure ? `部分改图历史未能删除：${failure}` : "改图工作区历史已清空。");
+  };
+
+  const closeExtractionWorkflow = (workflowId: string) => {
+    const workflow = extractionWorkflowsRef.current.find((item) => item.id === workflowId);
+    if (!workflow || (!isWorkspaceStatusTerminal(workflow.status) && workflow.status !== "setup")) return;
+    commitExtractionWorkflows((current) => current.filter((item) => item.id !== workflowId));
+    if (activeExtractionWorkflowId === workflowId) setActiveExtractionWorkflowId("");
+  };
+  const closeGenerationWorkflow = (workflowId: string) => {
+    const workflow = generationWorkflowsRef.current.find((item) => item.id === workflowId);
+    if (!workflow || (!isWorkspaceStatusTerminal(workflow.status) && workflow.status !== "setup")) return;
+    commitGenerationWorkflows((current) => current.filter((item) => item.id !== workflowId));
+    if (activeGenerationWorkflowId === workflowId) setActiveGenerationWorkflowId("");
+  };
+  const closeImageEditWorkflow = (workflowId: string) => {
+    const workflow = imageEditWorkflowsRef.current.find((item) => item.id === workflowId);
+    if (!workflow || (!isWorkspaceStatusTerminal(workflow.status) && workflow.status !== "setup")) return;
+    commitImageEditWorkflows((current) => current.filter((item) => item.id !== workflowId));
+    if (activeImageEditWorkflowId === workflowId) setActiveImageEditWorkflowId("");
+  };
+  const closeGenerationNavigationItem = (workflowId: string) => {
+    const handoff = pendingGenerationHandoffs.find((item) => item.id === workflowId);
+    if (handoff) {
+      dismissHandoffs("generation", [handoff.handoffKey]);
+      setStatus("已移除生图工作区记录。");
+      return;
+    }
+    closeGenerationWorkflow(workflowId);
+  };
+  const closeImageEditNavigationItem = (workflowId: string) => {
+    const handoff = pendingImageEditHandoffs.find((item) => item.id === workflowId);
+    if (handoff) {
+      dismissHandoffs("image_edit", [handoff.handoffKey]);
+      setStatus("已移除改图工作区记录。");
+      return;
+    }
+    closeImageEditWorkflow(workflowId);
+  };
+  const selectGenerationNavigationItem = (workflowId: string) => {
+    const sourceWorkflow = pendingGenerationHandoffById.get(workflowId);
+    if (sourceWorkflow) {
+      void openPendingGenerationHandoff(sourceWorkflow.id);
+      return;
+    }
+    setActiveGenerationWorkflowId(workflowId);
+  };
+  const selectImageEditNavigationItem = (workflowId: string) => {
+    const handoff = pendingImageEditHandoffById.get(workflowId);
+    if (handoff) {
+      void sendGenerationOutputToImageEdit(handoff.task, handoff.output, handoff.index);
+      return;
+    }
+    setActiveImageEditWorkflowId(workflowId);
+  };
+  const createBlankGenerationWorkflow = () => {
+    reserveGenerationWorkflow(createGenerationWorkflow({ displayName: "手动生图" }));
+  };
+  const setImageEditActiveTool = (value: ImageEditTool) =>
+    updateActiveImageEdit((workflow) => ({ ...workflow, activeTool: value }));
+  const setImageEditAnnotationColor = (value: string) =>
+    updateActiveImageEdit((workflow) => ({ ...workflow, annotationColor: value }));
+  const setImageEditAnnotationText = (value: string) =>
+    updateActiveImageEdit((workflow) => ({ ...workflow, annotationText: value }));
+  const activeViewError =
+    activeView === "extract" ? error || fuseError : activeView === "generate" ? generationError : imageEditError;
+  const liveCapacityDialogOccupied = !capacityDialog
+    ? 0
+    : capacityDialog.workspace === "extraction"
+      ? countActiveWorkflows(extractionWorkflows)
+      : capacityDialog.workspace === "generation"
+        ? countActiveWorkflows(generationWorkflows)
+        : countActiveWorkflows(imageEditWorkflows);
+  const capacityDialogOccupied = capacityDialog
+    ? Math.min(WORKSPACE_CONCURRENCY_LIMIT, Math.max(capacityDialog.occupied, liveCapacityDialogOccupied))
+    : 0;
 
   return (
     <main className="app-shell">
@@ -2619,7 +4762,11 @@ export function App(): JSX.Element {
           <FileJson size={18} />
           提示词提取
         </button>
-        <button className={activeView === "generate" ? "active" : ""} onClick={() => setActiveView("generate")} type="button">
+        <button
+          className={activeView === "generate" ? "active" : ""}
+          onClick={() => void openGenerationWorkspace()}
+          type="button"
+        >
           <Sparkles size={18} />
           生图工作台
         </button>
@@ -2629,14 +4776,35 @@ export function App(): JSX.Element {
         </button>
       </nav>
 
-      {(status || error) && (
-        <section className={error ? "notice error" : "notice"}>
-          {error ? <AlertCircle size={18} /> : <Check size={18} />}
-          <span>{error || status}</span>
+      {(status || activeViewError) && (
+        <section className={activeViewError ? "notice error" : "notice"}>
+          {activeViewError ? <AlertCircle size={18} /> : <Check size={18} />}
+          <span>{activeViewError || status}</span>
         </section>
       )}
 
-      {activeView === "extract" && <section className="workspace">
+      {activeView === "extract" && (
+        <section className="workflow-shell">
+          <WorkflowNavigator
+            activeId={activeExtractionWorkflowId}
+            collapseCompleted={collapseCompletedExtraction}
+            items={extractionNavigationItems}
+            onAdd={() => fileInputRef.current?.click()}
+            onClearHistory={history.length > 0 ? clearHistory : undefined}
+            onClose={closeExtractionWorkflow}
+            onSelect={setActiveExtractionWorkflowId}
+            onToggleCompleted={() => setCollapseCompletedExtraction((current) => !current)}
+            workspace="extraction"
+          />
+          <div className="workflow-detail">
+            {!activeExtractionWorkflow ? (
+              <WorkspaceBlankState
+                actionLabel="上传多张图片"
+                description="当前没有图片解析流程。"
+                onAction={() => fileInputRef.current?.click()}
+              />
+            ) : (
+              <section className="workspace">
         <aside className="left-panel">
           <div
             className={`upload-zone ${isDragging ? "dragging" : ""}`}
@@ -2670,7 +4838,7 @@ export function App(): JSX.Element {
 
           {image && (
             <div className="source-meta">
-              <ImagePlus size={17} />
+              <WorkflowLineageBadge marker={activeExtractionLineageMarker} />
               <span>
                 <strong>{getSourceLabel(image.sourceCapture)}</strong>
                 {image.sourceCapture.domain ? ` · ${image.sourceCapture.domain}` : ""}
@@ -2695,14 +4863,6 @@ export function App(): JSX.Element {
               </button>
             )}
           </div>
-          <input
-            accept="image/*"
-            hidden
-            onChange={onFileChange}
-            ref={fileInputRef}
-            type="file"
-          />
-
           <div className="hint-box">
             <Clipboard size={18} />
             <span>图片里的文字只用于判断层级和排版，默认不会要求模型照抄文案、品牌、价格或数据。</span>
@@ -2919,13 +5079,44 @@ export function App(): JSX.Element {
             </details>
           )}
         </section>
-      </section>}
+              </section>
+            )}
+          </div>
+        </section>
+      )}
 
       {activeView === "generate" && (
-        <GenerationWorkspace
+        <section className="workflow-shell">
+          <WorkflowNavigator
+            activeId={activeGenerationWorkflowId}
+            collapseCompleted={collapseCompletedGeneration}
+            items={generationNavigationItems}
+            onAdd={createBlankGenerationWorkflow}
+            onClearHistory={
+              generationTasks.some((task) => isWorkspaceStatusTerminal(task.status)) || pendingGenerationHandoffs.length > 0
+                ? clearGenerationWorkspaceHistory
+                : undefined
+            }
+            onClose={closeGenerationNavigationItem}
+            onSelect={selectGenerationNavigationItem}
+            onToggleCompleted={() => setCollapseCompletedGeneration((current) => !current)}
+            workspace="generation"
+          />
+          <div className="workflow-detail">
+            {!activeGenerationWorkflow ? (
+              <WorkspaceBlankState
+                actionLabel="新建生图流程"
+                description="当前没有生图流程。"
+                onAction={createBlankGenerationWorkflow}
+              />
+            ) : (
+              <GenerationWorkspace
+          key={activeGenerationWorkflow.id}
+          lineageMarker={activeGenerationLineageMarker}
           copiedKey={generationCopied}
           collapsedTaskIds={collapsedGenerationTaskIds}
           error={generationError}
+          formLocked={Boolean(activeGenerationWorkflow.taskId) || isGeneratingImage}
           isGenerating={isGeneratingImage}
           onClearTasks={clearGenerationTasks}
           onCancelTask={cancelGenerationTask}
@@ -2962,23 +5153,58 @@ export function App(): JSX.Element {
           setSettings={setGenerationSettings}
           settings={generationSettings}
           selectedTaskId={selectedGenerationTaskId}
-          tasks={generationTasks}
+          tasks={visibleGenerationTasks}
           backendActionLabel={generationBackendActionLabel(generationConfig)}
           backendReady={generationBackendReady}
-        />
+              />
+            )}
+          </div>
+        </section>
       )}
 
       {activeView === "edit" && (
-        <ImageEditWorkspace
+        <section className="workflow-shell">
+          <WorkflowNavigator
+            activeId={activeImageEditWorkflowId}
+            collapseCompleted={collapseCompletedImageEdit}
+            items={imageEditNavigationItems}
+            onAdd={() => imageEditSourceInputRef.current?.click()}
+            onClearHistory={
+              imageEditTasks.some((task) => isWorkspaceStatusTerminal(task.status)) || pendingImageEditHandoffs.length > 0
+                ? clearImageEditWorkspaceHistory
+                : undefined
+            }
+            onClose={closeImageEditNavigationItem}
+            onSelect={selectImageEditNavigationItem}
+            onToggleCompleted={() => setCollapseCompletedImageEdit((current) => !current)}
+            workspace="image_edit"
+          />
+          <div className="workflow-detail">
+            {!activeImageEditWorkflow ? (
+              <WorkspaceBlankState
+                actionLabel="导入多张源图"
+                description="当前没有改图流程。"
+                onAction={() => imageEditSourceInputRef.current?.click()}
+              />
+            ) : (
+              <ImageEditWorkspace
+          key={activeImageEditWorkflow.id}
+          lineageMarker={activeImageEditLineageMarker}
+          workflowId={activeImageEditWorkflow.id}
           annotations={imageEditAnnotations}
+          activeTool={activeImageEditWorkflow.activeTool}
+          annotationColor={activeImageEditWorkflow.annotationColor}
+          annotationText={activeImageEditWorkflow.annotationText}
           backendActionLabel={generationBackendActionLabel(generationConfig)}
           backendReady={generationBackendReady}
           error={imageEditError}
+          formLocked={Boolean(activeImageEditWorkflow.taskId) || isResolvingImageEditAnnotations || isCreatingImageEdit}
           instruction={imageEditInstruction}
           isCreating={isCreatingImageEdit}
           isResolvingAnnotations={isResolvingImageEditAnnotations}
           isDragging={isImageEditDragging}
           onCancelTask={cancelImageEditTask}
+          onCancelResolution={cancelImageEditAnnotationResolution}
           onClearAnnotations={() => setImageEditAnnotations([])}
           onClearTasks={clearImageEditTasks}
           onCreateTask={createImageEditTask}
@@ -2995,6 +5221,9 @@ export function App(): JSX.Element {
           onToggleTaskCollapsed={toggleImageEditTaskCollapsed}
           onSetAnnotationResolution={setImageEditAnnotationResolution}
           onSetAnnotations={setImageEditAnnotations}
+          onSetActiveTool={setImageEditActiveTool}
+          onSetAnnotationColor={setImageEditAnnotationColor}
+          onSetAnnotationText={setImageEditAnnotationText}
           onSetInstruction={setImageEditInstruction}
           onSetRegenerationContext={setImageEditRegenerationContext}
           onSetSettings={setImageEditSettings}
@@ -3015,9 +5244,21 @@ export function App(): JSX.Element {
           collapsedTaskIds={collapsedImageEditTaskIds}
           regenerationContext={imageEditRegenerationContext}
           annotationResolution={imageEditAnnotationResolution}
-          tasks={imageEditTasks}
-        />
+          tasks={visibleImageEditTasks}
+              />
+            )}
+          </div>
+        </section>
       )}
+
+      <input
+        accept="image/*"
+        hidden
+        multiple
+        onChange={onFileChange}
+        ref={fileInputRef}
+        type="file"
+      />
 
       <input
         accept="image/*"
@@ -3031,10 +5272,64 @@ export function App(): JSX.Element {
       <input
         accept="image/*"
         hidden
+        multiple
         onChange={onImageEditSourceChange}
         ref={imageEditSourceInputRef}
         type="file"
       />
+
+      {capacityDialog && (
+        <div className="modal-backdrop capacity-backdrop" onMouseDown={() => setCapacityDialog(null)}>
+          <section
+            aria-labelledby="workspace-capacity-title"
+            aria-modal="true"
+            className="modal capacity-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <div className="capacity-modal-icon" aria-hidden="true">
+              <AlertCircle size={22} />
+            </div>
+            <div className="modal-title">
+              <h2 id="workspace-capacity-title">
+                {capacityDialog.rejectedCount > 0
+                  ? capacityDialog.acceptedCount > 0
+                    ? "部分流程未加入"
+                    : "已达到并发上限"
+                  : "部分图片处理失败"}
+              </h2>
+              <p>
+                {capacityDialog.rejectedCount > 0
+                  ? `${workspaceLabelMap[capacityDialog.workspace]}最多同时处理 ${WORKSPACE_CONCURRENCY_LIMIT} 个流程，当前占用 ${capacityDialogOccupied} / ${WORKSPACE_CONCURRENCY_LIMIT}。`
+                  : "以下文件未能处理，不影响其他合格图片继续加入。"}
+              </p>
+            </div>
+            {capacityDialog.rejectedCount > 0 && (
+              <p className="capacity-modal-summary">
+                {capacityDialog.acceptedCount > 0
+                  ? `本次已加入 ${capacityDialog.acceptedCount} 个流程，另 ${capacityDialog.rejectedCount} 个流程未加入。`
+                  : `本次有 ${capacityDialog.rejectedCount} 个流程未加入。`}
+                请等待任一进行中流程完成后再继续。
+              </p>
+            )}
+            {capacityDialog.failures && capacityDialog.failures.length > 0 && (
+              <div className="capacity-modal-failures">
+                <strong>未能读取的图片</strong>
+                <ul>
+                  {capacityDialog.failures.map((failure, index) => (
+                    <li key={`${failure}-${index}`}>{failure}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <div className="modal-actions">
+              <button autoFocus className="primary-button" onClick={() => setCapacityDialog(null)} type="button">
+                我知道了
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
 
       {editingGenerationReference && (
         <ReferenceImageEditor
@@ -3225,7 +5520,12 @@ export function App(): JSX.Element {
             )}
 
             <div className="button-row fuse-actions">
-              <button className="secondary-button" onClick={() => subjectFileInputRef.current?.click()} type="button">
+              <button
+                className="secondary-button"
+                disabled={isFusing}
+                onClick={() => subjectFileInputRef.current?.click()}
+                type="button"
+              >
                 <Upload size={18} />
                 {fuseMode === "information_layout" ? "选择信息图" : "选择主体图"}
               </button>
@@ -3417,8 +5717,6 @@ export function App(): JSX.Element {
                   : `未检测到可用 Codex OAuth，请先在终端运行 codex login。${
                       generationDraft.codexOAuthError ? ` ${generationDraft.codexOAuthError}` : ""
                     }`}
-                <br />
-                <span>{generationDraft.codexOAuthPath || "~/.codex/auth.json"}</span>
               </div>
             )}
             <label>
@@ -3801,13 +6099,202 @@ export function App(): JSX.Element {
   );
 }
 
+const workflowLifecycleLabel: Record<WorkspaceLifecycleStatus, string> = {
+  setup: "待处理",
+  queued: "排队中",
+  running: "进行中",
+  succeeded: "已完成",
+  partial_failed: "部分完成",
+  failed: "失败",
+  canceled: "已取消"
+};
+
+const workspaceAddLabel: Record<WorkspaceKind, string> = {
+  extraction: "上传多图",
+  generation: "新建流程",
+  image_edit: "导入多图"
+};
+
+const workspaceClearHistoryLabel: Record<WorkspaceKind, string> = {
+  extraction: "清空图片解析历史",
+  generation: "清空生图历史",
+  image_edit: "清空改图历史"
+};
+
+function WorkflowLineageBadge({ marker }: { marker: WorkflowLineageMarker }): JSX.Element {
+  return (
+    <span
+      aria-label={`对应标记 ${marker}`}
+      className={`workflow-lineage-marker workflow-lineage-marker-${marker}`}
+    >
+      {marker}
+    </span>
+  );
+}
+
+function WorkflowNavigator({
+  activeId,
+  collapseCompleted,
+  items,
+  onAdd,
+  onClearHistory,
+  onClose,
+  onSelect,
+  onToggleCompleted,
+  workspace
+}: {
+  activeId: string;
+  collapseCompleted: boolean;
+  items: WorkflowNavigatorItem[];
+  onAdd: () => void;
+  onClearHistory?: () => void;
+  onClose: (workflowId: string) => void;
+  onSelect: (workflowId: string) => void;
+  onToggleCompleted: () => void;
+  workspace: WorkspaceKind;
+}): JSX.Element {
+  const activeCount = items.filter(
+    (item) => item.countsTowardCapacity !== false && !isWorkspaceStatusTerminal(item.status)
+  ).length;
+  const completedCount = items.filter((item) => isWorkspaceStatusTerminal(item.status)).length;
+
+  return (
+    <aside className="workflow-navigator" aria-label={`${workspaceLabelMap[workspace]}流程导航`}>
+      <div className="workflow-navigator-header">
+        <div className="workflow-navigator-heading">
+          <strong>{workspaceLabelMap[workspace]}</strong>
+          <span>进行中 {activeCount} / {WORKSPACE_CONCURRENCY_LIMIT}</span>
+        </div>
+        <div className="workflow-navigator-actions">
+          {onClearHistory && (
+            <button
+              aria-label={workspaceClearHistoryLabel[workspace]}
+              className="icon-button workflow-clear-button"
+              onClick={onClearHistory}
+              title={workspaceClearHistoryLabel[workspace]}
+              type="button"
+            >
+              <Trash2 size={17} />
+            </button>
+          )}
+          <button
+            aria-label={workspaceAddLabel[workspace]}
+            className="icon-button workflow-add-button"
+            onClick={onAdd}
+            title={workspaceAddLabel[workspace]}
+            type="button"
+          >
+            <ImagePlus size={18} />
+          </button>
+        </div>
+      </div>
+
+      <div className="workflow-navigator-list">
+        {items.length === 0 ? (
+          <p className="workflow-navigator-empty">暂无流程</p>
+        ) : (
+          items.map((item) => {
+            const terminal = isWorkspaceStatusTerminal(item.status);
+            const canClose = item.canClose ?? (terminal || item.status === "setup");
+            const compact = collapseCompleted && terminal && item.status !== "failed";
+            const selected = item.id === activeId;
+            return (
+              <div
+                className={[
+                  "workflow-navigator-row",
+                  `workflow-navigator-row-${item.status}`,
+                  selected ? "active" : "",
+                  terminal ? "terminal" : "",
+                  canClose ? "closable" : "",
+                  compact ? "completed-collapsed" : ""
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                key={item.id}
+              >
+                <button
+                  aria-expanded={selected}
+                  className="workflow-navigator-main"
+                  onClick={() => onSelect(selected ? "" : item.id)}
+                  title={item.error || item.title}
+                  type="button"
+                >
+                  <span className="workflow-navigator-chevron" aria-hidden="true">
+                    {selected ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                  </span>
+                  <span className="workflow-navigator-thumbnail">
+                    {item.thumbnailDataUrl ? <img alt="" src={item.thumbnailDataUrl} /> : <ImagePlus size={18} />}
+                  </span>
+                  <span className="workflow-navigator-copy">
+                    <span className="workflow-navigator-title">
+                      <WorkflowLineageBadge marker={item.lineageMarker} />
+                      <strong>{item.title}</strong>
+                    </span>
+                    <span className="workflow-navigator-subtitle">{item.error || item.subtitle}</span>
+                  </span>
+                  <span className={`workflow-status-badge workflow-status-${item.status}`}>
+                    {workflowLifecycleLabel[item.status]}
+                  </span>
+                </button>
+                {canClose && (
+                  <button
+                    aria-label={item.closeLabel || `关闭流程 ${item.title}`}
+                    className="workflow-navigator-close"
+                    onClick={() => onClose(item.id)}
+                    title={item.closeTitle || (terminal ? "关闭流程视图" : "放弃当前流程")}
+                    type="button"
+                  >
+                    <X size={15} />
+                  </button>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {completedCount > 0 && (
+        <button className="workflow-collapse-button" onClick={onToggleCompleted} type="button">
+          {collapseCompleted ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+          {collapseCompleted ? "展开已完成" : "折叠已完成"}
+        </button>
+      )}
+    </aside>
+  );
+}
+
+function WorkspaceBlankState({
+  actionLabel,
+  description,
+  onAction
+}: {
+  actionLabel: string;
+  description: string;
+  onAction: () => void;
+}): JSX.Element {
+  return (
+    <section className="workspace-blank-state">
+      <ImagePlus size={38} />
+      <div>
+        <strong>{description}</strong>
+      </div>
+      <button className="primary-button" onClick={onAction} type="button">
+        <ImagePlus size={18} />
+        {actionLabel}
+      </button>
+    </section>
+  );
+}
+
 function GenerationWorkspace({
   backendActionLabel,
   backendReady,
   collapsedTaskIds,
   copiedKey,
   error,
+  formLocked,
   isGenerating,
+  lineageMarker,
   onCancelTask,
   onClearTasks,
   onCopyText,
@@ -3847,7 +6334,9 @@ function GenerationWorkspace({
   collapsedTaskIds: string[];
   copiedKey: string;
   error: string;
+  formLocked: boolean;
   isGenerating: boolean;
+  lineageMarker: WorkflowLineageMarker;
   onCancelTask: (id: string) => void;
   onClearTasks: () => void;
   onCopyText: (key: string, text: string) => void;
@@ -3924,6 +6413,7 @@ function GenerationWorkspace({
           </button>
         </div>
 
+        <fieldset className="workflow-form-fieldset" disabled={formLocked}>
         <div className="import-row">
           {options.length === 0 ? (
             <p className="empty-text">可直接在下方填写完整提示词；完成图片分析后，解析结果导入项会显示在这里。</p>
@@ -3946,8 +6436,11 @@ function GenerationWorkspace({
             className={`generation-source-strip${promptSource.sourceThumbnailDataUrl ? "" : " without-thumbnail"}`}
           >
             {promptSource.sourceThumbnailDataUrl && <img alt="" src={promptSource.sourceThumbnailDataUrl} />}
-            <span>
-              <strong>{promptSource.label}</strong>
+            <div className="workflow-source-copy">
+              <div className="workflow-lineage-heading">
+                <WorkflowLineageBadge marker={lineageMarker} />
+                <strong>{promptSource.label}</strong>
+              </div>
               <small>
                 {promptSource.sourceFileName
                   ? `${promptSource.sourceFileName} · `
@@ -3956,7 +6449,7 @@ function GenerationWorkspace({
                     : "解析来源图 · "}
                 {new Date(promptSource.importedAt).toLocaleString("zh-CN")}
               </small>
-            </span>
+            </div>
           </div>
         )}
 
@@ -4153,8 +6646,8 @@ function GenerationWorkspace({
 
         <div
           className="generation-reference-zone"
-          onDragOver={(event) => event.preventDefault()}
-          onDrop={onReferenceDrop}
+          onDragOver={formLocked ? undefined : (event) => event.preventDefault()}
+          onDrop={formLocked ? undefined : onReferenceDrop}
         >
           <div>
             <strong>参考图</strong>
@@ -4222,6 +6715,7 @@ function GenerationWorkspace({
             {copiedKey === "generationPrompt" ? "已复制" : "复制当前提示词"}
           </button>
         </div>
+        </fieldset>
       </section>
 
       <section className="generation-results">
@@ -4356,6 +6850,7 @@ function GenerationWorkspace({
                     </button>
                     <button
                       className="history-delete-button"
+                      disabled={isTaskActive}
                       onClick={(event) => {
                         event.stopPropagation();
                         onDeleteTask(task.id);
@@ -4387,32 +6882,32 @@ function GenerationWorkspace({
                           取消
                         </button>
                       )}
+                      {!isTaskActive && (
+                        <button
+                          className="secondary-button"
+                          disabled={isGenerating}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            onRetryTask(task);
+                          }}
+                          type="button"
+                        >
+                          <RotateCcw size={16} />
+                          重试
+                        </button>
+                      )}
                       {hasGeneratedOutputs && (
-                        <>
-                          <button
-                            className="secondary-button"
-                            disabled={isGenerating}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              onRetryTask(task);
-                            }}
-                            type="button"
-                          >
-                            <RotateCcw size={16} />
-                            重试
-                          </button>
-                          <button
-                            className="secondary-button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              onRestoreTask(task);
-                            }}
-                            type="button"
-                          >
-                            <History size={16} />
-                            恢复任务
-                          </button>
-                        </>
+                        <button
+                          className="secondary-button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            onRestoreTask(task);
+                          }}
+                          type="button"
+                        >
+                          <History size={16} />
+                          恢复任务
+                        </button>
                       )}
                       {visibility === "active" && !isTaskActive && (
                         <>
@@ -4589,15 +7084,21 @@ function GenerationWorkspace({
 }
 
 function ImageEditWorkspace({
+  activeTool,
+  annotationColor,
+  annotationText,
   annotations,
   backendActionLabel,
   backendReady,
   collapsedTaskIds,
   error,
+  formLocked,
   instruction,
   isCreating,
   isResolvingAnnotations,
   isDragging,
+  lineageMarker,
+  onCancelResolution,
   onCancelTask,
   onClearAnnotations,
   onClearTasks,
@@ -4615,6 +7116,9 @@ function ImageEditWorkspace({
   onToggleTaskCollapsed,
   onSetAnnotationResolution,
   onSetAnnotations,
+  onSetActiveTool,
+  onSetAnnotationColor,
+  onSetAnnotationText,
   onSetInstruction,
   onSetRegenerationContext,
   onSetSettings,
@@ -4627,17 +7131,24 @@ function ImageEditWorkspace({
   source,
   regenerationContext,
   annotationResolution,
-  tasks
+  tasks,
+  workflowId
 }: {
+  activeTool: ImageEditTool;
+  annotationColor: string;
+  annotationText: string;
   annotations: ImageEditAnnotation[];
   backendActionLabel: string;
   backendReady: boolean;
   collapsedTaskIds: string[];
   error: string;
+  formLocked: boolean;
   instruction: string;
   isCreating: boolean;
   isResolvingAnnotations: boolean;
   isDragging: boolean;
+  lineageMarker: WorkflowLineageMarker;
+  onCancelResolution: () => void;
   onCancelTask: (id: string) => void;
   onClearAnnotations: () => void;
   onClearTasks: () => void;
@@ -4655,6 +7166,9 @@ function ImageEditWorkspace({
   onToggleTaskCollapsed: (taskId: string) => void;
   onSetAnnotationResolution: Dispatch<SetStateAction<ImageEditAnnotationResolution | null>>;
   onSetAnnotations: Dispatch<SetStateAction<ImageEditAnnotation[]>>;
+  onSetActiveTool: (value: ImageEditTool) => void;
+  onSetAnnotationColor: (value: string) => void;
+  onSetAnnotationText: (value: string) => void;
   onSetInstruction: (value: string) => void;
   onSetRegenerationContext: Dispatch<SetStateAction<ImageEditRegenerationContext | null>>;
   onSetSettings: Dispatch<SetStateAction<ImageEditRequestSettings>>;
@@ -4668,10 +7182,8 @@ function ImageEditWorkspace({
   regenerationContext: ImageEditRegenerationContext | null;
   annotationResolution: ImageEditAnnotationResolution | null;
   tasks: ImageEditTask[];
+  workflowId: string;
 }): JSX.Element {
-  const [activeTool, setActiveTool] = useState<ImageEditTool>("brush");
-  const [annotationColor, setAnnotationColor] = useState("#f04438");
-  const [annotationText, setAnnotationText] = useState("");
   const [showHiddenTasks, setShowHiddenTasks] = useState(false);
   const hiddenTaskCount = useMemo(() => tasks.filter((task) => imageEditTaskVisibility(task) !== "active").length, [tasks]);
   const visibleTasks = useMemo(
@@ -4754,21 +7266,35 @@ function ImageEditWorkspace({
           </button>
         </div>
 
+        {isResolvingAnnotations && (
+          <div className="button-row workflow-operation-actions">
+            <span>修改意图解析中</span>
+            <button className="secondary-button" onClick={onCancelResolution} type="button">
+              <X size={17} />
+              取消解析
+            </button>
+          </div>
+        )}
+
+        <fieldset className={`workflow-form-fieldset ${formLocked ? "locked" : ""}`} disabled={formLocked}>
         <div
           className={`image-edit-source-zone ${isDragging ? "dragging" : ""}`}
-          onDragLeave={onSourceDragLeave}
-          onDragOver={onSourceDragOver}
-          onDrop={onSourceDrop}
+          onDragLeave={formLocked ? undefined : onSourceDragLeave}
+          onDragOver={formLocked ? undefined : onSourceDragOver}
+          onDrop={formLocked ? undefined : onSourceDrop}
         >
           {source ? (
             <div className="image-edit-source-strip">
               <img alt="" src={source.thumbnailDataUrl || source.dataUrl} />
-              <span>
-                <strong>{source.name}</strong>
+              <div className="workflow-source-copy">
+                <div className="workflow-lineage-heading">
+                  <WorkflowLineageBadge marker={lineageMarker} />
+                  <strong>{source.name}</strong>
+                </div>
                 <small>
                   {sourceExactSize || "源图尺寸待识别"} · 输出 {settings.size}
                 </small>
-              </span>
+              </div>
               <button className="secondary-button" onClick={onPickSource} type="button">
                 <Upload size={17} />
                 更换源图
@@ -4785,6 +7311,7 @@ function ImageEditWorkspace({
 
         {source ? (
           <ImageEditAnnotationBoard
+            key={workflowId}
             activeTool={activeTool}
             annotationColor={annotationColor}
             annotations={annotations}
@@ -4802,7 +7329,7 @@ function ImageEditWorkspace({
               <button
                 className={activeTool === tool.value ? "active" : ""}
                 key={tool.value}
-                onClick={() => setActiveTool(tool.value)}
+                onClick={() => onSetActiveTool(tool.value)}
                 type="button"
               >
                 {tool.icon}
@@ -4814,7 +7341,7 @@ function ImageEditWorkspace({
             <span>颜色</span>
             <input
               aria-label="标注颜色"
-              onChange={(event) => setAnnotationColor(event.target.value)}
+              onChange={(event) => onSetAnnotationColor(event.target.value)}
               type="color"
               value={annotationColor}
             />
@@ -4822,7 +7349,7 @@ function ImageEditWorkspace({
           <label className="image-edit-text-input">
             <span>当前标注要求</span>
             <input
-              onChange={(event) => setAnnotationText(event.target.value)}
+              onChange={(event) => onSetAnnotationText(event.target.value)}
               placeholder="先写这一处怎么改，再点击或拖拽"
               value={annotationText}
             />
@@ -4912,7 +7439,6 @@ function ImageEditWorkspace({
                 className="secondary-button"
                 disabled={
                   isResolvingAnnotations ||
-                  Boolean(annotationResolution) ||
                   !source ||
                   !annotations.length ||
                   !regenerationContext?.basePrompt.trim() ||
@@ -4922,7 +7448,11 @@ function ImageEditWorkspace({
                 type="button"
               >
                 {isResolvingAnnotations ? <Loader2 className="spin" size={17} /> : <Sparkles size={17} />}
-                {annotationResolution ? "当前标注版本已解析" : "解析修改清单"}
+                {isResolvingAnnotations
+                  ? "修改意图解析中"
+                  : annotationResolution
+                    ? "重新解析修改清单"
+                    : "解析修改清单"}
               </button>
               {annotationResolution && (
                 <section className="image-edit-resolution-list">
@@ -5181,6 +7711,7 @@ function ImageEditWorkspace({
             生成修订版
           </button>
         </div>
+        </fieldset>
       </section>
 
       <section className="generation-results">
@@ -5262,7 +7793,13 @@ function ImageEditWorkspace({
                         {isTaskCollapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
                         {isTaskCollapsed ? "展开卡片" : "收起卡片"}
                       </button>
-                      <button className="history-delete-button" onClick={() => onDeleteTask(task.id)} title="删除任务" type="button">
+                      <button
+                        className="history-delete-button"
+                        disabled={isCreating || isTaskActive}
+                        onClick={() => onDeleteTask(task.id)}
+                        title="删除任务"
+                        type="button"
+                      >
                         <Trash2 size={16} />
                       </button>
                     </div>
@@ -5281,7 +7818,12 @@ function ImageEditWorkspace({
                           </button>
                         )}
                         {!isTaskActive && !isLegacyTask && (
-                          <button className="secondary-button" onClick={() => onRetryTask(task)} type="button">
+                          <button
+                            className="secondary-button"
+                            disabled={isCreating}
+                            onClick={() => onRetryTask(task)}
+                            type="button"
+                          >
                             <RotateCcw size={16} />
                             重试
                           </button>

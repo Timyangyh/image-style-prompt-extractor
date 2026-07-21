@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
@@ -11,7 +11,7 @@ import {
   imageEditResolutionForDimensions,
   imageEditSettingsFromSource
 } from "./image-edit";
-import type { ImageEditCreateRequest } from "../src/shared/types";
+import type { ImageEditCreateRequest, ImageEditTask } from "../src/shared/types";
 
 const crcTable = Array.from({ length: 256 }, (_item, index) => {
   let value = index;
@@ -281,12 +281,12 @@ describe("image edit size helpers", () => {
 });
 
 describe("ImageEditService task storage", () => {
-  it("preserves the existing macOS empty task-file structure during full cleanup", async () => {
+  it("removes the complete edit data domain during full cleanup on macOS", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "image-edit-mac-clear-all-"));
     try {
       const service = new ImageEditService(rootDir);
       await service.clearAll("darwin");
-      expect(JSON.parse(await readFile(join(rootDir, "image-edit", "tasks.json"), "utf8"))).toEqual([]);
+      await expect(readFile(join(rootDir, "image-edit", "tasks.json"), "utf8")).rejects.toThrow();
     } finally {
       await rm(rootDir, { recursive: true, force: true });
     }
@@ -415,16 +415,25 @@ describe("ImageEditService task storage", () => {
   it("stores large source and annotation images as assets while tasks.json keeps metadata", async () => {
     const rootDir = await mkdtemp(join(tmpdir(), "image-edit-assets-"));
     try {
-      const runner = vi.fn(async () => [
-        {
-          dataUrl: dataUrl(2688, 1152),
-          mimeType: "image/png",
-          requestedSize: "2688x1152",
-          actualSize: "2688x1152",
-          actualWidth: 2688,
-          actualHeight: 1152
-        }
-      ]);
+      const runner = vi.fn(async (executionTask) => {
+        expect(executionTask.sourceImage.dataUrl).toBe("");
+        expect(executionTask.annotationImage.dataUrl).toBe("");
+        expect(executionTask.modelInputImage).toBeUndefined();
+        expect(executionTask.maskImage).toBeUndefined();
+        expect(executionTask.localProtectionMaskImage).toBeUndefined();
+        expect(executionTask.outputs).toEqual([]);
+        expect(executionTask.regenerationContext?.originalReferences[0].dataUrl).toMatch(/^data:image\/png;base64,/);
+        return [
+          {
+            dataUrl: dataUrl(2688, 1152),
+            mimeType: "image/png",
+            requestedSize: "2688x1152",
+            actualSize: "2688x1152",
+            actualWidth: 2688,
+            actualHeight: 1152
+          }
+        ];
+      });
       const service = new ImageEditService(rootDir, { runner, concurrency: 1 });
       const task = await service.createTask(createRequest());
       expect(task.status).toBe("queued");
@@ -520,12 +529,15 @@ describe("ImageEditService task storage", () => {
           throw new Error("model unavailable");
         }
       });
-      const task = await service.createTask(createRequest(dataUrl(1024, 1024)));
+      const request = createRequest(dataUrl(1024, 1024));
+      request.sourceImage.sourcePointer.historyItemId = "history-lineage-1";
+      const task = await service.createTask(request);
       await waitFor(async () => (await service.getTasks()).some((item) => item.id === task.id && item.status === "failed"));
       const retried = await service.retryTask(task.id);
       expect(retried.id).not.toBe(task.id);
       expect(retried.sourceImage.sourcePointer).toMatchObject({
         kind: "restored_edit_output",
+        historyItemId: "history-lineage-1",
         imageEditTaskId: task.id
       });
       const restored = await service.restoreTask(task.id);
@@ -887,6 +899,330 @@ describe("ImageEditService model routing", () => {
       expect(finished?.outputs[0].compositeAudit).toBeUndefined();
     } finally {
       vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("ImageEditService concurrency safety", () => {
+  const smallRequest = (clientWorkflowId?: string): ImageEditCreateRequest => {
+    const request = createRequest(dataUrl(64, 64));
+    request.clientWorkflowId = clientWorkflowId;
+    request.annotationImage = { ...request.annotationImage, dataUrl: dataUrl(64, 64), thumbnailDataUrl: dataUrl(32, 32) };
+    return request;
+  };
+
+  it("atomically reserves five task slots, rejects the sixth and keeps reverse results isolated", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-capacity-"));
+    const releases = new Map<string, () => void>();
+    const runner = vi.fn(
+      (task) =>
+        new Promise<Array<{ dataUrl: string; mimeType: string; requestedSize: string }>>((resolve) => {
+          const index = Number(task.clientWorkflowId?.split("-").at(-1) || 0);
+          releases.set(task.id, () =>
+            resolve([{ dataUrl: dataUrl(64 + index, 64), mimeType: "image/png", requestedSize: `${64 + index}x64` }])
+          );
+        })
+    );
+    try {
+      const service = new ImageEditService(rootDir, { runner });
+      const results = await Promise.allSettled(
+        Array.from({ length: 6 }, (_item, index) => service.createTask(smallRequest(`workflow-${index}`)))
+      );
+      const admitted = results
+        .filter((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof service.createTask>>> => result.status === "fulfilled")
+        .map((result) => result.value);
+      const rejected = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      expect(admitted).toHaveLength(5);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason).toMatchObject({ code: "WORKSPACE_CAPACITY_REACHED" });
+      await waitFor(() => releases.size === 5);
+      for (const task of [...admitted].reverse()) releases.get(task.id)?.();
+      await waitFor(async () => (await service.getTasks()).every((task) => task.status === "succeeded"));
+      const tasks = await service.getTasks();
+      for (let index = 0; index < 5; index += 1) {
+        const task = tasks.find((item) => item.clientWorkflowId === `workflow-${index}`);
+        expect(task?.outputs[0].actualWidth).toBe(64 + index);
+      }
+    } finally {
+      releases.forEach((release) => release());
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back a failed asset preparation and releases its reservation", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-reservation-rollback-"));
+    try {
+      const service = new ImageEditService(rootDir, {
+        runner: async () => [{ dataUrl: dataUrl(64, 64), mimeType: "image/png", requestedSize: "64x64" }]
+      });
+      const writableService = service as unknown as {
+        writeAsset(taskId: string, fileName: string, imageDataUrl: string): Promise<string>;
+      };
+      const originalWriteAsset = writableService.writeAsset.bind(service);
+      let callCount = 0;
+      const writeSpy = vi.spyOn(writableService, "writeAsset").mockImplementation(async (...args) => {
+        callCount += 1;
+        if (callCount === 2) throw new Error("disk full");
+        return originalWriteAsset(...args);
+      });
+      await expect(service.createTask(smallRequest("failed-assets"))).rejects.toThrow("disk full");
+      writeSpy.mockRestore();
+      expect(await readdir(join(rootDir, "image-edit", "assets")).catch(() => [])).toEqual([]);
+
+      const recovered = await service.createTask(smallRequest("after-rollback"));
+      await waitFor(async () => (await service.getTask(recovered.id))?.status === "succeeded");
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a task whose backend lookup began before task data was cleared", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-clear-during-backend-"));
+    let releaseBackend: (() => void) | undefined;
+    const backendResolver = vi.fn(
+      () =>
+        new Promise<{
+          authSource: "api";
+          providerId: string;
+          providerType: "openai_compatible";
+          providerName: string;
+          apiBaseUrl: string;
+          apiKey: string;
+          apiMode: "images";
+          imageModel: string;
+          mainModel: string;
+        }>((resolve) => {
+          releaseBackend = () =>
+            resolve({
+              authSource: "api",
+              providerId: "provider-a",
+              providerType: "openai_compatible",
+              providerName: "Provider A",
+              apiBaseUrl: "https://provider-a.example/v1",
+              apiKey: "provider-a-key",
+              apiMode: "images",
+              imageModel: "gpt-image-2",
+              mainModel: "gpt-5.5"
+            });
+        })
+    );
+    try {
+      const service = new ImageEditService(rootDir, { backendResolver });
+      const creation = service.createTask(smallRequest("pre-clear"));
+      await waitFor(() => Boolean(releaseBackend));
+      await service.clearTasks();
+      releaseBackend?.();
+
+      await expect(creation).rejects.toThrow("数据已被清理");
+      expect(await service.getTasks()).toEqual([]);
+      expect(await readdir(join(rootDir, "image-edit", "assets")).catch(() => [])).toEqual([]);
+    } finally {
+      releaseBackend?.();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not revive task records or assets after cancel, delete and clear races", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-races-"));
+    const releases = new Map<string, () => void>();
+    const runner = vi.fn(
+      (task) =>
+        new Promise<Array<{ dataUrl: string; mimeType: string; requestedSize: string }>>((resolve) => {
+          releases.set(task.id, () => resolve([{ dataUrl: dataUrl(64, 64), mimeType: "image/png", requestedSize: "64x64" }]));
+        })
+    );
+    try {
+      const service = new ImageEditService(rootDir, { runner, concurrency: 1 });
+
+      const canceled = await service.createTask(smallRequest("cancel-race"));
+      await waitFor(() => releases.has(canceled.id));
+      await service.cancelTask(canceled.id);
+      releases.get(canceled.id)?.();
+      await waitFor(async () => (await service.getTask(canceled.id))?.status === "canceled");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect((await service.getTask(canceled.id))?.status).toBe("canceled");
+
+      const deleted = await service.createTask(smallRequest("delete-race"));
+      await waitFor(() => releases.has(deleted.id));
+      const deletePromise = service.deleteTask(deleted.id);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      releases.get(deleted.id)?.();
+      await deletePromise;
+      expect(await service.getTask(deleted.id)).toBeNull();
+      await expect(stat(join(rootDir, "image-edit", "assets", deleted.id))).rejects.toThrow();
+
+      const cleared = await service.createTask(smallRequest("clear-race"));
+      await waitFor(() => releases.has(cleared.id));
+      const clearPromise = service.clearTasks();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      releases.get(cleared.id)?.();
+      await clearPromise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(await service.getTasks()).toEqual([]);
+      expect(await readdir(join(rootDir, "image-edit", "assets")).catch(() => [])).toEqual([]);
+    } finally {
+      releases.forEach((release) => release());
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not start a queued edit when cancel or delete is already waiting behind the start transition", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-start-stop-race-"));
+    const runner = vi.fn(async () => [
+      { dataUrl: dataUrl(64, 64), mimeType: "image/png", requestedSize: "64x64" }
+    ]);
+    try {
+      const service = new ImageEditService(rootDir, { runner, concurrency: 1 });
+      const internal = service as unknown as {
+        isQueuePumpActive: boolean;
+        startQueuedTask: (task: ImageEditTask) => Promise<void>;
+      };
+      internal.isQueuePumpActive = true;
+
+      const canceled = await service.createTask(smallRequest("cancel-before-start"));
+      await Promise.all([internal.startQueuedTask(canceled), service.cancelTask(canceled.id)]);
+      expect((await service.getTask(canceled.id))?.status).toBe("canceled");
+
+      const deleted = await service.createTask(smallRequest("delete-before-start"));
+      await Promise.all([internal.startQueuedTask(deleted), service.deleteTask(deleted.id)]);
+      expect(await service.getTask(deleted.id)).toBeNull();
+      expect(runner).not.toHaveBeenCalled();
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("executes queued edits with their original provider snapshot", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-provider-snapshot-"));
+    const responseBody = JSON.stringify({ data: [{ b64_json: pngBytes(1024, 1024).toString("base64") }] });
+    let releaseFirst: (() => void) | undefined;
+    const fetchMock = vi.fn(
+      (_input: string | URL | Request) =>
+        fetchMock.mock.calls.length === 1
+          ? new Promise<Response>((resolve) => {
+              releaseFirst = () => resolve(new Response(responseBody, { status: 200 }));
+            })
+          : Promise.resolve(new Response(responseBody, { status: 200 }))
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    let activeProvider = "provider-a";
+    const resolverCalls: Array<{ providerId?: string; snapshotProviderId?: string }> = [];
+    const backendResolver = vi.fn(async (providerId?: string, snapshot?: { providerId?: string; apiBaseUrl?: string }) => {
+      resolverCalls.push({ providerId, snapshotProviderId: snapshot?.providerId });
+      const selected = providerId || activeProvider;
+      return {
+        authSource: "api" as const,
+        providerId: selected,
+        providerType: "openai_compatible" as const,
+        providerName: selected,
+        apiBaseUrl: snapshot?.apiBaseUrl || `https://${selected}.example/v1`,
+        apiKey: `${selected}-key`,
+        apiMode: "images" as const,
+        imageModel: "gpt-image-2",
+        mainModel: "gpt-5.5"
+      };
+    });
+    try {
+      const service = new ImageEditService(rootDir, { concurrency: 1, backendResolver });
+      const first = await service.createTask(smallRequest("provider-first"));
+      const queued = await service.createTask(smallRequest("provider-queued"));
+      await waitFor(() => fetchMock.mock.calls.length === 1);
+      activeProvider = "provider-b";
+      releaseFirst?.();
+      await waitFor(() => fetchMock.mock.calls.length === 2);
+      await waitFor(async () => (await service.getTask(queued.id))?.status === "succeeded");
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+        "https://provider-a.example/v1/images/edits",
+        "https://provider-a.example/v1/images/edits"
+      ]);
+      expect(resolverCalls.some((call) => call.providerId === "provider-a" && call.snapshotProviderId === "provider-a")).toBe(true);
+      expect((await service.getTask(first.id))?.backend?.providerId).toBe("provider-a");
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers interrupted legacy tasks and emits summaries without image or credential data", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-restart-summary-"));
+    try {
+      const seed = new ImageEditService(rootDir, {
+        runner: async () => [{ dataUrl: dataUrl(64, 64), mimeType: "image/png", requestedSize: "64x64" }],
+        concurrency: 1
+      });
+      const running = await seed.createTask(smallRequest());
+      const queued = await seed.createTask(smallRequest());
+      await waitFor(async () => (await seed.getTasks()).every((task) => task.status === "succeeded"));
+      const tasksPath = join(rootDir, "image-edit", "tasks.json");
+      const stored = JSON.parse(await readFile(tasksPath, "utf8")) as Array<Record<string, unknown>>;
+      stored.find((task) => task.id === running.id)!.status = "running";
+      stored.find((task) => task.id === running.id)!.error =
+        "data:image/png;base64,c2VjcmV0 Authorization: Bearer super-secret-bearer apiKey=super-secret-api token=super-secret-token sk-live-secret12345 'C:\\Users\\private-account\\AppData\\tasks.json'";
+      const storedOutputs = stored.find((task) => task.id === running.id)!.outputs as Array<Record<string, unknown>>;
+      storedOutputs[0].error =
+        "Authorization: Bearer output-secret-token data:image/png;charset=utf-8;base64,c2VjcmV0LXVybHNhZmU_ 'C:\\Users\\output-owner\\private\\output.png'";
+      stored.find((task) => task.id === queued.id)!.status = "queued";
+      for (const task of stored) {
+        delete task.clientWorkflowId;
+        delete task.backend;
+      }
+      await writeFile(tasksPath, JSON.stringify(stored));
+
+      const restarted = new ImageEditService(rootDir, {
+        runner: async () => [{ dataUrl: dataUrl(65, 64), mimeType: "image/png", requestedSize: "65x64" }],
+        concurrency: 1
+      });
+      await restarted.resumePendingTasks();
+      await waitFor(async () => (await restarted.getTask(queued.id))?.status === "succeeded");
+      expect((await restarted.getTask(running.id))?.status).toBe("failed");
+      const summaries = await restarted.getTaskSummaries();
+      const serialized = JSON.stringify(summaries);
+      expect(serialized).not.toMatch(/data:image|base64,|apiKey|token|Bearer/i);
+      expect(serialized).not.toContain("super-secret");
+      expect(serialized).not.toContain("sk-live-secret12345");
+      expect(serialized).not.toContain("private-account");
+      expect(serialized).not.toContain("output-secret-token");
+      expect(serialized).not.toContain("output-owner");
+      expect(serialized).not.toContain("c2VjcmV0LXVybHNhZmU_");
+      expect(summaries.find((task) => task.id === running.id)?.clientWorkflowId).toBe(`task:${running.id}`);
+      expect((await restarted.getTask(queued.id))?.sourceImage.dataUrl).toContain("data:image");
+      expect(JSON.stringify(await restarted.getTask(running.id))).not.toContain("super-secret");
+      expect(await readFile(tasksPath, "utf8")).not.toContain("super-secret");
+      expect(await readFile(tasksPath, "utf8")).not.toContain("private-account");
+      expect(await readFile(tasksPath, "utf8")).not.toContain("output-secret-token");
+      expect(await readFile(tasksPath, "utf8")).not.toContain("c2VjcmV0LXVybHNhZmU_");
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes asset directories for tasks evicted by the storage limit", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "image-edit-trim-assets-"));
+    try {
+      const seed = new ImageEditService(rootDir, {
+        runner: async () => [{ dataUrl: dataUrl(64, 64), mimeType: "image/png", requestedSize: "64x64" }]
+      });
+      const task = await seed.createTask(smallRequest("seed"));
+      await waitFor(async () => (await seed.getTask(task.id))?.status === "succeeded");
+      const tasksPath = join(rootDir, "image-edit", "tasks.json");
+      const [storedTask] = JSON.parse(await readFile(tasksPath, "utf8")) as Array<Record<string, unknown>>;
+      const tasks = Array.from({ length: 81 }, (_item, index) => ({
+        ...storedTask,
+        id: `trim-task-${index}`,
+        status: "succeeded",
+        visibility: "active"
+      }));
+      await writeFile(tasksPath, JSON.stringify(tasks));
+      await Promise.all(
+        tasks.map((item) => mkdir(join(rootDir, "image-edit", "assets", String(item.id)), { recursive: true }))
+      );
+
+      await seed.updateTaskVisibility({ id: "trim-task-0", visibility: "archived" });
+      await expect(stat(join(rootDir, "image-edit", "assets", "trim-task-80"))).rejects.toThrow();
+      expect((await stat(join(rootDir, "image-edit", "assets", "trim-task-79"))).isDirectory()).toBe(true);
+      expect(JSON.parse(await readFile(tasksPath, "utf8"))).toHaveLength(80);
+    } finally {
       await rm(rootDir, { recursive: true, force: true });
     }
   });

@@ -20,7 +20,7 @@ import {
   parseOpenRouterImagesResponse,
   parseResponsesImageResponse
 } from "./generation";
-import { parseCodexAuthPayload } from "./codex-auth";
+import { getCodexAuthStatus, getPublicCodexAuthError, parseCodexAuthPayload } from "./codex-auth";
 import {
   dataUrlToGenerationOutputBuffer,
   generationOutputExtension,
@@ -462,6 +462,20 @@ describe("codex oauth auth parsing", () => {
     expect(state.refreshToken).toBe("refresh-token");
     expect(state.accountId).toBe("acct_test");
     expect(state.lastRefresh).toBe("2026-06-14T00:00:00.000Z");
+  });
+
+  it("never exposes a Codex auth file path through renderer-facing errors", async () => {
+    const privatePath = `/${["Users", "private-account", ".codex", "auth.json"].join("/")}`;
+    const status = await getCodexAuthStatus(privatePath);
+    const permissionError = Object.assign(new Error(`EACCES: permission denied, open '${privatePath}'`), {
+      code: "EACCES"
+    });
+
+    expect(status.available).toBe(false);
+    expect(status.error).toBe("未检测到 Codex OAuth 登录，请先执行 codex login。");
+    expect(status.error).not.toContain(privatePath);
+    expect(getPublicCodexAuthError(permissionError)).not.toContain(privatePath);
+    expect(getPublicCodexAuthError(permissionError)).not.toContain("auth.json");
   });
 });
 
@@ -1447,5 +1461,242 @@ describe("generation output save helpers", () => {
     expect(uniqueGenerationOutputPath(directoryPath, "generated.png", (path) => existing.has(path))).toBe(
       join(directoryPath, "generated (3).png")
     );
+  });
+});
+
+describe("GenerationService concurrency safety", () => {
+  const configure = async (service: GenerationService, imagesConcurrency = 4) =>
+    service.saveConfig({
+      authSource: "api",
+      providerType: "openai_compatible",
+      apiBaseUrl: "https://provider-a.example/v1",
+      apiKey: "provider-a-key",
+      apiMode: "images",
+      imageModel: "provider-a-model",
+      mainModel: "gpt-5.5",
+      saveApiKey: false,
+      imagesConcurrency
+    });
+
+  it("atomically admits five active tasks, rejects the sixth and completes in reverse order", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-capacity-"));
+    const releases = new Map<string, () => void>();
+    const runner = vi.fn(
+      (task: GenerationTask) =>
+        new Promise<Array<{ dataUrl: string; mimeType: string }>>((resolve) => {
+          releases.set(task.id, () => resolve([{ dataUrl: `data:image/png;base64,${task.id}`, mimeType: "image/png" }]));
+        })
+    );
+    try {
+      const service = new GenerationService(rootDir, { runner });
+      const config = await configure(service, 9);
+      expect(config.imagesConcurrency).toBe(5);
+      const admitted = await Promise.all(
+        Array.from({ length: 5 }, (_item, index) =>
+          service.createTask({ ...createManualGenerationRequest(`task-${index}`), clientWorkflowId: `workflow-${index}` })
+        )
+      );
+      await expect(service.createTask(createManualGenerationRequest("sixth"))).rejects.toMatchObject({
+        code: "WORKSPACE_CAPACITY_REACHED"
+      });
+      expect((await service.getTasks()).filter((task) => ["queued", "running"].includes(task.status))).toHaveLength(5);
+
+      await waitFor(() => releases.size === 5);
+      for (const task of [...admitted].reverse()) releases.get(task.id)?.();
+      await waitFor(async () => (await service.getTasks()).every((task) => task.status === "succeeded"));
+      expect((await service.getTasks()).map((task) => task.clientWorkflowId).sort()).toEqual(
+        Array.from({ length: 5 }, (_item, index) => `workflow-${index}`)
+      );
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the queued task provider snapshot and fails explicitly after that provider is deleted", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-provider-snapshot-"));
+    const releases: Array<() => void> = [];
+    const executions: Array<{ prompt: string; providerId?: string; apiBaseUrl: string; imageModel: string }> = [];
+    const runner = vi.fn(
+      (task: GenerationTask, backend: { providerId?: string; apiBaseUrl: string; imageModel: string }) =>
+        new Promise<Array<{ dataUrl: string; mimeType: string }>>((resolve) => {
+          executions.push({ prompt: task.prompt, ...backend });
+          releases.push(() => resolve([{ dataUrl: "data:image/png;base64,b2s=", mimeType: "image/png" }]));
+        })
+    );
+    try {
+      const service = new GenerationService(rootDir, { runner });
+      const initial = await configure(service, 1);
+      const providerAId = initial.activeProviderId;
+      const withB = await service.saveProvider({
+        name: "Provider B",
+        providerType: "openai_compatible",
+        apiBaseUrl: "https://provider-b.example/v1",
+        apiKey: "provider-b-key",
+        apiMode: "images",
+        imageModel: "provider-b-model",
+        mainModel: "gpt-5.5",
+        saveApiKey: false
+      });
+      const providerBId = withB.activeProviderId;
+      await service.selectProvider(providerAId);
+      const first = await service.createTask(createManualGenerationRequest("first-a"));
+      const queued = await service.createTask(createManualGenerationRequest("queued-a"));
+      await waitFor(() => executions.length === 1);
+      await service.selectProvider(providerBId);
+      releases.shift()?.();
+      await waitFor(() => executions.length === 2);
+      expect(executions[1]).toMatchObject({
+        prompt: "queued-a",
+        providerId: providerAId,
+        apiBaseUrl: "https://provider-a.example/v1",
+        imageModel: "provider-a-model"
+      });
+      releases.shift()?.();
+      await waitFor(async () => (await service.getTask(queued.id))?.status === "succeeded");
+
+      await service.selectProvider(providerAId);
+      const blocker = await service.createTask(createManualGenerationRequest("blocker-a"));
+      const orphaned = await service.createTask(createManualGenerationRequest("orphaned-a"));
+      await waitFor(() => executions.some((item) => item.prompt === "blocker-a"));
+      await service.deleteProvider(providerAId);
+      releases.shift()?.();
+      await waitFor(async () => (await service.getTask(orphaned.id))?.status === "failed");
+      expect((await service.getTask(orphaned.id))?.error).toContain("供应商已被删除");
+      expect((await service.getTask(first.id))?.status).toBe("succeeded");
+      expect((await service.getTask(blocker.id))?.status).toBe("succeeded");
+    } finally {
+      releases.splice(0).forEach((release) => release());
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not revive tasks after cancel, delete or clear races", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-races-"));
+    const releases = new Map<string, () => void>();
+    const runner = vi.fn(
+      (task: GenerationTask) =>
+        new Promise<Array<{ dataUrl: string; mimeType: string }>>((resolve) => {
+          releases.set(task.id, () => resolve([{ dataUrl: "data:image/png;base64,b2s=", mimeType: "image/png" }]));
+        })
+    );
+    try {
+      const service = new GenerationService(rootDir, { runner });
+      await configure(service, 1);
+
+      const canceled = await service.createTask(createManualGenerationRequest("cancel-race"));
+      await waitFor(() => releases.has(canceled.id));
+      await service.cancelTask(canceled.id);
+      releases.get(canceled.id)?.();
+      await waitFor(async () => (await service.getTask(canceled.id))?.status === "canceled");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect((await service.getTask(canceled.id))?.status).toBe("canceled");
+
+      const deleted = await service.createTask(createManualGenerationRequest("delete-race"));
+      await waitFor(() => releases.has(deleted.id));
+      await service.deleteTask(deleted.id);
+      releases.get(deleted.id)?.();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(await service.getTask(deleted.id)).toBeNull();
+
+      const cleared = await service.createTask(createManualGenerationRequest("clear-race"));
+      await waitFor(() => releases.has(cleared.id));
+      const clearPromise = service.clearTasks();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      releases.get(cleared.id)?.();
+      await clearPromise;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(await service.getTasks()).toEqual([]);
+    } finally {
+      releases.forEach((release) => release());
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not start a queued request when cancel or delete is already waiting behind the start transition", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-start-stop-race-"));
+    const runner = vi.fn(async () => [{ dataUrl: "data:image/png;base64,b2s=", mimeType: "image/png" }]);
+    try {
+      const service = new GenerationService(rootDir, { runner });
+      await configure(service, 1);
+      const internal = service as unknown as {
+        isQueuePumpActive: boolean;
+        startQueuedTask: (task: GenerationTask) => Promise<void>;
+      };
+      internal.isQueuePumpActive = true;
+
+      const canceled = await service.createTask(createManualGenerationRequest("cancel-before-start"));
+      await Promise.all([internal.startQueuedTask(canceled), service.cancelTask(canceled.id)]);
+      expect((await service.getTask(canceled.id))?.status).toBe("canceled");
+
+      const deleted = await service.createTask(createManualGenerationRequest("delete-before-start"));
+      await Promise.all([internal.startQueuedTask(deleted), service.deleteTask(deleted.id)]);
+      expect(await service.getTask(deleted.id)).toBeNull();
+      expect(runner).not.toHaveBeenCalled();
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers interrupted tasks, resumes queued legacy data and returns sanitized summaries", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "generation-restart-summary-"));
+    try {
+      const privateOutputPath = `/${["Users", "output-owner", "private", "output.png"].join("/")}`;
+      const privateAuthPath = `/${["Users", "private-account", ".codex", "auth.json"].join("/")}`;
+      const runner = vi.fn(async () => [{ dataUrl: "data:image/png;base64,b2s=", mimeType: "image/png" }]);
+      const service = new GenerationService(rootDir, { runner });
+      await configure(service, 1);
+      await mkdir(join(rootDir, "generation"), { recursive: true });
+      const baseTask: GenerationTask = {
+        id: "legacy-running",
+        createdAt: "2026-07-20T00:00:00.000Z",
+        updatedAt: "2026-07-20T00:00:00.000Z",
+        status: "running",
+        prompt: "legacy running",
+        finalPrompt: "legacy running",
+        promptSource: createManualGenerationRequest("legacy").promptSource,
+        referenceImages: [],
+        settings: { ...settings, n: 1 },
+        outputs: [
+          {
+            id: "legacy-output",
+            createdAt: "2026-07-20T00:00:00.000Z",
+            dataUrl: "data:image/png;base64,b2s=",
+            mimeType: "image/png",
+            error:
+              `Authorization: Bearer output-secret-token provider payload base64,c2VjcmV0X3VybHNhZmU '${privateOutputPath}'`
+          }
+        ],
+        error: `data:image/png;base64,c2VjcmV0 Authorization: Bearer super-secret-bearer apiKey=super-secret-api token=super-secret-token sk-live-secret12345 '${privateAuthPath}'`
+      };
+      await writeFile(
+        join(rootDir, "generation", "tasks.json"),
+        JSON.stringify([
+          baseTask,
+          { ...baseTask, id: "legacy-queued", prompt: "legacy queued", finalPrompt: "legacy queued", status: "queued", error: undefined }
+        ])
+      );
+
+      await service.resumePendingTasks();
+      await waitFor(async () => (await service.getTask("legacy-queued"))?.status === "succeeded");
+      expect((await service.getTask("legacy-running"))?.status).toBe("failed");
+      const summaries = await service.getTaskSummaries();
+      const serialized = JSON.stringify(summaries);
+      expect(serialized).not.toMatch(/data:image|base64,|apiKey|token|Bearer/i);
+      expect(serialized).not.toContain("super-secret");
+      expect(serialized).not.toContain("sk-live-secret12345");
+      expect(serialized).not.toContain("private-account");
+      expect(serialized).not.toContain("output-secret-token");
+      expect(serialized).not.toContain("output-owner");
+      expect(serialized).not.toContain("c2VjcmV0X3VybHNhZmU");
+      expect(summaries.find((item) => item.id === "legacy-running")?.clientWorkflowId).toBe("task:legacy-running");
+      expect((await service.getTask("legacy-queued"))?.outputs[0].dataUrl).toContain("data:image");
+      expect(JSON.stringify(await service.getTask("legacy-running"))).not.toContain("super-secret");
+      expect(await readFile(join(rootDir, "generation", "tasks.json"), "utf8")).not.toContain("super-secret");
+      expect(await readFile(join(rootDir, "generation", "tasks.json"), "utf8")).not.toContain("private-account");
+      expect(await readFile(join(rootDir, "generation", "tasks.json"), "utf8")).not.toContain("output-secret-token");
+      expect(await readFile(join(rootDir, "generation", "tasks.json"), "utf8")).not.toContain("c2VjcmV0X3VybHNhZmU");
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
+    }
   });
 });

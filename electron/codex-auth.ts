@@ -82,6 +82,23 @@ export const loadCodexAuthState = async (path = DEFAULT_CODEX_AUTH_PATH): Promis
   return parseCodexAuthPayload(JSON.parse(text) as unknown, path);
 };
 
+export const getPublicCodexAuthError = (error: unknown): string => {
+  const code = isRecord(error) ? stringValue(error.code) : "";
+  if (code === "ENOENT") return "未检测到 Codex OAuth 登录，请先执行 codex login。";
+  if (code === "EACCES" || code === "EPERM") {
+    return "Codex OAuth 凭证不可读取，请检查本机文件权限。";
+  }
+  if (error instanceof SyntaxError) return "Codex OAuth 凭证格式无效，请重新执行 codex login。";
+  if (
+    error instanceof Error &&
+    (error.message === "Codex OAuth 文件不是有效 JSON 对象。" ||
+      error.message === "Codex OAuth 文件缺少 access_token 或 refresh_token。")
+  ) {
+    return error.message;
+  }
+  return "无法读取 Codex OAuth 登录状态，请重新执行 codex login。";
+};
+
 export const getCodexAuthStatus = async (path = DEFAULT_CODEX_AUTH_PATH): Promise<CodexAuthStatus> => {
   try {
     const state = await loadCodexAuthState(path);
@@ -95,7 +112,7 @@ export const getCodexAuthStatus = async (path = DEFAULT_CODEX_AUTH_PATH): Promis
     return {
       available: false,
       path,
-      error: error instanceof Error ? error.message : String(error)
+      error: getPublicCodexAuthError(error)
     };
   }
 };

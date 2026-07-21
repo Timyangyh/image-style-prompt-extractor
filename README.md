@@ -6,7 +6,13 @@
 
 如果需要分析网页或应用界面，可以先截图，然后直接粘贴或上传到应用中分析。项目不包含 Chrome 浏览器插件或自动网页采集服务。
 
-## 当前版本：v1.1.6
+## 当前版本：v1.1.7
+
+- 图片解析、生图和改图工作台支持各自最多 5 个独立流程，异步结果按稳定流程 ID 回写。
+- 同一解析图片再次更新文字或融合结果后，已有未提交生图草稿会在切回生图工作台时原位刷新，不再重复新增待处理流程。
+- 同步刷新 Apple Silicon macOS 与 Windows x64 本地安装包。
+
+### v1.1.6
 
 - 识图新增 Anthropic Messages 协议，可接入使用 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 和自定义模型名的 Claude Code 兼容中转。
 - Anthropic Messages 会从平台根地址拼接 `/v1/messages`，以 Bearer token 认证，并使用原生 base64 图片内容块和文本响应格式。

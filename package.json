@@ -1,6 +1,6 @@
 {
   "name": "image-style-prompt-extractor",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "本地图片风格提示词复刻提取工具",
   "main": "./out/main/index.js",
   "author": "图片复刻大师 contributors",
@@ -11,6 +11,7 @@
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
     "test:unit": "vitest run",
+    "test:e2e:handoff": "npm run build && node scripts/workflow-handoff-e2e.mjs",
     "test:e2e:win": "node scripts/windows-e2e.mjs",
     "verify:release": "bash scripts/verify-public-release.sh",
     "start": "electron-vite preview",
