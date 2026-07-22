@@ -16,10 +16,6 @@
 
 ![图片复刻大师生图任务概览](assets/ui-generation-tasks.png)
 
-**原图与生成图对比**
-
-![图片复刻大师原图与生成图对比界面](assets/ui-generation-comparison.png)
-
 ## 当前版本：v1.1.7
 
 - 新增支持批量解析图片、生成图片和修改图片。
