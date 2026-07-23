@@ -52,6 +52,21 @@ import {
 import { clipboardPasteShortcut, isWindowsPlatform, localDataScopeLabel } from "./shared/platform";
 import { createLocalSourceCapture } from "./shared/schema";
 import { buildDirectTextToImagePrompt } from "./shared/text-to-image-prompt";
+import { AppSidebarHeader, ContextToolbar } from "./ui/AppChrome";
+import {
+  clearLayoutPreferences,
+  ResizableSeparator
+} from "./ui/ResizableLayout";
+import {
+  applyTheme,
+  clearThemePreference,
+  currentTheme,
+  persistTheme,
+  readThemePreference,
+  watchSystemTheme
+} from "./ui/theme";
+import type { AppTheme } from "./ui/theme";
+import { useDialogAccessibility } from "./ui/useDialogAccessibility";
 import {
   extractionGenerationHandoffKey,
   extractionWorkflowLineageKey,
@@ -1424,6 +1439,9 @@ const preferredGenerationPromptOption = (
   return fusedOption || options.find((option) => option.kind === "text_to_image") || options[0];
 };
 
+const minimumSidebarWorkspaceNavigationHeight = (containerHeight: number): number =>
+  containerHeight <= 759 ? 200 : 232;
+
 export function App(): JSX.Element {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const subjectFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1455,6 +1473,8 @@ export function App(): JSX.Element {
   const [generationDraft, setGenerationDraft] = useState<GenerationConfigDraft>(defaultGenerationDraft);
   const [showGenerationConfig, setShowGenerationConfig] = useState(false);
   const [activeView, setActiveView] = useState<"extract" | "generate" | "edit">("extract");
+  const [theme, setTheme] = useState<AppTheme>(() => currentTheme());
+  const [hasExplicitTheme, setHasExplicitTheme] = useState(() => Boolean(readThemePreference()));
   const [showConfig, setShowConfig] = useState(false);
   const [extractionWorkflows, setExtractionWorkflowsState] = useState<ExtractionWorkflow[]>([]);
   const [generationWorkflows, setGenerationWorkflowsState] = useState<GenerationWorkflow[]>([]);
@@ -1831,6 +1851,21 @@ export function App(): JSX.Element {
     imageEditTasksRef.current = imageEditTasks;
   }, [imageEditTasks]);
 
+  useEffect(() => {
+    if (hasExplicitTheme) return;
+    return watchSystemTheme((nextTheme) => {
+      applyTheme(nextTheme);
+      setTheme(nextTheme);
+    });
+  }, [hasExplicitTheme]);
+
+  const toggleTheme = useCallback(() => {
+    const nextTheme = theme === "dark" ? "light" : "dark";
+    persistTheme(nextTheme);
+    setTheme(nextTheme);
+    setHasExplicitTheme(true);
+  }, [theme]);
+
   const applyGenerationConfig = useCallback((nextConfig: GenerationConfig) => {
     const activeProvider =
       nextConfig.providers.find((provider) => provider.id === nextConfig.activeProviderId) || nextConfig.providers[0];
@@ -1883,6 +1918,24 @@ export function App(): JSX.Element {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [capacityDialog, isFusing, showConfig, showFuseModal, showGenerationConfig]);
+
+  useDialogAccessibility(
+    capacityDialog
+      ? "capacity"
+      : editingGenerationReferenceId
+        ? `reference:${editingGenerationReferenceId}`
+        : showFuseModal
+          ? "fusion"
+          : imagePreview
+            ? "image-preview"
+            : comparePreview
+              ? "compare-preview"
+              : showGenerationConfig
+                ? "generation-config"
+                : showConfig
+                  ? "model-config"
+                  : ""
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -4393,6 +4446,9 @@ export function App(): JSX.Element {
     setGenerationDraft(defaultGenerationDraft);
     setImageEditTasks([]);
     setShowFuseModal(false);
+    clearLayoutPreferences();
+    setTheme(clearThemePreference());
+    setHasExplicitTheme(false);
     setStatus(
       isWindows
         ? "本机模型配置、API Key、图片历史记录、生图任务、改图任务和 Windows 运行时浏览数据已全部抹除。"
@@ -4728,53 +4784,51 @@ export function App(): JSX.Element {
   const capacityDialogOccupied = capacityDialog
     ? Math.min(WORKSPACE_CONCURRENCY_LIMIT, Math.max(capacityDialog.occupied, liveCapacityDialogOccupied))
     : 0;
+  const activeWorkflowCount =
+    activeView === "extract"
+      ? countActiveWorkflows(extractionWorkflows)
+      : activeView === "generate"
+        ? countActiveWorkflows(generationWorkflows)
+        : countActiveWorkflows(imageEditWorkflows);
 
   return (
     <main className="app-shell">
-      <header className="topbar">
-        <div>
-          <h1>图片复刻大师</h1>
-          <p>提取可迁移的风格、配色、排版与视觉系统，不做原图 1:1 复刻。</p>
-        </div>
-        <div className="topbar-actions">
-          <button className="ghost-button" onClick={() => void openGenerationConfig()} type="button">
-            <Sparkles size={18} />
-            生图配置
-          </button>
-          <label className="switch">
-            <input
-              checked={strictGeneralization}
-              onChange={(event) => setStrictGeneralization(event.target.checked)}
-              type="checkbox"
-            />
-            <span />
-            严格通用化
-          </label>
-          <button className="ghost-button" onClick={() => setShowConfig(true)} type="button">
-            <Settings size={18} />
-            模型配置
-          </button>
-        </div>
-      </header>
-
-      <nav className="page-tabs" aria-label="工作区切换">
-        <button className={activeView === "extract" ? "active" : ""} onClick={() => setActiveView("extract")} type="button">
-          <FileJson size={18} />
-          提示词提取
-        </button>
-        <button
-          className={activeView === "generate" ? "active" : ""}
-          onClick={() => void openGenerationWorkspace()}
-          type="button"
-        >
-          <Sparkles size={18} />
-          生图工作台
-        </button>
-        <button className={activeView === "edit" ? "active" : ""} onClick={() => setActiveView("edit")} type="button">
-          <PenLine size={18} />
-          改图工作台
-        </button>
-      </nav>
+      <AppSidebarHeader
+        activeView={activeView}
+        onOpenEdit={() => setActiveView("edit")}
+        onOpenExtract={() => setActiveView("extract")}
+        onOpenGenerate={() => void openGenerationWorkspace()}
+      />
+      <ResizableSeparator
+        className="sidebar-workspace-separator"
+        cssVariable="--sidebar-workspaces-height"
+        label="调整工作台导航与流程列表高度"
+        layoutId="sidebar-workspaces"
+        maximumStartSize={360}
+        minimumEndSize={300}
+        minimumStartSize={minimumSidebarWorkspaceNavigationHeight}
+        orientation="horizontal"
+      />
+      <ResizableSeparator
+        className="app-layout-separator"
+        cssVariable="--sidebar-width"
+        label="调整应用侧栏与主内容宽度"
+        layoutId="app-sidebar"
+        maximumStartSize={360}
+        minimumEndSize={720}
+        minimumStartSize={200}
+      />
+      <ContextToolbar
+        activeCount={activeWorkflowCount}
+        activeView={activeView}
+        hasError={Boolean(activeViewError)}
+        onOpenGenerationConfig={() => void openGenerationConfig()}
+        onOpenModelConfig={() => setShowConfig(true)}
+        onStrictGeneralizationChange={setStrictGeneralization}
+        onToggleTheme={toggleTheme}
+        strictGeneralization={strictGeneralization}
+        theme={theme}
+      />
 
       {(status || activeViewError) && (
         <section className={activeViewError ? "notice error" : "notice"}>
@@ -4836,18 +4890,7 @@ export function App(): JSX.Element {
             )}
           </div>
 
-          {image && (
-            <div className="source-meta">
-              <WorkflowLineageBadge marker={activeExtractionLineageMarker} />
-              <span>
-                <strong>{getSourceLabel(image.sourceCapture)}</strong>
-                {image.sourceCapture.domain ? ` · ${image.sourceCapture.domain}` : ""}
-                {image.sourceCapture.page_title ? ` · ${image.sourceCapture.page_title}` : ""}
-              </span>
-            </div>
-          )}
-
-          <div className="button-row">
+          <div className="button-row image-context-actions">
             <button className="secondary-button" onClick={() => fileInputRef.current?.click()} type="button">
               <Upload size={18} />
               选择图片
@@ -4863,6 +4906,17 @@ export function App(): JSX.Element {
               </button>
             )}
           </div>
+
+          {image && (
+            <div className="source-meta">
+              <WorkflowLineageBadge marker={activeExtractionLineageMarker} />
+              <span>
+                <strong>{getSourceLabel(image.sourceCapture)}</strong>
+                {image.sourceCapture.domain ? ` · ${image.sourceCapture.domain}` : ""}
+                {image.sourceCapture.page_title ? ` · ${image.sourceCapture.page_title}` : ""}
+              </span>
+            </div>
+          )}
           <div className="hint-box">
             <Clipboard size={18} />
             <span>图片里的文字只用于判断层级和排版，默认不会要求模型照抄文案、品牌、价格或数据。</span>
@@ -4908,6 +4962,14 @@ export function App(): JSX.Element {
             </div>
           </section>
         </aside>
+
+        <ResizableSeparator
+          cssVariable="--extraction-panel-width"
+          label="调整图片输入区与结果区宽度"
+          layoutId="extraction"
+          minimumEndSize={360}
+          minimumStartSize={280}
+        />
 
         <section className="result-panel">
           {analysis && (
@@ -5286,6 +5348,7 @@ export function App(): JSX.Element {
             className="modal capacity-modal"
             onMouseDown={(event) => event.stopPropagation()}
             role="dialog"
+            tabIndex={-1}
           >
             <div className="capacity-modal-icon" aria-hidden="true">
               <AlertCircle size={22} />
@@ -5341,7 +5404,14 @@ export function App(): JSX.Element {
 
       {showFuseModal && (
         <div className="modal-backdrop" onMouseDown={() => setShowFuseModal(false)}>
-          <section className="modal fusion-modal" onMouseDown={(event) => event.stopPropagation()}>
+          <section
+            aria-label={fuseMode === "information_layout" ? "输入新产品信息" : "上传主体参考图"}
+            aria-modal="true"
+            className="modal fusion-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+            tabIndex={-1}
+          >
             <div className="modal-title">
               <h2>{fuseMode === "information_layout" ? "输入新产品信息" : "上传主体参考图"}</h2>
               <p>
@@ -5609,11 +5679,13 @@ export function App(): JSX.Element {
               .join(" ")}
             onMouseDown={(event) => event.stopPropagation()}
             role="dialog"
+            tabIndex={-1}
           >
             <div className="image-viewer-toolbar">
               <strong>{imagePreview.title}</strong>
               <button
                 className="icon-button viewer-close-button"
+                aria-label="关闭图片大图预览"
                 onClick={closeImagePreview}
                 title="关闭"
                 type="button"
@@ -5641,6 +5713,7 @@ export function App(): JSX.Element {
             className="compare-viewer"
             onMouseDown={(event) => event.stopPropagation()}
             role="dialog"
+            tabIndex={-1}
           >
             <div className="compare-toolbar">
               <strong>原始提取图 / 生成图对比</strong>
@@ -5665,6 +5738,7 @@ export function App(): JSX.Element {
               )}
               <button
                 className="icon-button viewer-close-button"
+                aria-label="关闭原图与生成图左右对比"
                 onClick={() => setComparePreview(null)}
                 title="关闭"
                 type="button"
@@ -5688,7 +5762,14 @@ export function App(): JSX.Element {
 
       {showGenerationConfig && (
         <div className="modal-backdrop" onMouseDown={() => setShowGenerationConfig(false)}>
-          <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+          <section
+            aria-label="生图配置"
+            aria-modal="true"
+            className="modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+            tabIndex={-1}
+          >
             <div className="modal-title">
               <h2>生图配置</h2>
               <p>支持 Images、Responses、Chat Completions 和 Gemini 原生生图/改图协议。</p>
@@ -5977,7 +6058,14 @@ export function App(): JSX.Element {
 
       {showConfig && (
         <div className="modal-backdrop" onMouseDown={() => setShowConfig(false)}>
-          <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+          <section
+            aria-label="模型配置"
+            aria-modal="true"
+            className="modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+            tabIndex={-1}
+          >
             <div className="modal-title">
               <h2>模型配置</h2>
               <p>选择平台实际提供的识图协议，应用会自动拼接对应接口路径。</p>
@@ -6717,6 +6805,14 @@ function GenerationWorkspace({
         </div>
         </fieldset>
       </section>
+
+      <ResizableSeparator
+        cssVariable="--generation-panel-width"
+        label="调整生图控制区与结果区宽度"
+        layoutId="generation"
+        minimumEndSize={360}
+        minimumStartSize={400}
+      />
 
       <section className="generation-results">
         <div className="generation-results-header">
@@ -7714,6 +7810,14 @@ function ImageEditWorkspace({
         </fieldset>
       </section>
 
+      <ResizableSeparator
+        cssVariable="--image-edit-panel-width"
+        label="调整改图控制区与结果区宽度"
+        layoutId="image-edit"
+        minimumEndSize={360}
+        minimumStartSize={440}
+      />
+
       <section className="generation-results">
         <div className="generation-results-header">
           <div>
@@ -7937,7 +8041,36 @@ function ImageEditAnnotationBoard({
   source: ImageEditSourceImage;
 }): JSX.Element {
   const [draftAnnotationId, setDraftAnnotationId] = useState("");
+  const [stageSize, setStageSize] = useState({ height: 1, width: 1 });
   const stageRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    let frame = 0;
+    const updateStageSize = (width: number, height: number) => {
+      if (width <= 0 || height <= 0) return;
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        setStageSize((current) =>
+          Math.abs(current.width - width) < 0.5 && Math.abs(current.height - height) < 0.5
+            ? current
+            : { width, height }
+        );
+      });
+    };
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) updateStageSize(entry.contentRect.width, entry.contentRect.height);
+    });
+    const initialRect = stage.getBoundingClientRect();
+    updateStageSize(initialRect.width, initialRect.height);
+    observer.observe(stage);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [source.dataUrl]);
 
   const pointFromEvent = (event: PointerEvent<HTMLDivElement>) => {
     const rect = stageRef.current?.getBoundingClientRect();
@@ -7947,6 +8080,12 @@ function ImageEditAnnotationBoard({
       y: Math.min(Math.max((event.clientY - rect.top) / rect.height, 0), 1)
     };
   };
+  const screenPoint = (point: { x: number; y: number }) => ({
+    x: point.x * stageSize.width,
+    y: point.y * stageSize.height
+  });
+  const annotationStrokeWidth = 3;
+  const annotationLabelRadius = 13;
 
   const defaultEndPoint = (point: { x: number; y: number }, tool: ImageEditTool) => {
     const offsetX = tool === "box" ? 0.18 : 0.16;
@@ -8014,29 +8153,38 @@ function ImageEditAnnotationBoard({
         ref={stageRef}
       >
         <img alt="改图源图" draggable={false} src={source.dataUrl} />
-        <svg aria-hidden="true" className="image-edit-annotation-svg" viewBox="0 0 1 1" preserveAspectRatio="none">
+        <svg
+          aria-hidden="true"
+          className="image-edit-annotation-svg"
+          preserveAspectRatio="none"
+          viewBox={`0 0 ${stageSize.width} ${stageSize.height}`}
+        >
           {annotations.map((annotation, annotationIndex) => {
             const anchor = imageEditAnnotationAnchor(annotation);
-            const label = anchor ? (
+            const anchorPoint = anchor ? screenPoint(anchor) : null;
+            const label = anchorPoint ? (
               <g className="image-edit-annotation-label" key={`${annotation.id}-label`}>
-                <circle cx={anchor.x} cy={anchor.y} r={0.026} />
-                <text fontSize={0.028} x={anchor.x} y={anchor.y}>
+                <circle cx={anchorPoint.x} cy={anchorPoint.y} r={annotationLabelRadius} />
+                <text fontSize={12} x={anchorPoint.x} y={anchorPoint.y}>
                   {annotationIndex + 1}
                 </text>
               </g>
             ) : null;
             if (annotation.tool === "brush" && annotation.points?.length) {
               if (annotation.points.length === 1) {
-                const [point] = annotation.points;
+                const point = screenPoint(annotation.points[0]);
                 return (
                   <g key={annotation.id}>
-                    <circle cx={point.x} cy={point.y} fill={annotation.color} r={0.012} />
+                    <circle cx={point.x} cy={point.y} fill={annotation.color} r={annotationStrokeWidth * 1.5} />
                     {label}
                   </g>
                 );
               }
               const path = annotation.points
-                .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`)
+                .map((point, index) => {
+                  const renderedPoint = screenPoint(point);
+                  return `${index === 0 ? "M" : "L"} ${renderedPoint.x} ${renderedPoint.y}`;
+                })
                 .join(" ");
               return (
                 <g key={annotation.id}>
@@ -8046,54 +8194,58 @@ function ImageEditAnnotationBoard({
                     stroke={annotation.color}
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    strokeWidth={0.012}
+                    strokeWidth={annotationStrokeWidth}
                   />
                   {label}
                 </g>
               );
             }
             if (annotation.tool === "arrow" && annotation.start && annotation.end) {
-              const angle = Math.atan2(annotation.end.y - annotation.start.y, annotation.end.x - annotation.start.x);
-              const headLength = 0.04;
-              const leftX = annotation.end.x - headLength * Math.cos(angle - Math.PI / 6);
-              const leftY = annotation.end.y - headLength * Math.sin(angle - Math.PI / 6);
-              const rightX = annotation.end.x - headLength * Math.cos(angle + Math.PI / 6);
-              const rightY = annotation.end.y - headLength * Math.sin(angle + Math.PI / 6);
+              const start = screenPoint(annotation.start);
+              const end = screenPoint(annotation.end);
+              const angle = Math.atan2(end.y - start.y, end.x - start.x);
+              const headLength = 16;
+              const leftX = end.x - headLength * Math.cos(angle - Math.PI / 6);
+              const leftY = end.y - headLength * Math.sin(angle - Math.PI / 6);
+              const rightX = end.x - headLength * Math.cos(angle + Math.PI / 6);
+              const rightY = end.y - headLength * Math.sin(angle + Math.PI / 6);
               return (
                 <g key={annotation.id}>
                   <line
                     stroke={annotation.color}
                     strokeLinecap="round"
-                    strokeWidth={0.012}
-                    x1={annotation.start.x}
-                    x2={annotation.end.x}
-                    y1={annotation.start.y}
-                    y2={annotation.end.y}
+                    strokeWidth={annotationStrokeWidth}
+                    x1={start.x}
+                    x2={end.x}
+                    y1={start.y}
+                    y2={end.y}
                   />
                   <path
-                    d={`M ${leftX} ${leftY} L ${annotation.end.x} ${annotation.end.y} L ${rightX} ${rightY}`}
+                    d={`M ${leftX} ${leftY} L ${end.x} ${end.y} L ${rightX} ${rightY}`}
                     fill="none"
                     stroke={annotation.color}
                     strokeLinecap="round"
                     strokeLinejoin="round"
-                    strokeWidth={0.012}
+                    strokeWidth={annotationStrokeWidth}
                   />
                   {label}
                 </g>
               );
             }
             if (annotation.tool === "box" && annotation.start && annotation.end) {
-              const x = Math.min(annotation.start.x, annotation.end.x);
-              const y = Math.min(annotation.start.y, annotation.end.y);
-              const width = Math.abs(annotation.end.x - annotation.start.x);
-              const height = Math.abs(annotation.end.y - annotation.start.y);
+              const start = screenPoint(annotation.start);
+              const end = screenPoint(annotation.end);
+              const x = Math.min(start.x, end.x);
+              const y = Math.min(start.y, end.y);
+              const width = Math.abs(end.x - start.x);
+              const height = Math.abs(end.y - start.y);
               return (
                 <g key={annotation.id}>
                   <rect
                     fill="none"
                     height={height}
                     stroke={annotation.color}
-                    strokeWidth={0.012}
+                    strokeWidth={annotationStrokeWidth}
                     width={width}
                     x={x}
                     y={y}
@@ -8203,7 +8355,14 @@ function ReferenceImageEditor({
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
-      <section className="modal reference-editor-modal" onMouseDown={(event) => event.stopPropagation()}>
+      <section
+        aria-label="参考图轻量编辑"
+        aria-modal="true"
+        className="modal reference-editor-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        tabIndex={-1}
+      >
         <div className="modal-title">
           <h2>参考图轻量编辑</h2>
           <p>{reference.name}</p>

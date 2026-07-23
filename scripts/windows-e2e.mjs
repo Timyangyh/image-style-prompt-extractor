@@ -213,6 +213,144 @@ try {
 
   assert.equal(await page.title(), "图片复刻大师");
   await page.getByText("当前没有图片解析流程。").waitFor();
+  const waitForFullScreen = async (expected) => {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const isFullScreen = await electronApp.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows()[0]?.isFullScreen() ?? false
+      );
+      if (isFullScreen === expected) return;
+      await page.waitForTimeout(50);
+    }
+    throw new Error(`等待窗口${expected ? "进入" : "退出"}全屏超时`);
+  };
+  await page.getByRole("button", { name: "模型配置", exact: true }).click();
+  const fullScreenPriorityDialog = page.getByRole("dialog", { name: "模型配置" });
+  await fullScreenPriorityDialog.waitFor();
+  await electronApp.evaluate(({ BrowserWindow }) => {
+    BrowserWindow.getAllWindows()[0]?.setFullScreen(true);
+  });
+  await waitForFullScreen(true);
+  const sendNativeEscapeEvent = (type) =>
+    electronApp.evaluate(({ BrowserWindow }, inputType) => {
+      BrowserWindow.getAllWindows()[0]?.webContents.sendInputEvent({
+        type: inputType,
+        keyCode: "Escape"
+      });
+    }, type);
+  await sendNativeEscapeEvent("keyDown");
+  await waitForFullScreen(false);
+  await sendNativeEscapeEvent("keyDown");
+  assert.equal(
+    await fullScreenPriorityDialog.isVisible(),
+    true,
+    "全屏 Escape 及其按键重复不应同时关闭渲染层弹窗"
+  );
+  await sendNativeEscapeEvent("keyUp");
+  await sendNativeEscapeEvent("keyDown");
+  await sendNativeEscapeEvent("keyUp");
+  await fullScreenPriorityDialog.waitFor({ state: "hidden" });
+
+  const themeStorageKey = "image-style-prompt-extractor:theme:v1";
+  const currentTheme = await page.evaluate(() => document.documentElement.dataset.theme);
+  if (currentTheme === "dark") {
+    await page.getByRole("button", { name: "切换为浅色模式", exact: true }).click();
+  }
+  await page.getByRole("button", { name: "切换为深色模式", exact: true }).click();
+  assert.equal(
+    await page.evaluate((key) => localStorage.getItem(key), themeStorageKey),
+    "dark",
+    "Windows 主题选择应写入本机枚举偏好"
+  );
+
+  const layoutStorageKey = "image-style-prompt-extractor:resizable-layout:v1";
+  const sidebarWorkspaceSeparatorName = "调整工作台导航与流程列表高度";
+  const readSidebarWorkspaceLayout = async () => {
+    const separator = page.getByRole("separator", {
+      name: sidebarWorkspaceSeparatorName,
+      exact: true
+    });
+    await separator.waitFor();
+    return separator.evaluate((element) => {
+      const parentRect = element.parentElement.getBoundingClientRect();
+      const separatorRect = element.getBoundingClientRect();
+      const lastNavigationButton = document
+        .querySelector(".page-tabs button:last-child")
+        ?.getBoundingClientRect();
+      const workflowNavigator = document
+        .querySelector(".workflow-navigator")
+        ?.getBoundingClientRect();
+      return {
+        ratio: (separatorRect.top - parentRect.top) / parentRect.height,
+        regionsSeparated:
+          Boolean(lastNavigationButton && workflowNavigator) &&
+          lastNavigationButton.bottom <= separatorRect.top + 1 &&
+          separatorRect.bottom <= workflowNavigator.top + 1 &&
+          workflowNavigator.top - lastNavigationButton.bottom >= 12,
+        startSize: separatorRect.top - parentRect.top,
+        valueNow: Number(element.getAttribute("aria-valuenow"))
+      };
+    });
+  };
+  const sidebarWorkspaceSeparator = page.getByRole("separator", {
+    name: sidebarWorkspaceSeparatorName,
+    exact: true
+  });
+  assert.equal(
+    await sidebarWorkspaceSeparator.getAttribute("aria-orientation"),
+    "horizontal",
+    "Windows 应显示工作台导航与流程列表的横向分隔条"
+  );
+  const initialSidebarWorkspaceLayout = await readSidebarWorkspaceLayout();
+  assert.equal(
+    initialSidebarWorkspaceLayout.regionsSeparated,
+    true,
+    "Windows 默认布局中的工作台导航与流程列表仍然贴靠或重叠"
+  );
+  await sidebarWorkspaceSeparator.focus();
+  await page.keyboard.press("ArrowDown");
+  const keyboardAdjustedSidebarWorkspaceLayout = await readSidebarWorkspaceLayout();
+  assert.ok(
+    keyboardAdjustedSidebarWorkspaceLayout.valueNow >
+      initialSidebarWorkspaceLayout.valueNow,
+    "Windows 横向分隔条未响应向下方向键"
+  );
+  const sidebarWorkspaceSeparatorBox = await sidebarWorkspaceSeparator.boundingBox();
+  assert.ok(sidebarWorkspaceSeparatorBox, "Windows 横向分隔条不可见");
+  const sidebarWorkspaceSeparatorX =
+    sidebarWorkspaceSeparatorBox.x + sidebarWorkspaceSeparatorBox.width / 2;
+  await page.mouse.move(
+    sidebarWorkspaceSeparatorX,
+    sidebarWorkspaceSeparatorBox.y + sidebarWorkspaceSeparatorBox.height / 2
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    sidebarWorkspaceSeparatorX,
+    sidebarWorkspaceSeparatorBox.y + sidebarWorkspaceSeparatorBox.height / 2 + 44,
+    { steps: 6 }
+  );
+  await page.mouse.up();
+  const draggedSidebarWorkspaceLayout = await readSidebarWorkspaceLayout();
+  assert.ok(
+    draggedSidebarWorkspaceLayout.startSize >
+      keyboardAdjustedSidebarWorkspaceLayout.startSize + 20,
+    "Windows 横向分隔条的鼠标拖动未改变上下区域占比"
+  );
+  const storedSidebarWorkspaceRatio = await page.evaluate((key) => {
+    try {
+      return JSON.parse(localStorage.getItem(key) || "{}")?.ratios?.[
+        "sidebar-workspaces"
+      ] ?? null;
+    } catch {
+      return null;
+    }
+  }, layoutStorageKey);
+  assert.equal(
+    Number.isFinite(storedSidebarWorkspaceRatio),
+    true,
+    "Windows 横向分隔条未保存合法比例"
+  );
+
   await page.locator('input[type="file"]').first().setInputFiles(sourceImagePath);
   await page.locator('img[alt="待分析图片预览"]').waitFor();
 
@@ -299,6 +437,30 @@ try {
   launchedState = await launchApp();
   electronApp = launchedState.launched;
   page = launchedState.page;
+
+  const restartedTheme = await page.evaluate(
+    (key) => ({
+      stored: localStorage.getItem(key),
+      theme: document.documentElement.dataset.theme
+    }),
+    themeStorageKey
+  );
+  assert.deepEqual(
+    restartedTheme,
+    { stored: "dark", theme: "dark" },
+    "Windows 应用重启后应恢复显式深色偏好"
+  );
+  const restartedSidebarWorkspaceLayout = await readSidebarWorkspaceLayout();
+  assert.ok(
+    Math.abs(restartedSidebarWorkspaceLayout.ratio - storedSidebarWorkspaceRatio) <
+      0.012,
+    "Windows 应用重启后未恢复横向分隔条比例"
+  );
+  assert.equal(
+    restartedSidebarWorkspaceLayout.regionsSeparated,
+    true,
+    "Windows 应用重启后的工作台导航与流程列表发生贴靠或重叠"
+  );
 
   const recoveredTasks = await page.evaluate(() => window.styleExtractor.getGenerationTasks());
   assert.equal(recoveredTasks.length, 1);
@@ -469,20 +631,24 @@ try {
   assert.equal(clearedAnalysis.succeeded, false);
   assert.match(clearedAnalysis.error, /已抹除全部本机数据/);
 
-  const clearedState = await page.evaluate(async () => ({
+  const clearedState = await page.evaluate(async ({ layoutKey, themeKey }) => ({
     model: await window.styleExtractor.getConfig(),
     generation: await window.styleExtractor.getGenerationConfig(),
     history: await window.styleExtractor.getHistory(),
     generationTasks: await window.styleExtractor.getGenerationTasks(),
     imageEditTasks: await window.styleExtractor.getImageEditTasks(),
-    localStorageMarker: localStorage.getItem("windows-e2e-private")
-  }));
+    layoutPreference: localStorage.getItem(layoutKey),
+    localStorageMarker: localStorage.getItem("windows-e2e-private"),
+    themePreference: localStorage.getItem(themeKey)
+  }), { layoutKey: layoutStorageKey, themeKey: themeStorageKey });
   assert.equal(clearedState.model.hasApiKey, false);
   assert.equal(clearedState.generation.hasApiKey, false);
   assert.deepEqual(clearedState.history, []);
   assert.deepEqual(clearedState.generationTasks, []);
   assert.deepEqual(clearedState.imageEditTasks, []);
+  assert.equal(clearedState.layoutPreference, null);
   assert.equal(clearedState.localStorageMarker, null);
+  assert.equal(clearedState.themePreference, null);
 
   const runtimeState = await electronApp.evaluate(async ({ session }) => ({
     cookies: await session.defaultSession.cookies.get({ name: "windows-e2e-private" }),
@@ -507,7 +673,7 @@ try {
   await rm(testRoot, { recursive: true, force: true });
   await assert.rejects(access(testRoot));
 
-  console.log("Windows Electron E2E passed: deletion checklist confirmation, image-edit API request, encrypted config, restart recovery and cleanup.");
+  console.log("Windows Electron E2E passed: adjustable sidebar, deletion checklist confirmation, image-edit API request, encrypted config, restart recovery and cleanup.");
 } finally {
   if (electronApp) await electronApp.close().catch(() => undefined);
   const serverClosed = new Promise((resolveClose) => hangingServer.close(resolveClose));

@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
-    "test:unit": "vitest run",
+    "test:unit": "vitest run src electron",
     "test:e2e:handoff": "npm run build && node scripts/workflow-handoff-e2e.mjs",
     "test:e2e:win": "node scripts/windows-e2e.mjs",
     "verify:release": "bash scripts/verify-public-release.sh",
