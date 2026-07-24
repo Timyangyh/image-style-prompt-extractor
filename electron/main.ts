@@ -715,6 +715,27 @@ const createWindow = (): void => {
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
+  let consumeFullscreenEscapeUntilKeyUp = false;
+  mainWindow.on("blur", () => {
+    consumeFullscreenEscapeUntilKeyUp = false;
+  });
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (input.key !== "Escape") return;
+    if (input.type === "keyUp" && consumeFullscreenEscapeUntilKeyUp) {
+      consumeFullscreenEscapeUntilKeyUp = false;
+      event.preventDefault();
+      return;
+    }
+    if (input.type !== "keyDown") return;
+    if (consumeFullscreenEscapeUntilKeyUp) {
+      event.preventDefault();
+      return;
+    }
+    if (!mainWindow?.isFullScreen()) return;
+    consumeFullscreenEscapeUntilKeyUp = true;
+    event.preventDefault();
+    mainWindow.setFullScreen(false);
+  });
   mainWindow.webContents.setWindowOpenHandler((details) => {
     try {
       const protocol = new URL(details.url).protocol;
